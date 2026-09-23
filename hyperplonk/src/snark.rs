@@ -15,9 +15,7 @@ use arithmetic::{evaluate_opt, gen_eval_point, VPAuxInfo};
 use ark_ec::pairing::Pairing;
 use ark_poly::DenseMultilinearExtension;
 use ark_std::{end_timer, log2, start_timer, One, Zero};
-use rayon::iter::IntoParallelRefIterator;
-#[cfg(feature = "parallel")]
-use rayon::iter::ParallelIterator;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{marker::PhantomData, sync::Arc};
 use subroutines::{
     pcs::prelude::{Commitment, PolynomialCommitmentScheme},

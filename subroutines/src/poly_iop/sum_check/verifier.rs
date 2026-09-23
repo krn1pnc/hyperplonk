@@ -16,7 +16,6 @@ use ark_ff::PrimeField;
 use ark_std::{end_timer, start_timer};
 use transcript::IOPTranscript;
 
-#[cfg(feature = "parallel")]
 use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
 
 impl<F: PrimeField> SumCheckVerifier<F> for IOPVerifierState<F> {
@@ -113,30 +112,11 @@ impl<F: PrimeField> SumCheckVerifier<F> for IOPVerifierState<F> {
 
         // the deferred check during the interactive phase:
         // 2. set `expected` to P(r)`
-        #[cfg(feature = "parallel")]
         let mut expected_vec = self
             .polynomials_received
             .clone()
             .into_par_iter()
             .zip(self.challenges.clone().into_par_iter())
-            .map(|(evaluations, challenge)| {
-                if evaluations.len() != self.max_degree + 1 {
-                    return Err(PolyIOPErrors::InvalidVerifier(format!(
-                        "incorrect number of evaluations: {} vs {}",
-                        evaluations.len(),
-                        self.max_degree + 1
-                    )));
-                }
-                interpolate_uni_poly::<F>(&evaluations, challenge)
-            })
-            .collect::<Result<Vec<_>, PolyIOPErrors>>()?;
-
-        #[cfg(not(feature = "parallel"))]
-        let mut expected_vec = self
-            .polynomials_received
-            .clone()
-            .into_iter()
-            .zip(self.challenges.clone().into_iter())
             .map(|(evaluations, challenge)| {
                 if evaluations.len() != self.max_degree + 1 {
                     return Err(PolyIOPErrors::InvalidVerifier(format!(

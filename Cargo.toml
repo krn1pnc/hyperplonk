@@ -4,6 +4,5 @@ members = [
   "arithmetic",
   "hyperplonk",
   "subroutines",
-  "transcript",
-  "util"
+  "transcript"
 ]

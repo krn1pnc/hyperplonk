@@ -14,12 +14,11 @@ use crate::poly_iop::{
 use arithmetic::{fix_variables, VirtualPolynomial};
 use ark_ff::{batch_inversion, PrimeField};
 use ark_poly::DenseMultilinearExtension;
-use ark_std::{cfg_into_iter, end_timer, start_timer, vec::Vec};
-use rayon::prelude::{IntoParallelIterator, IntoParallelRefIterator};
+use ark_std::{end_timer, start_timer, vec::Vec};
+use rayon::prelude::{
+    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
+};
 use std::sync::Arc;
-
-#[cfg(feature = "parallel")]
-use rayon::iter::{IntoParallelRefMutIterator, ParallelIterator};
 
 impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
     type VirtualPolynomial = VirtualPolynomial<F>;
@@ -97,13 +96,8 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
             self.challenges.push(*chal);
 
             let r = self.challenges[self.round - 1];
-            #[cfg(feature = "parallel")]
             flattened_ml_extensions
                 .par_iter_mut()
-                .for_each(|mle| *mle = fix_variables(mle, &[r]));
-            #[cfg(not(feature = "parallel"))]
-            flattened_ml_extensions
-                .iter_mut()
                 .for_each(|mle| *mle = fix_variables(mle, &[r]));
         } else if self.round > 0 {
             return Err(PolyIOPErrors::InvalidProver(
@@ -121,7 +115,8 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
         // f(r_1, ... r_m,, x_{m+1}... x_n)
 
         products_list.iter().for_each(|(coefficient, products)| {
-            let mut sum = cfg_into_iter!(0..1 << (self.poly.aux_info.num_variables - self.round))
+            let mut sum = (0..(1 << (self.poly.aux_info.num_variables - self.round)))
+                .into_par_iter()
                 .fold(
                     || {
                         (
@@ -156,7 +151,8 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
                     },
                 );
             sum.iter_mut().for_each(|sum| *sum *= coefficient);
-            let extraploation = cfg_into_iter!(0..self.poly.aux_info.max_degree - products.len())
+            let extraploation = (0..(self.poly.aux_info.max_degree - products.len()))
+                .into_par_iter()
                 .map(|i| {
                     let (points, weights) = &self.extrapolation_aux[products.len() - 1];
                     let at = F::from((products.len() + 1 + i) as u64);

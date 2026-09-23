@@ -6,16 +6,15 @@ edition = "2021"
 
 [dependencies]
 arithmetic = { path = "../arithmetic" }
-ark-ec = { version = "^0.4.0", default-features = false }
-ark-ff = { version = "^0.4.0", default-features = false }
-ark-poly = { version = "^0.4.0", default-features = false }
+ark-ec = { version = "^0.4.0", default-features = false, features = ["parallel"] }
+ark-ff = { version = "^0.4.0", default-features = false, features = ["parallel"] }
+ark-poly = { version = "^0.4.0", default-features = false, features = ["parallel"] }
 ark-serialize = { version = "^0.4.0", default-features = false, features = [ "derive" ] }
-ark-std = { version = "^0.4.0", default-features = false }
+ark-std = { version = "^0.4.0", default-features = false, features = ["parallel"] }
 displaydoc = { version = "0.2.3", default-features = false }
-rayon = { version = "1.5.2", default-features = false, optional = true }
+rayon = { version = "1.5.2", default-features = false }
 subroutines = { path = "../subroutines" }
 transcript = { path = "../transcript" }
-util = { path = "../util" }
 
 [dev-dependencies]
 ark-bls12-381 = { version = "0.4.0", default-features = false, features = [ "curve" ] }
@@ -26,26 +25,12 @@ path = "benches/bench.rs"
 harness = false
 
 [features]
-# default = [ ]
-# default = [ "parallel" ]
-# default = [ "parallel", "print-trace" ]
-default = ["parallel", "extensive_sanity_checks"]
-bench = ["parallel"]
+default = ["extensive_sanity_checks"]
+bench = []
 # extensive sanity checks that are useful for debugging
 extensive_sanity_checks = [
     "subroutines/extensive_sanity_checks",
  ]
-parallel = [ 
-    "rayon",
-    "ark-std/parallel", 
-    "ark-ff/parallel",  
-    "ark-poly/parallel", 
-    "ark-ec/parallel",
-
-    "arithmetic/parallel",
-    "subroutines/parallel",
-    "util/parallel"
-    ]
 print-trace = [ 
     "ark-std/print-trace",
     "arithmetic/print-trace",
