@@ -19,12 +19,12 @@
 /// #[cfg(not(feature = "parallel"))]
 /// let sum = v.iter().sum();
 #[cfg(feature = "parallel")]
-pub fn parallelizable_slice_iter<T: Sync>(data: &[T]) -> rayon::slice::Iter<T> {
+pub fn parallelizable_slice_iter<T: Sync>(data: &[T]) -> rayon::slice::Iter<'_, T> {
     use rayon::iter::IntoParallelIterator;
     data.into_par_iter()
 }
 
 #[cfg(not(feature = "parallel"))]
-pub fn parallelizable_slice_iter<T>(data: &[T]) -> core::slice::Iter<T> {
+pub fn parallelizable_slice_iter<T>(data: &[T]) -> core::slice::Iter<'_, T> {
     data.iter()
 }
