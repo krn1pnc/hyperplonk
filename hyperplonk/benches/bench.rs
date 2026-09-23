@@ -63,7 +63,7 @@ fn read_srs() -> Result<MultilinearUniversalParams<Bls12_381>, io::Error> {
 
 fn write_srs(pcs_srs: &MultilinearUniversalParams<Bls12_381>) {
     let mut f = File::create("srs.params").unwrap();
-    pcs_srs.serialize_uncompressed(&mut f).unwrap();
+    pcs_srs.serialize_compressed(&mut f).unwrap();
 }
 
 fn bench_vanilla_plonk(
