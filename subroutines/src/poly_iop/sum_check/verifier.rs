@@ -7,16 +7,13 @@
 //! Verifier subroutines for a SumCheck protocol.
 
 use super::{SumCheckSubClaim, SumCheckVerifier};
-use crate::poly_iop::{
-    errors::PolyIOPErrors,
-    structs::{IOPProverMessage, IOPVerifierState},
-};
-use arithmetic::VPAuxInfo;
+use crate::{poly_iop::structs::IOPVerifierState, IOPProverMessage, PolyIOPErrors};
 use ark_ff::PrimeField;
 use ark_std::{end_timer, start_timer};
+use backend::VPAuxInfo;
 use transcript::IOPTranscript;
 
-use rayon::iter::{IndexedParallelIterator, IntoParallelIterator, ParallelIterator};
+use rayon::iter::{IndexedParallelIterator, IntoParallelRefIterator, ParallelIterator};
 
 impl<F: PrimeField> SumCheckVerifier<F> for IOPVerifierState<F> {
     type VPAuxInfo = VPAuxInfo<F>;
@@ -53,6 +50,21 @@ impl<F: PrimeField> SumCheckVerifier<F> for IOPVerifierState<F> {
     ) -> Result<Self::Challenge, PolyIOPErrors> {
         let start =
             start_timer!(|| format!("sum check verify {}-th round and update state", self.round));
+        if self.num_vars == 0 || self.max_degree == 0 {
+            return Err(PolyIOPErrors::InvalidParameters(
+                "SumCheck requires positive variable count and degree.".to_string(),
+            ));
+        }
+        let round_width = self.max_degree.checked_add(1).ok_or_else(|| {
+            PolyIOPErrors::InvalidParameters("SumCheck degree is too large.".to_string())
+        })?;
+        if prover_msg.evaluations.len() != round_width {
+            return Err(PolyIOPErrors::InvalidProof(format!(
+                "incorrect number of evaluations: {} vs {}",
+                prover_msg.evaluations.len(),
+                round_width
+            )));
+        }
 
         if self.finished {
             return Err(PolyIOPErrors::InvalidVerifier(
@@ -98,15 +110,33 @@ impl<F: PrimeField> SumCheckVerifier<F> for IOPVerifierState<F> {
         asserted_sum: &F,
     ) -> Result<Self::SumCheckSubClaim, PolyIOPErrors> {
         let start = start_timer!(|| "sum check check and generate subclaim");
+        if self.num_vars == 0 || self.max_degree == 0 {
+            return Err(PolyIOPErrors::InvalidParameters(
+                "SumCheck requires positive variable count and degree.".to_string(),
+            ));
+        }
+        let round_width = self.max_degree.checked_add(1).ok_or_else(|| {
+            PolyIOPErrors::InvalidParameters("SumCheck degree is too large.".to_string())
+        })?;
         if !self.finished {
             return Err(PolyIOPErrors::InvalidVerifier(
                 "Incorrect verifier state: Verifier has not finished.".to_string(),
             ));
         }
-
-        if self.polynomials_received.len() != self.num_vars {
+        if self.polynomials_received.len() != self.num_vars
+            || self.challenges.len() != self.num_vars
+        {
             return Err(PolyIOPErrors::InvalidVerifier(
-                "insufficient rounds".to_string(),
+                "Incorrect verifier state: Incomplete round history.".to_string(),
+            ));
+        }
+        if self
+            .polynomials_received
+            .iter()
+            .any(|evaluations| evaluations.len() != round_width)
+        {
+            return Err(PolyIOPErrors::InvalidProof(
+                "Incorrect number of evaluations in round history.".to_string(),
             ));
         }
 
@@ -114,20 +144,10 @@ impl<F: PrimeField> SumCheckVerifier<F> for IOPVerifierState<F> {
         // 2. set `expected` to P(r)`
         let mut expected_vec = self
             .polynomials_received
-            .clone()
-            .into_par_iter()
-            .zip(self.challenges.clone().into_par_iter())
-            .map(|(evaluations, challenge)| {
-                if evaluations.len() != self.max_degree + 1 {
-                    return Err(PolyIOPErrors::InvalidVerifier(format!(
-                        "incorrect number of evaluations: {} vs {}",
-                        evaluations.len(),
-                        self.max_degree + 1
-                    )));
-                }
-                interpolate_uni_poly::<F>(&evaluations, challenge)
-            })
-            .collect::<Result<Vec<_>, PolyIOPErrors>>()?;
+            .par_iter()
+            .zip(self.challenges.par_iter())
+            .map(|(evaluations, &challenge)| interpolate_uni_poly::<F>(evaluations, challenge))
+            .collect::<Vec<_>>();
 
         // insert the asserted_sum to the first position of the expected vector
         expected_vec.insert(0, *asserted_sum);
@@ -159,14 +179,17 @@ impl<F: PrimeField> SumCheckVerifier<F> for IOPVerifierState<F> {
 /// Interpolate a uni-variate degree-`p_i.len()-1` polynomial and evaluate this
 /// polynomial at `eval_at`:
 ///
-///   \sum_{i=0}^len p_i * (\prod_{j!=i} (eval_at - j)/(i-j) )
+/// `\sum_{i=0}^{len-1} p_i * (\prod_{0 <= j < len, j != i} (eval_at - j)/(i-j))`
 ///
 /// This implementation is linear in number of inputs in terms of field
 /// operations. It also has a quadratic term in primitive operations which is
 /// negligible compared to field operations.
-/// TODO: The quadratic term can be removed by precomputing the lagrange
-/// coefficients.
-fn interpolate_uni_poly<F: PrimeField>(p_i: &[F], eval_at: F) -> Result<F, PolyIOPErrors> {
+///
+/// Requires a nonempty input, distinct consecutive nodes in the field, and
+/// `eval_at` outside those nodes. The factorial denominators must be nonzero
+/// in the field. This routine has no node-hit fast path and does not validate
+/// small-characteristic degeneracy.
+fn interpolate_uni_poly<F: PrimeField>(p_i: &[F], eval_at: F) -> F {
     let start = start_timer!(|| "sum check interpolate uni poly opt");
 
     let len = p_i.len();
@@ -205,7 +228,7 @@ fn interpolate_uni_poly<F: PrimeField>(p_i: &[F], eval_at: F) -> Result<F, PolyI
     // so we will be able to compute the ratio
     //  - for len <= 20 with i64
     //  - for len <= 33 with i128
-    //  - for len >  33 with BigInt
+    //  - for len >  33 with field arithmetic
     if p_i.len() <= 20 {
         let last_denominator = F::from(u64_factorial(len - 1));
         let mut ratio_numerator = 1i64;
@@ -263,7 +286,7 @@ fn interpolate_uni_poly<F: PrimeField>(p_i: &[F], eval_at: F) -> Result<F, PolyI
         }
     }
     end_timer!(start);
-    Ok(res)
+    res
 }
 
 /// compute the factorial(a) = 1 * 2 * ... * a
@@ -299,13 +322,12 @@ fn u64_factorial(a: usize) -> u64 {
 #[cfg(test)]
 mod test {
     use super::interpolate_uni_poly;
-    use crate::poly_iop::errors::PolyIOPErrors;
     use ark_bls12_381::Fr;
     use ark_poly::{univariate::DensePolynomial, DenseUVPolynomial, Polynomial};
     use ark_std::{vec::Vec, UniformRand};
 
     #[test]
-    fn test_interpolation() -> Result<(), PolyIOPErrors> {
+    fn test_interpolation() {
         let mut prng = ark_std::test_rng();
 
         // test a polynomial with 20 known points, i.e., with degree 19
@@ -315,7 +337,7 @@ mod test {
             .collect::<Vec<Fr>>();
         let query = Fr::rand(&mut prng);
 
-        assert_eq!(poly.evaluate(&query), interpolate_uni_poly(&evals, query)?);
+        assert_eq!(poly.evaluate(&query), interpolate_uni_poly(&evals, query));
 
         // test a polynomial with 33 known points, i.e., with degree 32
         let poly = DensePolynomial::<Fr>::rand(33 - 1, &mut prng);
@@ -324,7 +346,7 @@ mod test {
             .collect::<Vec<Fr>>();
         let query = Fr::rand(&mut prng);
 
-        assert_eq!(poly.evaluate(&query), interpolate_uni_poly(&evals, query)?);
+        assert_eq!(poly.evaluate(&query), interpolate_uni_poly(&evals, query));
 
         // test a polynomial with 64 known points, i.e., with degree 63
         let poly = DensePolynomial::<Fr>::rand(64 - 1, &mut prng);
@@ -333,8 +355,6 @@ mod test {
             .collect::<Vec<Fr>>();
         let query = Fr::rand(&mut prng);
 
-        assert_eq!(poly.evaluate(&query), interpolate_uni_poly(&evals, query)?);
-
-        Ok(())
+        assert_eq!(poly.evaluate(&query), interpolate_uni_poly(&evals, query));
     }
 }

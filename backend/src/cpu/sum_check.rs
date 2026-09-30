@@ -1,44 +1,62 @@
 // Copyright (c) 2023 Espresso Systems (espressosys.com)
 // This file is part of the HyperPlonk library.
-
+//
 // You should have received a copy of the MIT License
 // along with the HyperPlonk library. If not, see <https://mit-license.org/>.
 
 //! Prover subroutines for a SumCheck protocol.
 
-use super::SumCheckProver;
-use crate::poly_iop::{
-    errors::PolyIOPErrors,
-    structs::{IOPProverMessage, IOPProverState},
-};
-use arithmetic::{fix_variables, VirtualPolynomial};
+use super::{CpuBackend, DenseMultilinearExtension};
+use crate::{BackendError, SumCheckProver, VirtualPolynomial};
 use ark_ff::{batch_inversion, PrimeField};
-use ark_poly::DenseMultilinearExtension;
-use ark_std::{end_timer, start_timer, vec::Vec};
-use rayon::prelude::{
-    IntoParallelIterator, IntoParallelRefIterator, IntoParallelRefMutIterator, ParallelIterator,
-};
+use ark_poly::MultilinearExtension;
+use ark_std::{end_timer, start_timer};
+use rayon::prelude::*;
 use std::sync::Arc;
 
-impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
-    type VirtualPolynomial = VirtualPolynomial<F>;
-    type ProverMessage = IOPProverMessage<F>;
+/// CPU working state, accessible only to its prover implementation.
+pub struct CpuSumCheckProverState<F: PrimeField> {
+    /// the current round number
+    round: usize,
+    num_variables: usize,
+    max_degree: usize,
+    products: Vec<(F, Vec<usize>)>,
+    flattened_ml_extensions: Vec<Arc<DenseMultilinearExtension<F>>>,
+    /// points with precomputed barycentric weights for extrapolating smaller
+    /// degree uni-polys to `max_degree + 1` evaluations.
+    extrapolation_aux: Vec<(Vec<F>, Vec<F>)>,
+}
+
+impl<F: PrimeField> SumCheckProver<F> for CpuBackend {
+    type ProverState = CpuSumCheckProverState<F>;
 
     /// Initialize the prover state to argue for the sum of the input polynomial
     /// over {0,1}^`num_vars`.
-    fn prover_init(polynomial: &Self::VirtualPolynomial) -> Result<Self, PolyIOPErrors> {
+    fn prover_init(
+        &self,
+        polynomial: &VirtualPolynomial<F, Self::Mle>,
+    ) -> Result<Self::ProverState, BackendError> {
         let start = start_timer!(|| "sum check prover init");
-        if polynomial.aux_info.num_variables == 0 {
-            return Err(PolyIOPErrors::InvalidParameters(
-                "Attempt to prove a constant.".to_string(),
+        if polynomial.aux_info.num_variables == 0 || polynomial.aux_info.max_degree == 0 {
+            return Err(BackendError::InvalidParameters(
+                "SumCheck requires positive variable count and degree.".to_string(),
             ));
         }
+        polynomial
+            .aux_info
+            .max_degree
+            .checked_add(1)
+            .ok_or_else(|| {
+                BackendError::InvalidParameters("SumCheck degree is too large.".to_string())
+            })?;
         end_timer!(start);
 
-        Ok(Self {
-            challenges: Vec::with_capacity(polynomial.aux_info.num_variables),
+        Ok(CpuSumCheckProverState {
             round: 0,
-            poly: polynomial.clone(),
+            num_variables: polynomial.aux_info.num_variables,
+            max_degree: polynomial.aux_info.max_degree,
+            products: polynomial.products.clone(),
+            flattened_ml_extensions: polynomial.flattened_ml_extensions().to_vec(),
             extrapolation_aux: (1..polynomial.aux_info.max_degree)
                 .map(|degree| {
                     let points = (0..1 + degree as u64).map(F::from).collect::<Vec<_>>();
@@ -54,15 +72,16 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
     ///
     /// Main algorithm used is from section 3.2 of [XZZPS19](https://eprint.iacr.org/2019/317.pdf#subsection.3.2).
     fn prove_round_and_update_state(
-        &mut self,
+        &self,
+        state: &mut Self::ProverState,
         challenge: &Option<F>,
-    ) -> Result<Self::ProverMessage, PolyIOPErrors> {
+    ) -> Result<Vec<F>, BackendError> {
         // let start =
         //     start_timer!(|| format!("sum check prove {}-th round and update state",
         // self.round));
 
-        if self.round >= self.poly.aux_info.num_variables {
-            return Err(PolyIOPErrors::InvalidProver(
+        if state.round >= state.num_variables {
+            return Err(BackendError::InvalidState(
                 "Prover is not active".to_string(),
             ));
         }
@@ -80,42 +99,34 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
         //    g(r_1, ..., r_{m-1}, x_m ... x_n)
         //
         // eval g over r_m, and mutate g to g(r_1, ... r_m,, x_{m+1}... x_n)
-        let mut flattened_ml_extensions: Vec<DenseMultilinearExtension<F>> = self
-            .poly
-            .flattened_ml_extensions
-            .par_iter()
-            .map(|x| x.as_ref().clone())
-            .collect();
 
         if let Some(chal) = challenge {
-            if self.round == 0 {
-                return Err(PolyIOPErrors::InvalidProver(
+            if state.round == 0 {
+                return Err(BackendError::InvalidState(
                     "first round should be prover first.".to_string(),
                 ));
             }
-            self.challenges.push(*chal);
-
-            let r = self.challenges[self.round - 1];
-            flattened_ml_extensions
+            // update prover's state to the partial evaluated polynomial
+            state
+                .flattened_ml_extensions
                 .par_iter_mut()
-                .for_each(|mle| *mle = fix_variables(mle, &[r]));
-        } else if self.round > 0 {
-            return Err(PolyIOPErrors::InvalidProver(
+                .for_each(|mle| *mle = Arc::new(mle.fix_variables(&[*chal])));
+        } else if state.round > 0 {
+            return Err(BackendError::InvalidState(
                 "verifier message is empty".to_string(),
             ));
         }
         // end_timer!(fix_argument);
 
-        self.round += 1;
+        state.round += 1;
 
-        let products_list = self.poly.products.clone();
-        let mut products_sum = vec![F::zero(); self.poly.aux_info.max_degree + 1];
+        let mut products_sum = vec![F::zero(); state.max_degree + 1];
 
         // Step 2: generate sum for the partial evaluated polynomial:
         // f(r_1, ... r_m,, x_{m+1}... x_n)
 
-        products_list.iter().for_each(|(coefficient, products)| {
-            let mut sum = (0..(1 << (self.poly.aux_info.num_variables - self.round)))
+        state.products.iter().for_each(|(coefficient, products)| {
+            let mut sum = (0..(1 << (state.num_variables - state.round)))
                 .into_par_iter()
                 .fold(
                     || {
@@ -128,7 +139,7 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
                         buf.iter_mut()
                             .zip(products.iter())
                             .for_each(|((eval, step), f)| {
-                                let table = &flattened_ml_extensions[*f];
+                                let table = &state.flattened_ml_extensions[*f].evaluations;
                                 *eval = table[b << 1];
                                 *step = table[(b << 1) + 1] - table[b << 1];
                             });
@@ -151,10 +162,10 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
                     },
                 );
             sum.iter_mut().for_each(|sum| *sum *= coefficient);
-            let extraploation = (0..(self.poly.aux_info.max_degree - products.len()))
+            let extraploation = (0..(state.max_degree - products.len()))
                 .into_par_iter()
                 .map(|i| {
-                    let (points, weights) = &self.extrapolation_aux[products.len() - 1];
+                    let (points, weights) = &state.extrapolation_aux[products.len() - 1];
                     let at = F::from((products.len() + 1 + i) as u64);
                     extrapolate(points, weights, &sum, &at)
                 })
@@ -165,15 +176,7 @@ impl<F: PrimeField> SumCheckProver<F> for IOPProverState<F> {
                 .for_each(|(products_sum, sum)| *products_sum += sum);
         });
 
-        // update prover's state to the partial evaluated polynomial
-        self.poly.flattened_ml_extensions = flattened_ml_extensions
-            .par_iter()
-            .map(|x| Arc::new(x.clone()))
-            .collect();
-
-        Ok(IOPProverMessage {
-            evaluations: products_sum,
-        })
+        Ok(products_sum)
     }
 }
 
@@ -211,4 +214,41 @@ fn extrapolate<F: PrimeField>(points: &[F], weights: &[F], evals: &[F], at: &F) 
         .map(|(coeff, eval)| *coeff * eval)
         .sum::<F>()
         * sum_inv
+}
+
+#[cfg(test)]
+mod test {
+    use super::*;
+    use ark_bls12_381::Fr;
+
+    #[test]
+    fn round_lifecycle_preserves_challenge_boundaries() -> Result<(), BackendError> {
+        let mle = Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+            2,
+            [2u64, 3, 5, 7].map(Fr::from).to_vec(),
+        ));
+        let mut poly = VirtualPolynomial::new_from_mle(&mle, Fr::from(2u64));
+        poly.add_mle_list([mle.clone(), mle.clone()], Fr::from(3u64))?;
+        let mut state = CpuBackend.prover_init(&poly)?;
+        let challenge = Some(Fr::from(2u64));
+
+        assert!(matches!(
+            CpuBackend.prove_round_and_update_state(&mut state, &challenge),
+            Err(BackendError::InvalidState(_))
+        ));
+        let first = CpuBackend.prove_round_and_update_state(&mut state, &None)?;
+        assert_eq!(first, [101u64, 194, 317].map(Fr::from));
+        assert!(matches!(
+            CpuBackend.prove_round_and_update_state(&mut state, &None),
+            Err(BackendError::InvalidState(_))
+        ));
+        let second = CpuBackend.prove_round_and_update_state(&mut state, &challenge)?;
+        assert_eq!(second, [56u64, 261, 616].map(Fr::from));
+        assert!(matches!(
+            CpuBackend.prove_round_and_update_state(&mut state, &challenge),
+            Err(BackendError::InvalidState(_))
+        ));
+        assert_eq!(mle.evaluations, [2u64, 3, 5, 7].map(Fr::from));
+        Ok(())
+    }
 }

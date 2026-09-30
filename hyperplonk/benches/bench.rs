@@ -9,16 +9,10 @@ use std::{fs::File, io, time::Instant};
 use ark_bls12_381::{Bls12_381, Fr};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize, Write};
 use ark_std::test_rng;
-use hyperplonk::{
-    prelude::{CustomizedGates, HyperPlonkErrors, MockCircuit},
-    HyperPlonkSNARK,
-};
+use backend::cpu::CpuBackend;
+use hyperplonk::{CustomizedGates, HyperPlonkErrors, HyperPlonkSNARK, MockCircuit};
 use subroutines::{
-    pcs::{
-        prelude::{MultilinearKzgPCS, MultilinearUniversalParams},
-        PolynomialCommitmentScheme,
-    },
-    poly_iop::PolyIOP,
+    MultilinearKzgPCS, MultilinearUniversalParams, PolyIOP, PolynomialCommitmentScheme,
 };
 
 const SUPPORTED_SIZE: usize = 20;
@@ -126,6 +120,7 @@ fn bench_mock_circuit_zkp_helper(
     let circuit = MockCircuit::<Fr>::new(1 << nv, gate);
     assert!(circuit.is_satisfied());
     let index = circuit.index;
+    let backend = CpuBackend;
     //==========================================================
     // generate pk and vks
     let start = Instant::now();
@@ -133,27 +128,28 @@ fn bench_mock_circuit_zkp_helper(
         let (_pk, _vk) = <PolyIOP<Fr> as HyperPlonkSNARK<
             Bls12_381,
             MultilinearKzgPCS<Bls12_381>,
-        >>::preprocess(&index, pcs_srs)?;
+            CpuBackend,
+        >>::preprocess(&backend, &index, pcs_srs)?;
     }
     println!(
         "key extraction for {} variables: {} us",
         nv,
         start.elapsed().as_micros() / repetition as u128
     );
-    let (pk, vk) =
-        <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, MultilinearKzgPCS<Bls12_381>>>::preprocess(
-            &index, pcs_srs,
-        )?;
+    let (pk, vk) = <PolyIOP<Fr> as HyperPlonkSNARK<
+        Bls12_381,
+        MultilinearKzgPCS<Bls12_381>,
+        CpuBackend,
+    >>::preprocess(&backend, &index, pcs_srs)?;
     //==========================================================
     // generate a proof
     let start = Instant::now();
     for _ in 0..repetition {
-        let _proof =
-            <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, MultilinearKzgPCS<Bls12_381>>>::prove(
-                &pk,
-                &circuit.public_inputs,
-                &circuit.witnesses,
-            )?;
+        let _proof = <PolyIOP<Fr> as HyperPlonkSNARK<
+            Bls12_381,
+            MultilinearKzgPCS<Bls12_381>,
+            CpuBackend,
+        >>::prove(&backend, &pk, &circuit.public_inputs, &circuit.witnesses)?;
     }
     let t = start.elapsed().as_micros() / repetition as u128;
     println!(
@@ -163,21 +159,20 @@ fn bench_mock_circuit_zkp_helper(
     );
     file.write_all(format!("{} {}\n", nv, t).as_ref()).unwrap();
 
-    let proof = <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, MultilinearKzgPCS<Bls12_381>>>::prove(
-        &pk,
-        &circuit.public_inputs,
-        &circuit.witnesses,
-    )?;
+    let proof = <PolyIOP<Fr> as HyperPlonkSNARK<
+        Bls12_381,
+        MultilinearKzgPCS<Bls12_381>,
+        CpuBackend,
+    >>::prove(&backend, &pk, &circuit.public_inputs, &circuit.witnesses)?;
     //==========================================================
     // verify a proof
     let start = Instant::now();
     for _ in 0..repetition {
-        let verify =
-            <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, MultilinearKzgPCS<Bls12_381>>>::verify(
-                &vk,
-                &circuit.public_inputs,
-                &proof,
-            )?;
+        let verify = <PolyIOP<Fr> as HyperPlonkSNARK<
+            Bls12_381,
+            MultilinearKzgPCS<Bls12_381>,
+            CpuBackend,
+        >>::verify(&vk, &circuit.public_inputs, &proof)?;
         assert!(verify);
     }
     println!(

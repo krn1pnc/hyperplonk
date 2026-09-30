@@ -6,26 +6,20 @@
 
 //! This module implements the sum check protocol.
 
-use crate::poly_iop::{
-    errors::PolyIOPErrors,
-    structs::{IOPProof, IOPProverState, IOPVerifierState},
-    PolyIOP,
+use crate::{
+    poly_iop::structs::IOPVerifierState, IOPProof, IOPProverMessage, PolyIOP, PolyIOPErrors,
 };
-use arithmetic::{VPAuxInfo, VirtualPolynomial};
 use ark_ff::PrimeField;
-use ark_poly::DenseMultilinearExtension;
 use ark_std::{end_timer, start_timer};
-use std::{fmt::Debug, sync::Arc};
+use backend::{SumCheckProver, VPAuxInfo, VirtualPolynomial};
+use std::fmt::Debug;
 use transcript::IOPTranscript;
 
-mod prover;
 mod verifier;
 
 /// Trait for doing sum check protocols.
 pub trait SumCheck<F: PrimeField> {
-    type VirtualPolynomial;
     type VPAuxInfo;
-    type MultilinearExtension;
 
     type SumCheckProof: Clone + Debug + Default + PartialEq;
     type Transcript;
@@ -45,40 +39,24 @@ pub trait SumCheck<F: PrimeField> {
     /// Generate proof of the sum of polynomial over {0,1}^`num_vars`
     ///
     /// The polynomial is represented in the form of a VirtualPolynomial.
-    fn prove(
-        poly: &Self::VirtualPolynomial,
+    /// Requires positive variable-count and degree metadata.
+    fn prove<B: SumCheckProver<F>>(
+        backend: &B,
+        poly: &VirtualPolynomial<F, B::Mle>,
         transcript: &mut Self::Transcript,
     ) -> Result<Self::SumCheckProof, PolyIOPErrors>;
 
     /// Verify the claimed sum using the proof
+    /// Validates point length, round count, and every round's degree-dependent
+    /// width. Challenges, not cached proof-point coordinates, determine the
+    /// returned subclaim point. The transcript state after an error is
+    /// unspecified.
     fn verify(
         sum: F,
         proof: &Self::SumCheckProof,
         aux_info: &Self::VPAuxInfo,
         transcript: &mut Self::Transcript,
     ) -> Result<Self::SumCheckSubClaim, PolyIOPErrors>;
-}
-
-/// Trait for sum check protocol prover side APIs.
-pub trait SumCheckProver<F: PrimeField>
-where
-    Self: Sized,
-{
-    type VirtualPolynomial;
-    type ProverMessage;
-
-    /// Initialize the prover state to argue for the sum of the input polynomial
-    /// over {0,1}^`num_vars`.
-    fn prover_init(polynomial: &Self::VirtualPolynomial) -> Result<Self, PolyIOPErrors>;
-
-    /// Receive message from verifier, generate prover message, and proceed to
-    /// next round.
-    ///
-    /// Main algorithm used is from section 3.2 of [XZZPS19](https://eprint.iacr.org/2019/317.pdf#subsection.3.2).
-    fn prove_round_and_update_state(
-        &mut self,
-        challenge: &Option<F>,
-    ) -> Result<Self::ProverMessage, PolyIOPErrors>;
 }
 
 /// Trait for sum check protocol verifier side APIs.
@@ -131,9 +109,7 @@ pub struct SumCheckSubClaim<F: PrimeField> {
 
 impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
     type SumCheckProof = IOPProof<F>;
-    type VirtualPolynomial = VirtualPolynomial<F>;
     type VPAuxInfo = VPAuxInfo<F>;
-    type MultilinearExtension = Arc<DenseMultilinearExtension<F>>;
     type SumCheckSubClaim = SumCheckSubClaim<F>;
     type Transcript = IOPTranscript<F>;
 
@@ -151,32 +127,43 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
         res
     }
 
-    fn prove(
-        poly: &Self::VirtualPolynomial,
+    fn prove<B: SumCheckProver<F>>(
+        backend: &B,
+        poly: &VirtualPolynomial<F, B::Mle>,
         transcript: &mut Self::Transcript,
     ) -> Result<Self::SumCheckProof, PolyIOPErrors> {
         let start = start_timer!(|| "sum check prove");
+        if poly.aux_info.num_variables == 0 || poly.aux_info.max_degree == 0 {
+            return Err(PolyIOPErrors::InvalidParameters(
+                "SumCheck requires positive variable count and degree.".to_string(),
+            ));
+        }
+        poly.aux_info.max_degree.checked_add(1).ok_or_else(|| {
+            PolyIOPErrors::InvalidParameters("SumCheck degree is too large.".to_string())
+        })?;
 
         transcript.append_serializable_element(b"aux info", &poly.aux_info)?;
 
-        let mut prover_state = IOPProverState::prover_init(poly)?;
+        let mut prover_state = backend.prover_init(poly)?;
         let mut challenge = None;
         let mut prover_msgs = Vec::with_capacity(poly.aux_info.num_variables);
+        // sampled randomness derived from the transcript
+        let mut point = Vec::with_capacity(poly.aux_info.num_variables);
         for _ in 0..poly.aux_info.num_variables {
-            let prover_msg =
-                IOPProverState::prove_round_and_update_state(&mut prover_state, &challenge)?;
+            let prover_msg = IOPProverMessage::new(
+                backend.prove_round_and_update_state(&mut prover_state, &challenge)?,
+            );
             transcript.append_serializable_element(b"prover msg", &prover_msg)?;
             prover_msgs.push(prover_msg);
-            challenge = Some(transcript.get_and_append_challenge(b"Internal round")?);
+            let next_challenge = transcript.get_and_append_challenge(b"Internal round")?;
+            // pushing each challenge point, including the last one, to the proof
+            point.push(next_challenge);
+            challenge = Some(next_challenge);
         }
-        // pushing the last challenge point to the state
-        if let Some(p) = challenge {
-            prover_state.challenges.push(p)
-        };
 
         end_timer!(start);
         Ok(IOPProof {
-            point: prover_state.challenges,
+            point,
             proofs: prover_msgs,
         })
     }
@@ -188,11 +175,36 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
         transcript: &mut Self::Transcript,
     ) -> Result<Self::SumCheckSubClaim, PolyIOPErrors> {
         let start = start_timer!(|| "sum check verify");
+        let num_variables = aux_info.num_variables;
+        if num_variables == 0 || aux_info.max_degree == 0 {
+            return Err(PolyIOPErrors::InvalidParameters(
+                "SumCheck requires positive variable count and degree.".to_string(),
+            ));
+        }
+        let round_width = aux_info.max_degree.checked_add(1).ok_or_else(|| {
+            PolyIOPErrors::InvalidParameters("SumCheck degree is too large.".to_string())
+        })?;
+        if proof.point.len() != num_variables || proof.proofs.len() != num_variables {
+            return Err(PolyIOPErrors::InvalidProof(format!(
+                "incorrect SumCheck dimensions: point {}, rounds {}, expected {}",
+                proof.point.len(),
+                proof.proofs.len(),
+                num_variables
+            )));
+        }
+        for message in &proof.proofs {
+            if message.evaluations.len() != round_width {
+                return Err(PolyIOPErrors::InvalidProof(format!(
+                    "incorrect number of evaluations: {} vs {}",
+                    message.evaluations.len(),
+                    round_width
+                )));
+            }
+        }
 
         transcript.append_serializable_element(b"aux info", aux_info)?;
         let mut verifier_state = IOPVerifierState::verifier_init(aux_info);
-        for i in 0..aux_info.num_variables {
-            let prover_msg = proof.proofs.get(i).expect("proof is incomplete");
+        for prover_msg in &proof.proofs {
             transcript.append_serializable_element(b"prover msg", prover_msg)?;
             IOPVerifierState::verify_round_and_update_state(
                 &mut verifier_state,
@@ -208,15 +220,215 @@ impl<F: PrimeField> SumCheck<F> for PolyIOP<F> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu"))]
 mod test {
-
     use super::*;
     use ark_bls12_381::Fr;
     use ark_ff::UniformRand;
     use ark_poly::{DenseMultilinearExtension, MultilinearExtension};
     use ark_std::test_rng;
+    use backend::{cpu::CpuBackend, BackendError, MleBackend};
     use std::sync::Arc;
+
+    #[test]
+    fn test_prover_rejects_invalid_metadata() -> Result<(), PolyIOPErrors> {
+        for (num_variables, max_degree) in [(2, 0), (0, 1), (2, usize::MAX)] {
+            let mut poly =
+                VirtualPolynomial::<Fr, Arc<DenseMultilinearExtension<Fr>>>::new(num_variables);
+            poly.aux_info.max_degree = max_degree;
+            let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            transcript.append_message(b"testing", b"metadata rejection")?;
+            assert!(matches!(
+                <PolyIOP<Fr> as SumCheck<Fr>>::prove(&CpuBackend, &poly, &mut transcript),
+                Err(PolyIOPErrors::InvalidParameters(_))
+            ));
+            assert!(matches!(
+                CpuBackend.prover_init(&poly),
+                Err(BackendError::InvalidParameters(_))
+            ));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_positive_degree_constant_values_are_supported() -> Result<(), PolyIOPErrors> {
+        let mle = Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+            2,
+            vec![Fr::from(5u64); 4],
+        ));
+        let poly = VirtualPolynomial::new_from_mle(&mle, Fr::from(1u64));
+        let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&CpuBackend, &poly, &mut transcript)?;
+        let mut verifier_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let subclaim = <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+            Fr::from(20u64),
+            &proof,
+            &poly.aux_info,
+            &mut verifier_transcript,
+        )?;
+        assert_eq!(subclaim.expected_evaluation, Fr::from(5u64));
+        assert_eq!(
+            CpuBackend.evaluate_vp(&poly, &subclaim.point)?,
+            subclaim.expected_evaluation
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_sumcheck_rejects_malformed_shape() -> Result<(), PolyIOPErrors> {
+        let mle = Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+            2,
+            vec![
+                Fr::from(1u64),
+                Fr::from(2u64),
+                Fr::from(3u64),
+                Fr::from(4u64),
+            ],
+        ));
+        let poly = VirtualPolynomial::new_from_mle(&mle, Fr::from(1u64));
+        let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&CpuBackend, &poly, &mut transcript)?;
+        let mut malformed = vec![IOPProof::default()];
+        for rounds in [0, 1, 3] {
+            let mut candidate = proof.clone();
+            candidate.proofs.resize(rounds, proof.proofs[0].clone());
+            malformed.push(candidate);
+        }
+        for point_length in [0, 1, 3] {
+            let mut candidate = proof.clone();
+            candidate.point.resize(point_length, Fr::from(0u64));
+            malformed.push(candidate);
+        }
+        for round in 0..2 {
+            for width in [0, 1, 3] {
+                let mut candidate = proof.clone();
+                candidate.proofs[round]
+                    .evaluations
+                    .resize(width, Fr::from(0u64));
+                malformed.push(candidate);
+            }
+        }
+        for candidate in malformed {
+            let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            transcript.append_message(b"testing", b"shape rejection")?;
+            assert!(matches!(
+                <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+                    Fr::from(10u64),
+                    &candidate,
+                    &poly.aux_info,
+                    &mut transcript,
+                ),
+                Err(PolyIOPErrors::InvalidProof(_))
+            ));
+        }
+        for (num_variables, max_degree) in [(0, 1), (2, 0), (2, usize::MAX)] {
+            let mut aux_info = poly.aux_info.clone();
+            aux_info.num_variables = num_variables;
+            aux_info.max_degree = max_degree;
+            let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            transcript.append_message(b"testing", b"metadata rejection")?;
+            assert!(matches!(
+                <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+                    Fr::from(10u64),
+                    &proof,
+                    &aux_info,
+                    &mut transcript,
+                ),
+                Err(PolyIOPErrors::InvalidParameters(_))
+            ));
+        }
+        // Only transcript-derived challenges determine the returned subclaim.
+        let mut altered_point = proof.clone();
+        altered_point.point.fill(Fr::from(0u64));
+        let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let subclaim = <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+            Fr::from(10u64),
+            &altered_point,
+            &poly.aux_info,
+            &mut transcript,
+        )?;
+        assert_eq!(subclaim.point, proof.point);
+        assert_eq!(
+            CpuBackend.evaluate_vp(&poly, &subclaim.point)?,
+            subclaim.expected_evaluation
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_direct_verifier_rejects_invalid_rounds() -> Result<(), PolyIOPErrors> {
+        use crate::IOPProverMessage;
+
+        let aux_info = VPAuxInfo {
+            num_variables: 2,
+            max_degree: 0,
+            phantom: std::marker::PhantomData::<Fr>,
+        };
+        for (num_variables, max_degree) in [(0, 1), (2, 0), (2, usize::MAX)] {
+            let mut aux_info = aux_info.clone();
+            aux_info.num_variables = num_variables;
+            aux_info.max_degree = max_degree;
+            let mut state = IOPVerifierState::verifier_init(&aux_info);
+            let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            transcript.append_message(b"testing", b"metadata rejection")?;
+            assert!(matches!(
+                state.verify_round_and_update_state(
+                    &IOPProverMessage::new(vec![Fr::from(0u64); 2]),
+                    &mut transcript,
+                ),
+                Err(PolyIOPErrors::InvalidParameters(_))
+            ));
+            assert!(matches!(
+                state.check_and_generate_subclaim(&Fr::from(0u64)),
+                Err(PolyIOPErrors::InvalidParameters(_))
+            ));
+        }
+        let mut aux_info = aux_info;
+        aux_info.max_degree = 1;
+        for width in [0, 1, 3] {
+            let mut state = IOPVerifierState::verifier_init(&aux_info);
+            let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            transcript.append_message(b"testing", b"round rejection")?;
+            assert!(matches!(
+                state.verify_round_and_update_state(
+                    &IOPProverMessage::new(vec![Fr::from(0u64); width]),
+                    &mut transcript,
+                ),
+                Err(PolyIOPErrors::InvalidProof(_))
+            ));
+        }
+        for width in [0, 1, 3] {
+            let mut state = IOPVerifierState::verifier_init(&aux_info);
+            state.finished = true;
+            state.polynomials_received = vec![vec![Fr::from(0u64); width]; 2];
+            state.challenges = vec![Fr::from(2u64); 2];
+            assert!(matches!(
+                state.check_and_generate_subclaim(&Fr::from(0u64)),
+                Err(PolyIOPErrors::InvalidProof(_))
+            ));
+        }
+        for (rounds, challenges) in [(0, 2), (1, 2), (3, 2), (2, 0), (2, 1), (2, 3)] {
+            let mut state = IOPVerifierState::verifier_init(&aux_info);
+            state.finished = true;
+            state.polynomials_received = vec![vec![Fr::from(0u64); 2]; rounds];
+            state.challenges = vec![Fr::from(2u64); challenges];
+            assert!(matches!(
+                state.check_and_generate_subclaim(&Fr::from(0u64)),
+                Err(PolyIOPErrors::InvalidVerifier(_))
+            ));
+        }
+        aux_info.num_variables = 1;
+        aux_info.max_degree = 0;
+        let mut state = IOPVerifierState::verifier_init(&aux_info);
+        state.finished = true;
+        state.polynomials_received = vec![vec![Fr::from(0u64)]];
+        state.challenges = vec![Fr::from(2u64)];
+        assert!(matches!(
+            state.check_and_generate_subclaim(&Fr::from(0u64)),
+            Err(PolyIOPErrors::InvalidParameters(_))
+        ));
+        Ok(())
+    }
 
     fn test_sumcheck(
         nv: usize,
@@ -228,7 +440,7 @@ mod test {
 
         let (poly, asserted_sum) =
             VirtualPolynomial::rand(nv, num_multiplicands_range, num_products, &mut rng)?;
-        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&poly, &mut transcript)?;
+        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&CpuBackend, &poly, &mut transcript)?;
         let poly_info = poly.aux_info.clone();
         let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
         let subclaim = <PolyIOP<Fr> as SumCheck<Fr>>::verify(
@@ -238,7 +450,7 @@ mod test {
             &mut transcript,
         )?;
         assert!(
-            poly.evaluate(&subclaim.point).unwrap() == subclaim.expected_evaluation,
+            CpuBackend.evaluate_vp(&poly, &subclaim.point).unwrap() == subclaim.expected_evaluation,
             "wrong subclaim"
         );
         Ok(())
@@ -251,9 +463,9 @@ mod test {
     ) -> Result<(), PolyIOPErrors> {
         let mut rng = test_rng();
         let (poly, asserted_sum) =
-            VirtualPolynomial::<Fr>::rand(nv, num_multiplicands_range, num_products, &mut rng)?;
+            VirtualPolynomial::<Fr, _>::rand(nv, num_multiplicands_range, num_products, &mut rng)?;
         let poly_info = poly.aux_info.clone();
-        let mut prover_state = IOPProverState::prover_init(&poly)?;
+        let mut prover_state = CpuBackend.prover_init(&poly)?;
         let mut verifier_state = IOPVerifierState::verifier_init(&poly_info);
         let mut challenge = None;
         let mut transcript = IOPTranscript::new(b"a test transcript");
@@ -261,9 +473,11 @@ mod test {
             .append_message(b"testing", b"initializing transcript for testing")
             .unwrap();
         for _ in 0..poly.aux_info.num_variables {
-            let prover_message =
-                IOPProverState::prove_round_and_update_state(&mut prover_state, &challenge)
-                    .unwrap();
+            let prover_message = IOPProverMessage::new(
+                CpuBackend
+                    .prove_round_and_update_state(&mut prover_state, &challenge)
+                    .unwrap(),
+            );
 
             challenge = Some(
                 IOPVerifierState::verify_round_and_update_state(
@@ -278,8 +492,60 @@ mod test {
             IOPVerifierState::check_and_generate_subclaim(&verifier_state, &asserted_sum)
                 .expect("fail to generate subclaim");
         assert!(
-            poly.evaluate(&subclaim.point).unwrap() == subclaim.expected_evaluation,
+            CpuBackend.evaluate_vp(&poly, &subclaim.point).unwrap() == subclaim.expected_evaluation,
             "wrong subclaim"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_prover_preserves_input_polynomial() -> Result<(), PolyIOPErrors> {
+        let mle = Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+            2,
+            vec![
+                Fr::from(2u64),
+                Fr::from(3u64),
+                Fr::from(5u64),
+                Fr::from(7u64),
+            ],
+        ));
+        let mut poly = VirtualPolynomial::new_from_mle(&mle, Fr::from(2u64));
+        poly.add_mle_list([mle.clone(), mle.clone()], Fr::from(3u64))?;
+        let point = [Fr::from(2u64), Fr::from(3u64)];
+        let original_evaluation = CpuBackend.evaluate_vp(&poly, &point)?;
+        let asserted_sum = mle
+            .evaluations
+            .iter()
+            .map(|value| Fr::from(2u64) * value + Fr::from(3u64) * value * value)
+            .sum();
+
+        let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&CpuBackend, &poly, &mut transcript)?;
+        let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let subclaim = <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+            asserted_sum,
+            &proof,
+            &poly.aux_info,
+            &mut transcript,
+        )?;
+        assert_eq!(proof.point, subclaim.point);
+        assert_eq!(
+            CpuBackend.evaluate_vp(&poly, &subclaim.point)?,
+            subclaim.expected_evaluation
+        );
+        assert_eq!(CpuBackend.evaluate_vp(&poly, &point)?, original_evaluation);
+        assert!(Arc::ptr_eq(&poly.flattened_ml_extensions()[0], &mle));
+
+        let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let repeated_proof =
+            <PolyIOP<Fr> as SumCheck<Fr>>::prove(&CpuBackend, &poly, &mut transcript)?;
+        assert_eq!(proof, repeated_proof);
+
+        poly.mul_by_mle(mle.clone(), Fr::from(1u64))?;
+        assert_eq!(poly.flattened_ml_extensions().len(), 1);
+        assert_eq!(
+            CpuBackend.evaluate_vp(&poly, &point)?,
+            original_evaluation * CpuBackend.evaluate_mle(&mle, &point)?
         );
         Ok(())
     }
@@ -316,9 +582,9 @@ mod test {
     fn test_extract_sum() -> Result<(), PolyIOPErrors> {
         let mut rng = test_rng();
         let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
-        let (poly, asserted_sum) = VirtualPolynomial::<Fr>::rand(8, (3, 4), 3, &mut rng)?;
+        let (poly, asserted_sum) = VirtualPolynomial::<Fr, _>::rand(8, (3, 4), 3, &mut rng)?;
 
-        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&poly, &mut transcript)?;
+        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&CpuBackend, &poly, &mut transcript)?;
         assert_eq!(
             <PolyIOP<Fr> as SumCheck<Fr>>::extract_sum(&proof),
             asserted_sum
@@ -365,16 +631,11 @@ mod test {
         )?;
         poly.add_mle_list(vec![ml_extensions[4].clone()], Fr::rand(&mut rng))?;
 
-        assert_eq!(poly.flattened_ml_extensions.len(), 5);
-
-        // test memory usage for prover
-        let prover = IOPProverState::<Fr>::prover_init(&poly).unwrap();
-        assert_eq!(prover.poly.flattened_ml_extensions.len(), 5);
-        drop(prover);
+        assert_eq!(poly.flattened_ml_extensions().len(), 5);
 
         let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
         let poly_info = poly.aux_info.clone();
-        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&poly, &mut transcript)?;
+        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&CpuBackend, &poly, &mut transcript)?;
         let asserted_sum = <PolyIOP<Fr> as SumCheck<Fr>>::extract_sum(&proof);
 
         let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
@@ -385,7 +646,7 @@ mod test {
             &mut transcript,
         )?;
         assert!(
-            poly.evaluate(&subclaim.point)? == subclaim.expected_evaluation,
+            CpuBackend.evaluate_vp(&poly, &subclaim.point)? == subclaim.expected_evaluation,
             "wrong subclaim"
         );
         Ok(())

@@ -4,22 +4,20 @@
 // You should have received a copy of the MIT License
 // along with the HyperPlonk library. If not, see <https://mit-license.org/>.
 
-use crate::{
-    custom_gate::CustomizedGates, errors::HyperPlonkErrors, structs::HyperPlonkParams,
-    witness::WitnessColumn,
-};
-use arithmetic::{evaluate_opt, VirtualPolynomial};
+use crate::{structs::HyperPlonkParams, CustomizedGates, HyperPlonkErrors, WitnessColumn};
 use ark_ec::pairing::Pairing;
 use ark_ff::PrimeField;
-use ark_poly::DenseMultilinearExtension;
-use std::{borrow::Borrow, sync::Arc};
-use subroutines::pcs::{prelude::Commitment, PolynomialCommitmentScheme};
+use backend::{Mle, MultilinearKzgBackend, SumCheckProver, VirtualPolynomial};
+use subroutines::PolynomialCommitmentScheme;
 use transcript::IOPTranscript;
 
 /// An accumulator structure that holds a polynomial and
 /// its opening points
-#[derive(Debug)]
-pub(super) struct PcsAccumulator<E: Pairing, PCS: PolynomialCommitmentScheme<E>> {
+pub(super) struct PcsAccumulator<
+    E: Pairing,
+    PCS: PolynomialCommitmentScheme<E>,
+    B: MultilinearKzgBackend<E>,
+> {
     // sequence:
     // - prod(x) at 5 points
     // - w_merged at perm check point
@@ -27,29 +25,22 @@ pub(super) struct PcsAccumulator<E: Pairing, PCS: PolynomialCommitmentScheme<E>>
     // - selector_merged at zero check points (#selector points)
     // - w[0] at r_pi
     pub(crate) num_var: usize,
-    pub(crate) polynomials: Vec<PCS::Polynomial>,
-    pub(crate) commitments: Vec<PCS::Commitment>,
+    pub(crate) polynomials: Vec<B::Mle>,
     pub(crate) points: Vec<PCS::Point>,
     pub(crate) evals: Vec<PCS::Evaluation>,
 }
 
-impl<E, PCS> PcsAccumulator<E, PCS>
+impl<E, PCS, B> PcsAccumulator<E, PCS, B>
 where
     E: Pairing,
-    PCS: PolynomialCommitmentScheme<
-        E,
-        Polynomial = Arc<DenseMultilinearExtension<E::ScalarField>>,
-        Point = Vec<E::ScalarField>,
-        Evaluation = E::ScalarField,
-        Commitment = Commitment<E>,
-    >,
+    PCS: PolynomialCommitmentScheme<E, Point = Vec<E::ScalarField>, Evaluation = E::ScalarField>,
+    B: MultilinearKzgBackend<E>,
 {
     /// Create an empty accumulator.
     pub(super) fn new(num_var: usize) -> Self {
         Self {
             num_var,
             polynomials: vec![],
-            commitments: vec![],
             points: vec![],
             evals: vec![],
         }
@@ -58,30 +49,34 @@ where
     /// Push a new evaluation point into the accumulator
     pub(super) fn insert_poly_and_points(
         &mut self,
-        poly: &PCS::Polynomial,
-        commit: &PCS::Commitment,
+        backend: &B,
+        poly: &B::Mle,
         point: &PCS::Point,
-    ) {
-        assert!(poly.num_vars == point.len());
-        assert!(poly.num_vars == self.num_var);
+    ) -> Result<(), HyperPlonkErrors> {
+        assert!(poly.num_vars() == self.num_var);
 
-        let eval = evaluate_opt(poly, point);
+        let eval = backend.evaluate_mle(poly, point)?;
 
         self.evals.push(eval);
         self.polynomials.push(poly.clone());
         self.points.push(point.clone());
-        self.commitments.push(*commit);
+        Ok(())
     }
 
     /// Batch open all the points over a merged polynomial.
     /// A simple wrapper of PCS::multi_open
     pub(super) fn multi_open(
         &self,
-        prover_param: impl Borrow<PCS::ProverParam>,
+        backend: &B,
+        prover_param: &B::PreparedProverParam,
         transcript: &mut IOPTranscript<E::ScalarField>,
-    ) -> Result<PCS::BatchProof, HyperPlonkErrors> {
+    ) -> Result<PCS::BatchProof, HyperPlonkErrors>
+    where
+        B: SumCheckProver<E::ScalarField>,
+    {
         Ok(PCS::multi_open(
-            prover_param.borrow(),
+            backend,
+            prover_param,
             self.polynomials.as_ref(),
             self.points.as_ref(),
             self.evals.as_ref(),
@@ -181,34 +176,36 @@ pub(crate) fn prover_sanity_check<F: PrimeField>(
 /// build `f(w_0(x),...w_d(x))` where `f` is the constraint polynomial
 /// i.e., `f(a, b, c) = q_l a(x) + q_r b(x) + q_m a(x)b(x) - q_o c(x)` in
 /// vanilla plonk
-pub(crate) fn build_f<F: PrimeField>(
+pub(crate) fn build_f<F: PrimeField, P: Mle<F>>(
     gates: &CustomizedGates,
     num_vars: usize,
-    selector_mles: &[Arc<DenseMultilinearExtension<F>>],
-    witness_mles: &[Arc<DenseMultilinearExtension<F>>],
-) -> Result<VirtualPolynomial<F>, HyperPlonkErrors> {
+    selector_mles: &[P],
+    witness_mles: &[P],
+) -> Result<VirtualPolynomial<F, P>, HyperPlonkErrors> {
     // TODO: check that selector and witness lengths match what is in
     // the gate definition
 
     for selector_mle in selector_mles.iter() {
-        if selector_mle.num_vars != num_vars {
+        if selector_mle.num_vars() != num_vars {
             return Err(HyperPlonkErrors::InvalidParameters(format!(
                 "selector has different number of vars: {} vs {}",
-                selector_mle.num_vars, num_vars
+                selector_mle.num_vars(),
+                num_vars
             )));
         }
     }
 
     for witness_mle in witness_mles.iter() {
-        if witness_mle.num_vars != num_vars {
+        if witness_mle.num_vars() != num_vars {
             return Err(HyperPlonkErrors::InvalidParameters(format!(
                 "selector has different number of vars: {} vs {}",
-                witness_mle.num_vars, num_vars
+                witness_mle.num_vars(),
+                num_vars
             )));
         }
     }
 
-    let mut res = VirtualPolynomial::<F>::new(num_vars);
+    let mut res = VirtualPolynomial::<F, P>::new(num_vars);
 
     for (coeff, selector, witnesses) in gates.gates.iter() {
         let coeff_fr = if *coeff < 0 {
@@ -233,7 +230,7 @@ pub(crate) fn eval_f<F: PrimeField>(
     gates: &CustomizedGates,
     selector_evals: &[F],
     witness_evals: &[F],
-) -> Result<F, HyperPlonkErrors> {
+) -> F {
     let mut res = F::zero();
     for (coeff, selector, witnesses) in gates.gates.iter() {
         let mut cur_value = if *coeff < 0 {
@@ -250,7 +247,7 @@ pub(crate) fn eval_f<F: PrimeField>(
         }
         res += cur_value;
     }
-    Ok(res)
+    res
 }
 
 // check perm check subclaim:
@@ -276,7 +273,7 @@ pub(crate) fn eval_perm_gate<F: PrimeField>(
     beta: F,
     gamma: F,
     x1: F,
-) -> Result<F, HyperPlonkErrors> {
+) -> F {
     let p1_eval = frac_evals[1] + x1 * (prod_evals[1] - frac_evals[1]);
     let p2_eval = frac_evals[2] + x1 * (prod_evals[2] - frac_evals[2]);
     let mut f_prod_eval = F::one();
@@ -289,15 +286,17 @@ pub(crate) fn eval_perm_gate<F: PrimeField>(
     }
     let res =
         prod_evals[0] - p1_eval * p2_eval + alpha * (frac_evals[0] * g_prod_eval - f_prod_eval);
-    Ok(res)
+    res
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu"))]
 mod test {
     use super::*;
     use ark_bls12_381::Fr;
     use ark_ff::PrimeField;
-    use ark_poly::MultilinearExtension;
+    use ark_poly::DenseMultilinearExtension;
+    use backend::{cpu::CpuBackend, MleBackend};
+    use std::sync::Arc;
     #[test]
     fn test_build_gate() -> Result<(), HyperPlonkErrors> {
         test_build_gate_helper::<Fr>()
@@ -344,44 +343,68 @@ mod test {
 
         // Sanity check on build_f
         // f(0, 0) = 0
-        assert_eq!(f.evaluate(&[F::zero(), F::zero()])?, F::zero());
+        assert_eq!(
+            CpuBackend.evaluate_vp(&f, &[F::zero(), F::zero()])?,
+            F::zero()
+        );
         // f(0, 1) = 2 * 0^5 + (-1) * 1 = -1
-        assert_eq!(f.evaluate(&[F::zero(), F::one()])?, -F::one());
+        assert_eq!(
+            CpuBackend.evaluate_vp(&f, &[F::zero(), F::one()])?,
+            -F::one()
+        );
         // f(1, 0) = 0 * 1^5 + (-1) * 1 = -1
-        assert_eq!(f.evaluate(&[F::one(), F::zero()])?, -F::one());
+        assert_eq!(
+            CpuBackend.evaluate_vp(&f, &[F::one(), F::zero()])?,
+            -F::one()
+        );
         // f(1, 1) = 5 * 2^5 + (-1) * 2 = 158
-        assert_eq!(f.evaluate(&[F::one(), F::one()])?, F::from(158u64));
+        assert_eq!(
+            CpuBackend.evaluate_vp(&f, &[F::one(), F::one()])?,
+            F::from(158u64)
+        );
 
         // test eval_f
         {
             let point = [F::zero(), F::zero()];
-            let selector_evals = ql.evaluate(&point).unwrap();
-            let witness_evals = [w1.evaluate(&point).unwrap(), w2.evaluate(&point).unwrap()];
-            let eval_f = eval_f(&gates, &[selector_evals], &witness_evals)?;
+            let selector_evals = CpuBackend.evaluate_mle(&ql, &point)?;
+            let witness_evals = [
+                CpuBackend.evaluate_mle(&w1, &point)?,
+                CpuBackend.evaluate_mle(&w2, &point)?,
+            ];
+            let eval_f = eval_f(&gates, &[selector_evals], &witness_evals);
             // f(0, 0) = 0
             assert_eq!(eval_f, F::zero());
         }
         {
             let point = [F::zero(), F::one()];
-            let selector_evals = ql.evaluate(&point).unwrap();
-            let witness_evals = [w1.evaluate(&point).unwrap(), w2.evaluate(&point).unwrap()];
-            let eval_f = eval_f(&gates, &[selector_evals], &witness_evals)?;
+            let selector_evals = CpuBackend.evaluate_mle(&ql, &point)?;
+            let witness_evals = [
+                CpuBackend.evaluate_mle(&w1, &point)?,
+                CpuBackend.evaluate_mle(&w2, &point)?,
+            ];
+            let eval_f = eval_f(&gates, &[selector_evals], &witness_evals);
             // f(0, 1) = 2 * 0^5 + (-1) * 1 = -1
             assert_eq!(eval_f, -F::one());
         }
         {
             let point = [F::one(), F::zero()];
-            let selector_evals = ql.evaluate(&point).unwrap();
-            let witness_evals = [w1.evaluate(&point).unwrap(), w2.evaluate(&point).unwrap()];
-            let eval_f = eval_f(&gates, &[selector_evals], &witness_evals)?;
+            let selector_evals = CpuBackend.evaluate_mle(&ql, &point)?;
+            let witness_evals = [
+                CpuBackend.evaluate_mle(&w1, &point)?,
+                CpuBackend.evaluate_mle(&w2, &point)?,
+            ];
+            let eval_f = eval_f(&gates, &[selector_evals], &witness_evals);
             // f(1, 0) = 0 * 1^5 + (-1) * 1 = -1
             assert_eq!(eval_f, -F::one());
         }
         {
             let point = [F::one(), F::one()];
-            let selector_evals = ql.evaluate(&point).unwrap();
-            let witness_evals = [w1.evaluate(&point).unwrap(), w2.evaluate(&point).unwrap()];
-            let eval_f = eval_f(&gates, &[selector_evals], &witness_evals)?;
+            let selector_evals = CpuBackend.evaluate_mle(&ql, &point)?;
+            let witness_evals = [
+                CpuBackend.evaluate_mle(&w1, &point)?,
+                CpuBackend.evaluate_mle(&w2, &point)?,
+            ];
+            let eval_f = eval_f(&gates, &[selector_evals], &witness_evals);
             // f(1, 1) = 5 * 2^5 + (-1) * 2 = 158
             assert_eq!(eval_f, F::from(158u64));
         }

@@ -6,6 +6,10 @@ set -e
 # We want the code to panic if there is an integer overflow
 export RUSTFLAGS="-C overflow-checks=on"
 
-cargo test --release --all
-cargo test --no-run --features=print-trace
-cargo bench --no-run
+cargo test --locked --workspace --release
+cargo check --locked --workspace --all-targets --no-default-features
+cargo test --locked --workspace --no-run \
+    --features backend/print-trace,subroutines/print-trace,hyperplonk/print-trace
+cargo check --locked --workspace --lib --no-default-features \
+    --features backend/print-trace,subroutines/print-trace,hyperplonk/print-trace
+cargo bench --locked --workspace --no-run

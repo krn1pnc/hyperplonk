@@ -7,9 +7,8 @@
 //! Main module for the HyperPlonk SNARK.
 
 use ark_ec::pairing::Pairing;
-use errors::HyperPlonkErrors;
-use subroutines::{pcs::prelude::PolynomialCommitmentScheme, poly_iop::prelude::PermutationCheck};
-use witness::WitnessColumn;
+use backend::MultilinearKzgBackend;
+use subroutines::{PermutationCheck, PolynomialCommitmentScheme};
 
 mod custom_gate;
 mod errors;
@@ -21,12 +20,19 @@ mod structs;
 mod utils;
 mod witness;
 
+pub use custom_gate::CustomizedGates;
+pub use errors::HyperPlonkErrors;
+pub use mock::MockCircuit;
+pub use selectors::SelectorColumn;
+pub use witness::WitnessColumn;
+
 /// A trait for HyperPlonk SNARKs.
 /// A HyperPlonk is derived from ZeroChecks and PermutationChecks.
-pub trait HyperPlonkSNARK<E, PCS>: PermutationCheck<E, PCS>
+pub trait HyperPlonkSNARK<E, PCS, B>: PermutationCheck<E, PCS>
 where
     E: Pairing,
     PCS: PolynomialCommitmentScheme<E>,
+    B: MultilinearKzgBackend<E>,
 {
     type Index;
     type ProvingKey;
@@ -36,6 +42,7 @@ where
     /// Generate the preprocessed polynomials output by the indexer.
     ///
     /// Inputs:
+    /// - `backend`: computation context owning the prepared prover resources
     /// - `index`: HyperPlonk index
     /// - `pcs_srs`: Polynomial commitment structured reference string
     ///
@@ -45,6 +52,7 @@ where
     /// - The HyperPlonk verifying key, which includes the preprocessed
     ///   polynomial commitments
     fn preprocess(
+        backend: &B,
         index: &Self::Index,
         pcs_srs: &PCS::SRS,
     ) -> Result<(Self::ProvingKey, Self::VerifyingKey), HyperPlonkErrors>;
@@ -52,6 +60,7 @@ where
     /// Generate HyperPlonk SNARK proof.
     ///
     /// Inputs:
+    /// - `backend`: the context used to preprocess the proving key
     /// - `pk`: circuit proving key
     /// - `pub_input`: online public input
     /// - `witness`: witness assignment
@@ -59,6 +68,7 @@ where
     /// Outputs:
     /// - The HyperPlonk SNARK proof.
     fn prove(
+        backend: &B,
         pk: &Self::ProvingKey,
         pub_input: &[E::ScalarField],
         witnesses: &[WitnessColumn<E::ScalarField>],

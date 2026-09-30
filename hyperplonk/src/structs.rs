@@ -6,16 +6,12 @@
 
 //! Main module for the HyperPlonk PolyIOP.
 
-use crate::{custom_gate::CustomizedGates, prelude::HyperPlonkErrors, selectors::SelectorColumn};
+use crate::{CustomizedGates, HyperPlonkErrors, SelectorColumn};
 use ark_ec::pairing::Pairing;
 use ark_ff::PrimeField;
-use ark_poly::DenseMultilinearExtension;
 use ark_std::log2;
-use std::sync::Arc;
-use subroutines::{
-    pcs::PolynomialCommitmentScheme,
-    poly_iop::prelude::{PermutationCheck, ZeroCheck},
-};
+use backend::MultilinearKzgBackend;
+use subroutines::{PermutationCheck, PolynomialCommitmentScheme, ZeroCheck};
 
 /// The proof for the HyperPlonk PolyIOP, consists of the following:
 ///   - the commitments to all witness MLEs
@@ -127,20 +123,23 @@ impl<F: PrimeField> HyperPlonkIndex<F> {
 ///   - the preprocessed polynomials output by the indexer
 ///   - the commitment to the selectors and permutations
 ///   - the parameters for polynomial commitment
-#[derive(Clone, Debug, Default, PartialEq)]
-pub struct HyperPlonkProvingKey<E: Pairing, PCS: PolynomialCommitmentScheme<E>> {
+pub struct HyperPlonkProvingKey<
+    E: Pairing,
+    PCS: PolynomialCommitmentScheme<E>,
+    B: MultilinearKzgBackend<E>,
+> {
     /// Hyperplonk instance parameters
     pub params: HyperPlonkParams,
     /// The preprocessed permutation polynomials
-    pub permutation_oracles: Vec<Arc<DenseMultilinearExtension<E::ScalarField>>>,
+    pub permutation_oracles: Vec<B::Mle>,
     /// The preprocessed selector polynomials
-    pub selector_oracles: Vec<Arc<DenseMultilinearExtension<E::ScalarField>>>,
+    pub selector_oracles: Vec<B::Mle>,
     /// Commitments to the preprocessed selector polynomials
     pub selector_commitments: Vec<PCS::Commitment>,
     /// Commitments to the preprocessed permutation polynomials
     pub permutation_commitments: Vec<PCS::Commitment>,
     /// The parameters for PCS commitment
-    pub pcs_param: PCS::ProverParam,
+    pub pcs_param: B::PreparedProverParam,
 }
 
 /// The HyperPlonk verifying key, consists of the following:

@@ -13,7 +13,6 @@ pub mod prelude;
 mod prod_check;
 mod structs;
 mod sum_check;
-mod utils;
 mod zero_check;
 
 #[derive(Clone, Debug, Default, Copy, PartialEq, Eq)]

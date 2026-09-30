@@ -5,20 +5,52 @@
 // along with the HyperPlonk library. If not, see <https://mit-license.org/>.
 
 //! Implementing Structured Reference Strings for multilinear polynomial KZG
-use crate::pcs::{
-    multilinear_kzg::util::{eq_eval, eq_extension},
-    prelude::PCSError,
-    StructuredReferenceString,
-};
-use ark_ec::{pairing::Pairing, scalar_mul::fixed_base::FixedBase, AffineRepr, CurveGroup};
-use ark_ff::{Field, PrimeField, Zero};
-use ark_poly::DenseMultilinearExtension;
+use crate::{PCSError, StructuredReferenceString};
+use ark_ec::{pairing::Pairing, scalar_mul::ScalarMul, AffineRepr, CurveGroup};
+use ark_ff::{Field, Zero};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::{
     collections::LinkedList, end_timer, format, rand::Rng, start_timer, string::ToString, vec::Vec,
     UniformRand,
 };
+use backend::{common::eq::eq_eval, MultilinearKzgBackend};
 use core::iter::FromIterator;
+
+/// Generate eq(t,x), a product of multilinear polynomials with fixed t.
+/// eq(a,b) is the multilinear extension of equality on {0,1}^num_vars:
+/// it evaluates to 1 when a and b in {0,1}^num_vars are equal.
+/// Returns one full-dimensional Boolean evaluation table for each factor
+/// eq(t_i, x_i). Coordinate zero is the low table bit; an empty point
+/// returns no factor tables.
+fn build_eq_factor_tables<F: Field>(t: &[F]) -> Vec<Vec<F>> {
+    let start = start_timer!(|| "eq extension");
+
+    let dim = t.len();
+    let mut result = Vec::with_capacity(dim);
+    for (i, &ti) in t.iter().enumerate() {
+        let mut poly = Vec::with_capacity(1 << dim);
+        for x in 0..(1 << dim) {
+            let xi = if x >> i & 1 == 1 { F::one() } else { F::zero() };
+            let ti_xi = ti * xi;
+            poly.push(ti_xi + ti_xi - xi - ti + F::one());
+        }
+        result.push(poly);
+    }
+
+    end_timer!(start);
+    result
+}
+
+/// fix first `pad` variables of `evaluations` represented in evaluation form
+/// to zero by stride projection.
+/// Requires a nonempty power-of-two table and pad <= log2(evaluations.len()).
+fn fix_first_variables_to_zero<F: Field>(evaluations: &[F], pad: usize) -> Vec<F> {
+    if pad == 0 {
+        return evaluations.to_vec();
+    }
+    let nv = ark_std::log2(evaluations.len()) as usize - pad;
+    (0..(1 << nv)).map(|x| evaluations[x << pad]).collect()
+}
 
 /// Evaluations over {0,1}^n for G1 or G2
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug)]
@@ -30,8 +62,16 @@ pub struct Evaluations<C: AffineRepr> {
 /// Universal Parameter
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug)]
 pub struct MultilinearUniversalParams<E: Pairing> {
-    /// prover parameters
-    pub prover_param: MultilinearProverParam<E>,
+    /// number of variables
+    pub num_vars: usize,
+    /// `pp_{0}`, `pp_{1}`, ...,pp_{nu_vars} defined
+    /// by XZZPD19 where pp_{nv-0}=g and
+    /// pp_{nv-i}=g^{eq((t_1,..t_i),(X_1,..X_i))}
+    pub powers_of_g: Vec<Evaluations<E::G1Affine>>,
+    /// generator for G1
+    pub g: E::G1Affine,
+    /// generator for G2
+    pub h: E::G2Affine,
     /// h^randomness: h^t1, h^t2, ..., **h^{t_nv}**
     pub h_mask: Vec<E::G2Affine>,
 }
@@ -51,6 +91,19 @@ pub struct MultilinearProverParam<E: Pairing> {
     pub h: E::G2Affine,
 }
 
+impl<E: Pairing> MultilinearProverParam<E> {
+    /// Consume host layers into backend-owned prepared prover resources.
+    pub fn prepare<B: MultilinearKzgBackend<E>>(
+        self,
+        backend: &B,
+    ) -> Result<B::PreparedProverParam, PCSError> {
+        Ok(backend.prepare_prover_param(
+            self.num_vars,
+            self.powers_of_g.into_iter().map(|layer| layer.evals),
+        )?)
+    }
+}
+
 /// Verifier Parameters
 #[derive(CanonicalSerialize, CanonicalDeserialize, Clone, Debug)]
 pub struct MultilinearVerifierParam<E: Pairing> {
@@ -68,55 +121,32 @@ impl<E: Pairing> StructuredReferenceString<E> for MultilinearUniversalParams<E> 
     type ProverParam = MultilinearProverParam<E>;
     type VerifierParam = MultilinearVerifierParam<E>;
 
-    /// Extract the prover parameters from the public parameters.
-    fn extract_prover_param(&self, supported_num_vars: usize) -> Self::ProverParam {
-        let to_reduce = self.prover_param.num_vars - supported_num_vars;
-
-        Self::ProverParam {
-            powers_of_g: self.prover_param.powers_of_g[to_reduce..].to_vec(),
-            g: self.prover_param.g,
-            h: self.prover_param.h,
-            num_vars: supported_num_vars,
-        }
-    }
-
-    /// Extract the verifier parameters from the public parameters.
-    fn extract_verifier_param(&self, supported_num_vars: usize) -> Self::VerifierParam {
-        let to_reduce = self.prover_param.num_vars - supported_num_vars;
-        Self::VerifierParam {
-            num_vars: supported_num_vars,
-            g: self.prover_param.g,
-            h: self.prover_param.h,
-            h_mask: self.h_mask[to_reduce..].to_vec(),
-        }
-    }
-
     /// Trim the universal parameters to specialize the public parameters
     /// for multilinear polynomials to the given `supported_num_vars`, and
     /// returns committer key and verifier key. `supported_num_vars` should
-    /// be in range `1..=params.num_vars`
+    /// be in range `0..=params.num_vars`.
     fn trim(
         &self,
         supported_num_vars: usize,
     ) -> Result<(Self::ProverParam, Self::VerifierParam), PCSError> {
-        if supported_num_vars > self.prover_param.num_vars {
+        if supported_num_vars > self.num_vars {
             return Err(PCSError::InvalidParameters(format!(
                 "SRS does not support target number of vars {}",
                 supported_num_vars
             )));
         }
 
-        let to_reduce = self.prover_param.num_vars - supported_num_vars;
+        let to_reduce = self.num_vars - supported_num_vars;
         let ck = Self::ProverParam {
-            powers_of_g: self.prover_param.powers_of_g[to_reduce..].to_vec(),
-            g: self.prover_param.g,
-            h: self.prover_param.h,
+            powers_of_g: self.powers_of_g[to_reduce..].to_vec(),
+            g: self.g,
+            h: self.h,
             num_vars: supported_num_vars,
         };
         let vk = Self::VerifierParam {
             num_vars: supported_num_vars,
-            g: self.prover_param.g,
-            h: self.prover_param.h,
+            g: self.g,
+            h: self.h,
             h_mask: self.h_mask[to_reduce..].to_vec(),
         };
         Ok((ck, vk))
@@ -142,17 +172,16 @@ impl<E: Pairing> StructuredReferenceString<E> for MultilinearUniversalParams<E> 
         let mut powers_of_g = Vec::new();
 
         let t: Vec<_> = (0..num_vars).map(|_| E::ScalarField::rand(rng)).collect();
-        let scalar_bits = E::ScalarField::MODULUS_BIT_SIZE as usize;
 
-        let mut eq: LinkedList<DenseMultilinearExtension<E::ScalarField>> =
-            LinkedList::from_iter(eq_extension(&t));
+        let mut eq: LinkedList<Vec<E::ScalarField>> =
+            LinkedList::from_iter(build_eq_factor_tables(&t));
         let mut eq_arr = LinkedList::new();
-        let mut base = eq.pop_back().unwrap().evaluations;
+        let mut base = eq.pop_back().unwrap();
 
         for i in (0..num_vars).rev() {
-            eq_arr.push_front(remove_dummy_variable(&base, i)?);
+            eq_arr.push_front(fix_first_variables_to_zero(&base, i));
             if i != 0 {
-                let mul = eq.pop_back().unwrap().evaluations;
+                let mul = eq.pop_back().unwrap();
                 base = base
                     .into_iter()
                     .zip(mul.into_iter())
@@ -162,22 +191,13 @@ impl<E: Pairing> StructuredReferenceString<E> for MultilinearUniversalParams<E> 
         }
 
         let mut pp_powers = Vec::new();
-        let mut total_scalars = 0;
         for i in 0..num_vars {
             let eq = eq_arr.pop_front().unwrap();
             let pp_k_powers = (0..(1 << (num_vars - i))).map(|x| eq[x]);
             pp_powers.extend(pp_k_powers);
-            total_scalars += 1 << (num_vars - i);
         }
-        let window_size = FixedBase::get_mul_window_size(total_scalars);
-        let g_table = FixedBase::get_window_table(scalar_bits, window_size, g);
 
-        let pp_g = E::G1::normalize_batch(&FixedBase::msm(
-            scalar_bits,
-            window_size,
-            &g_table,
-            &pp_powers,
-        ));
+        let pp_g = g.batch_mul(&pp_powers);
 
         let mut start = 0;
         for i in 0..num_vars {
@@ -186,7 +206,10 @@ impl<E: Pairing> StructuredReferenceString<E> for MultilinearUniversalParams<E> 
                 evals: pp_g[start..(start + size)].to_vec(),
             };
             // check correctness of pp_k_g
-            let t_eval_0 = eq_eval(&vec![E::ScalarField::zero(); num_vars - i], &t[i..num_vars])?;
+            let t_eval_0 = eq_eval(&vec![E::ScalarField::zero(); num_vars - i], &t[i..num_vars])
+                .map_err(|_| {
+                    PCSError::InvalidParameters("x and y have different length".to_string())
+                })?;
             assert_eq!((g * t_eval_0).into(), pp_k_g.evals[0]);
             powers_of_g.push(pp_k_g);
             start += size;
@@ -196,58 +219,70 @@ impl<E: Pairing> StructuredReferenceString<E> for MultilinearUniversalParams<E> 
         };
         powers_of_g.push(gg);
 
-        let pp = Self::ProverParam {
-            num_vars,
-            g: g.into_affine(),
-            h: h.into_affine(),
-            powers_of_g,
-        };
-
         end_timer!(pp_generation_timer);
 
         let vp_generation_timer = start_timer!(|| "VP generation");
-        let h_mask = {
-            let window_size = FixedBase::get_mul_window_size(num_vars);
-            let h_table = FixedBase::get_window_table(scalar_bits, window_size, h);
-            E::G2::normalize_batch(&FixedBase::msm(scalar_bits, window_size, &h_table, &t))
-        };
+        let h_mask = h.batch_mul(&t);
         end_timer!(vp_generation_timer);
         end_timer!(total_timer);
         Ok(Self {
-            prover_param: pp,
+            num_vars,
+            powers_of_g,
+            g: g.into_affine(),
+            h: h.into_affine(),
             h_mask,
         })
     }
 }
 
-/// fix first `pad` variables of `poly` represented in evaluation form to zero
-fn remove_dummy_variable<F: Field>(poly: &[F], pad: usize) -> Result<Vec<F>, PCSError> {
-    if pad == 0 {
-        return Ok(poly.to_vec());
-    }
-    if !poly.len().is_power_of_two() {
-        return Err(PCSError::InvalidParameters(
-            "Size of polynomial should be power of two.".to_string(),
-        ));
-    }
-    let nv = ark_std::log2(poly.len()) as usize - pad;
-    Ok((0..(1 << nv)).map(|x| poly[x << pad]).collect())
-}
-
-#[cfg(test)]
-mod tests {
+#[cfg(all(test, feature = "cpu"))]
+mod test {
     use super::*;
-    use ark_bls12_381::Bls12_381;
-    use ark_std::test_rng;
-    type E = Bls12_381;
+    use crate::{MultilinearKzgPCS, PolynomialCommitmentScheme};
+    use ark_bls12_381::{Bls12_381, Fr};
+    use ark_poly::{DenseMultilinearExtension, Polynomial};
+    use ark_std::rand::{rngs::StdRng, SeedableRng};
+    use backend::cpu::CpuBackend;
+    use std::sync::Arc;
 
     #[test]
-    fn test_srs_gen() -> Result<(), PCSError> {
-        let mut rng = test_rng();
-        for nv in 4..10 {
-            let _ = MultilinearUniversalParams::<E>::gen_srs_for_testing(&mut rng, nv)?;
-        }
+    fn serialized_srs_trims_matching_keys() -> Result<(), PCSError> {
+        type PCS = MultilinearKzgPCS<Bls12_381>;
+        let mut rng = StdRng::seed_from_u64(7);
+        let srs = PCS::gen_srs_for_testing(&mut rng, 3)?;
+        let (full_ck, full_vk) = srs.trim(3)?;
+        let backend = CpuBackend;
+        let full_ck = full_ck.prepare(&backend)?;
+        let mut bytes = Vec::new();
+        srs.serialize_compressed(&mut bytes).unwrap();
+        let mut reader = bytes.as_slice();
+        let restored =
+            MultilinearUniversalParams::<Bls12_381>::deserialize_compressed(&mut reader).unwrap();
+        assert!(reader.is_empty());
 
+        for num_vars in 0..=3 {
+            let (ck, vk) = restored.trim(num_vars)?;
+            let ck = ck.prepare(&backend)?;
+            let polynomial = Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+                num_vars,
+                (0..(1u64 << num_vars))
+                    .map(|i| Fr::from(i * i + 2))
+                    .collect(),
+            ));
+            let commitment = PCS::commit(&backend, &ck, &polynomial)?;
+            assert_eq!(commitment, PCS::commit(&backend, &full_ck, &polynomial)?);
+            let point = (0..num_vars)
+                .map(|i| Fr::from(i as u64 + 3))
+                .collect::<Vec<_>>();
+            let (proof, value) = PCS::open(&backend, &ck, &polynomial, &point)?;
+            assert_eq!(value, polynomial.evaluate(&point));
+            assert!(PCS::verify(&vk, &commitment, &point, &value, &proof)?);
+            assert!(PCS::verify(&full_vk, &commitment, &point, &value, &proof)?);
+        }
+        assert!(matches!(
+            restored.trim(4),
+            Err(PCSError::InvalidParameters(_))
+        ));
         Ok(())
     }
 }

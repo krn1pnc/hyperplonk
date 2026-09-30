@@ -7,20 +7,13 @@
 //! Main module for the Product Check protocol
 
 use crate::{
-    pcs::PolynomialCommitmentScheme,
-    poly_iop::{
-        errors::PolyIOPErrors,
-        prod_check::util::{compute_frac_poly, compute_product_poly, prove_zero_check},
-        zero_check::ZeroCheck,
-        PolyIOP,
-    },
+    poly_iop::prod_check::util::prove_zero_check, PolyIOP, PolyIOPErrors,
+    PolynomialCommitmentScheme, ZeroCheck,
 };
-use arithmetic::VPAuxInfo;
 use ark_ec::pairing::Pairing;
 use ark_ff::{One, PrimeField, Zero};
-use ark_poly::DenseMultilinearExtension;
 use ark_std::{end_timer, start_timer};
-use std::sync::Arc;
+use backend::{Mle, MultilinearKzgBackend, SumCheckProver, VPAuxInfo};
 use transcript::IOPTranscript;
 
 mod util;
@@ -74,10 +67,11 @@ where
     /// = \prod_{x \in {0,1}^n} g1(x) * ... * gk(x)
     ///
     /// Inputs:
+    /// - backend: computation context for the prover operations
     /// - fxs: the list of numerator multilinear polynomial
     /// - gxs: the list of denominator multilinear polynomial
     /// - transcript: the IOP transcript
-    /// - pk: PCS committing key
+    /// - pcs_param: prepared PCS committing key
     ///
     /// Outputs
     /// - the product check proof
@@ -86,19 +80,15 @@ where
     ///
     /// Cost: O(N)
     #[allow(clippy::type_complexity)]
-    fn prove(
-        pcs_param: &PCS::ProverParam,
-        fxs: &[Self::MultilinearExtension],
-        gxs: &[Self::MultilinearExtension],
+    fn prove<B>(
+        backend: &B,
+        pcs_param: &B::PreparedProverParam,
+        fxs: &[B::Mle],
+        gxs: &[B::Mle],
         transcript: &mut IOPTranscript<E::ScalarField>,
-    ) -> Result<
-        (
-            Self::ProductCheckProof,
-            Self::MultilinearExtension,
-            Self::MultilinearExtension,
-        ),
-        PolyIOPErrors,
-    >;
+    ) -> Result<(Self::ProductCheckProof, B::Mle, B::Mle), PolyIOPErrors>
+    where
+        B: SumCheckProver<E::ScalarField> + MultilinearKzgBackend<E>;
 
     /// Verify that for witness multilinear polynomials (f1, ..., fk, g1, ...,
     /// gk) it holds that
@@ -148,7 +138,7 @@ pub struct ProductCheckProof<
 impl<E, PCS> ProductCheck<E, PCS> for PolyIOP<E::ScalarField>
 where
     E: Pairing,
-    PCS: PolynomialCommitmentScheme<E, Polynomial = Arc<DenseMultilinearExtension<E::ScalarField>>>,
+    PCS: PolynomialCommitmentScheme<E>,
 {
     type ProductCheckSubClaim = ProductCheckSubClaim<E::ScalarField, Self>;
     type ProductCheckProof = ProductCheckProof<E, PCS, Self>;
@@ -157,19 +147,16 @@ where
         IOPTranscript::<E::ScalarField>::new(b"Initializing ProductCheck transcript")
     }
 
-    fn prove(
-        pcs_param: &PCS::ProverParam,
-        fxs: &[Self::MultilinearExtension],
-        gxs: &[Self::MultilinearExtension],
+    fn prove<B>(
+        backend: &B,
+        pcs_param: &B::PreparedProverParam,
+        fxs: &[B::Mle],
+        gxs: &[B::Mle],
         transcript: &mut IOPTranscript<E::ScalarField>,
-    ) -> Result<
-        (
-            Self::ProductCheckProof,
-            Self::MultilinearExtension,
-            Self::MultilinearExtension,
-        ),
-        PolyIOPErrors,
-    > {
+    ) -> Result<(Self::ProductCheckProof, B::Mle, B::Mle), PolyIOPErrors>
+    where
+        B: SumCheckProver<E::ScalarField> + MultilinearKzgBackend<E>,
+    {
         let start = start_timer!(|| "prod_check prove");
 
         if fxs.is_empty() {
@@ -180,8 +167,9 @@ where
                 "fxs and gxs have different number of polynomials".to_string(),
             ));
         }
+        let num_vars = fxs[0].num_vars();
         for poly in fxs.iter().chain(gxs.iter()) {
-            if poly.num_vars != fxs[0].num_vars {
+            if poly.num_vars() != num_vars {
                 return Err(PolyIOPErrors::InvalidParameters(
                     "fx and gx have different number of variables".to_string(),
                 ));
@@ -190,20 +178,28 @@ where
 
         // compute the fractional polynomial frac_p s.t.
         // frac_p(x) = f1(x) * ... * fk(x) / (g1(x) * ... * gk(x))
-        let frac_poly = compute_frac_poly(fxs, gxs)?;
+        let frac_poly = backend.compute_frac_poly(fxs, gxs)?;
         // compute the product polynomial
-        let prod_x = compute_product_poly(&frac_poly)?;
+        let prod_x = backend.compute_product_poly(&frac_poly)?;
 
         // generate challenge
-        let frac_comm = PCS::commit(pcs_param, &frac_poly)?;
-        let prod_x_comm = PCS::commit(pcs_param, &prod_x)?;
+        let frac_comm = PCS::commit(backend, pcs_param, &frac_poly)?;
+        let prod_x_comm = PCS::commit(backend, pcs_param, &prod_x)?;
         transcript.append_serializable_element(b"frac(x)", &frac_comm)?;
         transcript.append_serializable_element(b"prod(x)", &prod_x_comm)?;
         let alpha = transcript.get_and_append_challenge(b"alpha")?;
 
+        let product_factors = backend.compute_product_factors(&frac_poly, &prod_x)?;
         // build the zero-check proof
-        let (zero_check_proof, _) =
-            prove_zero_check(fxs, gxs, &frac_poly, &prod_x, &alpha, transcript)?;
+        let zero_check_proof = prove_zero_check(
+            backend,
+            fxs,
+            gxs,
+            &frac_poly,
+            (&prod_x, product_factors),
+            &alpha,
+            transcript,
+        )?;
 
         end_timer!(start);
 
@@ -254,18 +250,17 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu"))]
 mod test {
-    use super::ProductCheck;
     use crate::{
-        pcs::{prelude::MultilinearKzgPCS, PolynomialCommitmentScheme},
-        poly_iop::{errors::PolyIOPErrors, PolyIOP},
+        MultilinearKzgPCS, MultilinearProverParam, PolyIOP, PolyIOPErrors,
+        PolynomialCommitmentScheme, ProductCheck,
     };
-    use arithmetic::VPAuxInfo;
     use ark_bls12_381::{Bls12_381, Fr};
     use ark_ec::pairing::Pairing;
     use ark_poly::{DenseMultilinearExtension, MultilinearExtension};
     use ark_std::test_rng;
+    use backend::{cpu::CpuBackend, MleBackend, MultilinearKzgBackend, VPAuxInfo};
     use std::{marker::PhantomData, sync::Arc};
 
     fn check_frac_poly<E>(
@@ -294,22 +289,21 @@ mod test {
     // fs and gs are guaranteed to have the same product
     // fs and hs doesn't have the same product
     fn test_product_check_helper<E, PCS>(
+        backend: &CpuBackend,
         fs: &[Arc<DenseMultilinearExtension<E::ScalarField>>],
         gs: &[Arc<DenseMultilinearExtension<E::ScalarField>>],
         hs: &[Arc<DenseMultilinearExtension<E::ScalarField>>],
-        pcs_param: &PCS::ProverParam,
+        pcs_param: &<CpuBackend as MultilinearKzgBackend<E>>::PreparedProverParam,
     ) -> Result<(), PolyIOPErrors>
     where
         E: Pairing,
-        PCS: PolynomialCommitmentScheme<
-            E,
-            Polynomial = Arc<DenseMultilinearExtension<E::ScalarField>>,
-        >,
+        PCS: PolynomialCommitmentScheme<E, ProverParam = MultilinearProverParam<E>>,
     {
         let mut transcript = <PolyIOP<E::ScalarField> as ProductCheck<E, PCS>>::init_transcript();
         transcript.append_message(b"testing", b"initializing transcript for testing")?;
 
         let (proof, prod_x, frac_poly) = <PolyIOP<E::ScalarField> as ProductCheck<E, PCS>>::prove(
+            backend,
             pcs_param,
             fs,
             gs,
@@ -331,7 +325,7 @@ mod test {
             &mut transcript,
         )?;
         assert_eq!(
-            prod_x.evaluate(&prod_subclaim.final_query.0).unwrap(),
+            backend.evaluate_mle(&prod_x, &prod_subclaim.final_query.0)?,
             prod_subclaim.final_query.1,
             "different product"
         );
@@ -345,7 +339,7 @@ mod test {
             E,
             PCS,
         >>::prove(
-            pcs_param, fs, hs, &mut transcript
+            backend, pcs_param, fs, hs, &mut transcript
         )?;
 
         let mut transcript = <PolyIOP<E::ScalarField> as ProductCheck<E, PCS>>::init_transcript();
@@ -356,7 +350,7 @@ mod test {
             &mut transcript,
         )?;
         assert_ne!(
-            prod_x_bad.evaluate(&bad_subclaim.final_query.0).unwrap(),
+            backend.evaluate_mle(&prod_x_bad, &bad_subclaim.final_query.0)?,
             bad_subclaim.final_query.1,
             "can't detect wrong proof"
         );
@@ -386,10 +380,12 @@ mod test {
         }
 
         let srs = MultilinearKzgPCS::<Bls12_381>::gen_srs_for_testing(&mut rng, nv)?;
-        let (pcs_param, _) = MultilinearKzgPCS::<Bls12_381>::trim(&srs, None, Some(nv))?;
+        let (pcs_param, _) = MultilinearKzgPCS::<Bls12_381>::trim(&srs, nv)?;
+        let backend = CpuBackend;
+        let pcs_param = pcs_param.prepare(&backend)?;
 
         test_product_check_helper::<Bls12_381, MultilinearKzgPCS<Bls12_381>>(
-            &fs, &gs, &hs, &pcs_param,
+            &backend, &fs, &gs, &hs, &pcs_param,
         )?;
 
         Ok(())

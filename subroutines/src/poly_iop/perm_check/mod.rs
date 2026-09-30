@@ -6,15 +6,10 @@
 
 //! Main module for the Permutation Check protocol
 
-use self::util::computer_nums_and_denoms;
-use crate::{
-    pcs::PolynomialCommitmentScheme,
-    poly_iop::{errors::PolyIOPErrors, prelude::ProductCheck, PolyIOP},
-};
+use crate::{PolyIOP, PolyIOPErrors, PolynomialCommitmentScheme, ProductCheck};
 use ark_ec::pairing::Pairing;
-use ark_poly::DenseMultilinearExtension;
 use ark_std::{end_timer, start_timer};
-use std::sync::Arc;
+use backend::{Mle, MultilinearKzgBackend, SumCheckProver};
 use transcript::IOPTranscript;
 
 /// A permutation subclaim consists of
@@ -32,8 +27,6 @@ where
     /// Challenges beta and gamma
     pub challenges: (E::ScalarField, E::ScalarField),
 }
-
-pub mod util;
 
 /// A PermutationCheck w.r.t. `(fs, gs, perms)`
 /// proves that (g1, ..., gk) is a permutation of (f1, ..., fk) under
@@ -63,6 +56,8 @@ where
     fn init_transcript() -> Self::Transcript;
 
     /// Inputs:
+    /// - backend: computation context for the prover operations
+    /// - pcs_param: prepared PCS committing key
     /// - fs = (f1, ..., fk)
     /// - gs = (g1, ..., gk)
     /// - permutation oracles = (p1, ..., pk)
@@ -75,20 +70,16 @@ where
     ///
     /// Cost: O(N)
     #[allow(clippy::type_complexity)]
-    fn prove(
-        pcs_param: &PCS::ProverParam,
-        fxs: &[Self::MultilinearExtension],
-        gxs: &[Self::MultilinearExtension],
-        perms: &[Self::MultilinearExtension],
+    fn prove<B>(
+        backend: &B,
+        pcs_param: &B::PreparedProverParam,
+        fxs: &[B::Mle],
+        gxs: &[B::Mle],
+        perms: &[B::Mle],
         transcript: &mut IOPTranscript<E::ScalarField>,
-    ) -> Result<
-        (
-            Self::PermutationProof,
-            Self::MultilinearExtension,
-            Self::MultilinearExtension,
-        ),
-        PolyIOPErrors,
-    >;
+    ) -> Result<(Self::PermutationProof, B::Mle, B::Mle), PolyIOPErrors>
+    where
+        B: SumCheckProver<E::ScalarField> + MultilinearKzgBackend<E>;
 
     /// Verify that (g1, ..., gk) is a permutation of
     /// (f1, ..., fk) over the permutation oracles (perm1, ..., permk)
@@ -102,7 +93,7 @@ where
 impl<E, PCS> PermutationCheck<E, PCS> for PolyIOP<E::ScalarField>
 where
     E: Pairing,
-    PCS: PolynomialCommitmentScheme<E, Polynomial = Arc<DenseMultilinearExtension<E::ScalarField>>>,
+    PCS: PolynomialCommitmentScheme<E>,
 {
     type PermutationCheckSubClaim = PermutationCheckSubClaim<E, PCS, Self>;
     type PermutationProof = Self::ProductCheckProof;
@@ -111,20 +102,17 @@ where
         IOPTranscript::<E::ScalarField>::new(b"Initializing PermutationCheck transcript")
     }
 
-    fn prove(
-        pcs_param: &PCS::ProverParam,
-        fxs: &[Self::MultilinearExtension],
-        gxs: &[Self::MultilinearExtension],
-        perms: &[Self::MultilinearExtension],
+    fn prove<B>(
+        backend: &B,
+        pcs_param: &B::PreparedProverParam,
+        fxs: &[B::Mle],
+        gxs: &[B::Mle],
+        perms: &[B::Mle],
         transcript: &mut IOPTranscript<E::ScalarField>,
-    ) -> Result<
-        (
-            Self::PermutationProof,
-            Self::MultilinearExtension,
-            Self::MultilinearExtension,
-        ),
-        PolyIOPErrors,
-    > {
+    ) -> Result<(Self::PermutationProof, B::Mle, B::Mle), PolyIOPErrors>
+    where
+        B: SumCheckProver<E::ScalarField> + MultilinearKzgBackend<E>,
+    {
         let start = start_timer!(|| "Permutation check prove");
         if fxs.is_empty() {
             return Err(PolyIOPErrors::InvalidParameters("fxs is empty".to_string()));
@@ -138,9 +126,11 @@ where
             )));
         }
 
-        let num_vars = fxs[0].num_vars;
+        let num_vars = fxs[0].num_vars();
         for ((fx, gx), perm) in fxs.iter().zip(gxs.iter()).zip(perms.iter()) {
-            if (fx.num_vars != num_vars) || (gx.num_vars != num_vars) || (perm.num_vars != num_vars)
+            if (fx.num_vars() != num_vars)
+                || (gx.num_vars() != num_vars)
+                || (perm.num_vars() != num_vars)
             {
                 return Err(PolyIOPErrors::InvalidParameters(
                     "number of variables unmatched".to_string(),
@@ -151,10 +141,12 @@ where
         // generate challenge `beta` and `gamma` from current transcript
         let beta = transcript.get_and_append_challenge(b"beta")?;
         let gamma = transcript.get_and_append_challenge(b"gamma")?;
-        let (numerators, denominators) = computer_nums_and_denoms(&beta, &gamma, fxs, gxs, perms)?;
+        let (numerators, denominators) =
+            backend.compute_nums_and_denoms(&beta, &gamma, fxs, gxs, perms)?;
 
         // invoke product check on numerator and denominator
         let (proof, prod_poly, frac_poly) = <Self as ProductCheck<E, PCS>>::prove(
+            backend,
             pcs_param,
             &numerators,
             &denominators,
@@ -187,34 +179,54 @@ where
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu"))]
 mod test {
-    use super::PermutationCheck;
     use crate::{
-        pcs::{prelude::MultilinearKzgPCS, PolynomialCommitmentScheme},
-        poly_iop::{errors::PolyIOPErrors, PolyIOP},
+        MultilinearKzgPCS, MultilinearProverParam, PermutationCheck, PolyIOP, PolyIOPErrors,
+        PolynomialCommitmentScheme,
     };
-    use arithmetic::{evaluate_opt, identity_permutation_mles, random_permutation_mles, VPAuxInfo};
     use ark_bls12_381::Bls12_381;
     use ark_ec::pairing::Pairing;
+    use ark_ff::PrimeField;
     use ark_poly::{DenseMultilinearExtension, MultilinearExtension};
-    use ark_std::test_rng;
+    use ark_std::{rand::RngCore, test_rng};
+    use backend::{
+        common::permutation::random_permutation,
+        cpu::{identity_permutation_mles, CpuBackend},
+        MleBackend, MultilinearKzgBackend, VPAuxInfo,
+    };
     use std::{marker::PhantomData, sync::Arc};
+
+    /// A list of MLEs that represent a random permutation
+    fn random_permutation_mles<F: PrimeField, R: RngCore>(
+        num_vars: usize,
+        num_chunks: usize,
+        rng: &mut R,
+    ) -> Vec<Arc<DenseMultilinearExtension<F>>> {
+        let s_perm_vec = random_permutation(num_vars, num_chunks, rng);
+        let mut res = vec![];
+        let n = 1 << num_vars;
+        for i in 0..num_chunks {
+            res.push(Arc::new(DenseMultilinearExtension::from_evaluations_vec(
+                num_vars,
+                s_perm_vec[i * n..i * n + n].to_vec(),
+            )));
+        }
+        res
+    }
 
     type Kzg = MultilinearKzgPCS<Bls12_381>;
 
     fn test_permutation_check_helper<E, PCS>(
-        pcs_param: &PCS::ProverParam,
+        backend: &CpuBackend,
+        pcs_param: &<CpuBackend as MultilinearKzgBackend<E>>::PreparedProverParam,
         fxs: &[Arc<DenseMultilinearExtension<E::ScalarField>>],
         gxs: &[Arc<DenseMultilinearExtension<E::ScalarField>>],
         perms: &[Arc<DenseMultilinearExtension<E::ScalarField>>],
     ) -> Result<(), PolyIOPErrors>
     where
         E: Pairing,
-        PCS: PolynomialCommitmentScheme<
-            E,
-            Polynomial = Arc<DenseMultilinearExtension<E::ScalarField>>,
-        >,
+        PCS: PolynomialCommitmentScheme<E, ProverParam = MultilinearProverParam<E>>,
     {
         let nv = fxs[0].num_vars;
         // what's AuxInfo used for?
@@ -230,6 +242,7 @@ mod test {
         transcript.append_message(b"testing", b"initializing transcript for testing")?;
         let (proof, prod_x, _frac_poly) =
             <PolyIOP<E::ScalarField> as PermutationCheck<E, PCS>>::prove(
+                backend,
                 pcs_param,
                 fxs,
                 gxs,
@@ -248,10 +261,10 @@ mod test {
         )?;
 
         // check product subclaim
-        if evaluate_opt(
+        if backend.evaluate_mle(
             &prod_x,
             &perm_check_sub_claim.product_check_sub_claim.final_query.0,
-        ) != perm_check_sub_claim.product_check_sub_claim.final_query.1
+        )? != perm_check_sub_claim.product_check_sub_claim.final_query.1
         {
             return Err(PolyIOPErrors::InvalidVerifier("wrong subclaim".to_string()));
         };
@@ -263,7 +276,9 @@ mod test {
         let mut rng = test_rng();
 
         let srs = MultilinearKzgPCS::<Bls12_381>::gen_srs_for_testing(&mut rng, nv)?;
-        let (pcs_param, _) = MultilinearKzgPCS::<Bls12_381>::trim(&srs, None, Some(nv))?;
+        let (pcs_param, _) = MultilinearKzgPCS::<Bls12_381>::trim(&srs, nv)?;
+        let backend = CpuBackend;
+        let pcs_param = pcs_param.prepare(&backend)?;
         let id_perms = identity_permutation_mles(nv, 2);
 
         {
@@ -274,7 +289,9 @@ mod test {
                 Arc::new(DenseMultilinearExtension::rand(nv, &mut rng)),
             ];
             // perms is the identity map
-            test_permutation_check_helper::<Bls12_381, Kzg>(&pcs_param, &ws, &ws, &id_perms)?;
+            test_permutation_check_helper::<Bls12_381, Kzg>(
+                &backend, &pcs_param, &ws, &ws, &id_perms,
+            )?;
         }
 
         {
@@ -288,7 +305,9 @@ mod test {
             // perms is the reverse identity map
             let mut perms = id_perms.clone();
             perms.reverse();
-            test_permutation_check_helper::<Bls12_381, Kzg>(&pcs_param, &fs, &gs, &perms)?;
+            test_permutation_check_helper::<Bls12_381, Kzg>(
+                &backend, &pcs_param, &fs, &gs, &perms,
+            )?;
         }
 
         {
@@ -300,10 +319,10 @@ mod test {
             // perms is a random map
             let perms = random_permutation_mles(nv, 2, &mut rng);
 
-            assert!(
-                test_permutation_check_helper::<Bls12_381, Kzg>(&pcs_param, &ws, &ws, &perms)
-                    .is_err()
-            );
+            assert!(test_permutation_check_helper::<Bls12_381, Kzg>(
+                &backend, &pcs_param, &ws, &ws, &perms,
+            )
+            .is_err());
         }
 
         {
@@ -319,7 +338,7 @@ mod test {
             // s_perm is the identity map
 
             assert!(test_permutation_check_helper::<Bls12_381, Kzg>(
-                &pcs_param, &fs, &gs, &id_perms
+                &backend, &pcs_param, &fs, &gs, &id_perms
             )
             .is_err());
         }

@@ -6,9 +6,9 @@
 
 //! Error module.
 
-use arithmetic::ArithErrors;
 use ark_serialize::SerializationError;
 use ark_std::string::String;
+use backend::BackendError;
 use displaydoc::Display;
 use transcript::TranscriptError;
 
@@ -17,18 +17,12 @@ use transcript::TranscriptError;
 pub enum PCSError {
     /// Invalid Prover: {0}
     InvalidProver(String),
-    /// Invalid Verifier: {0}
-    InvalidVerifier(String),
-    /// Invalid Proof: {0}
-    InvalidProof(String),
     /// Invalid parameters: {0}
     InvalidParameters(String),
     /// An error during (de)serialization: {0}
     SerializationError(SerializationError),
     /// Transcript error {0}
     TranscriptError(TranscriptError),
-    /// ArithErrors error {0}
-    ArithErrors(ArithErrors),
 }
 
 impl From<SerializationError> for PCSError {
@@ -43,8 +37,11 @@ impl From<TranscriptError> for PCSError {
     }
 }
 
-impl From<ArithErrors> for PCSError {
-    fn from(e: ArithErrors) -> Self {
-        Self::ArithErrors(e)
+impl From<BackendError> for PCSError {
+    fn from(e: BackendError) -> Self {
+        match e {
+            BackendError::InvalidParameters(message) => Self::InvalidParameters(message),
+            BackendError::InvalidState(message) => Self::InvalidProver(message),
+        }
     }
 }

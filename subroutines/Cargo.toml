@@ -5,34 +5,37 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-arithmetic = { path = "../arithmetic" }
-ark-bls12-381 = { version = "0.4.0", default-features = false, features = [ "curve" ] }
-ark-ec = { version = "^0.4.0", default-features = false, features = ["parallel"] }
-ark-ff = { version = "^0.4.0", default-features = false, features = ["parallel"] }
-ark-poly = { version = "^0.4.0", default-features = false, features = ["parallel"] }
-ark-serialize =  { version = "^0.4.0", default-features = false }
-ark-std = { version = "^0.4.0", default-features = false, features = ["parallel"] }
+backend = { path = "../backend", default-features = false }
+ark-ec = { version = "^0.6.0", default-features = false, features = ["parallel"] }
+ark-ff = { version = "^0.6.0", default-features = false, features = ["parallel"] }
+ark-serialize =  { version = "^0.6.0", default-features = false }
+ark-std = { version = "^0.6.0", default-features = false, features = ["parallel"] }
 derivative = { version = "2", features = ["use_core"] }
 displaydoc = { version = "0.2.3", default-features = false }
-rand_chacha = { version = "0.3.0", default-features = false }
 rayon = { version = "1.5.2", default-features = false }
 transcript = { path = "../transcript" }
-# # Benchmarks
-# [[bench]]
-# name = "poly-iop-benches"
-# path = "benches/iop_bench.rs"
-# harness = false
+[dev-dependencies]
+ark-bls12-381 = { version = "0.6.0", default-features = false, features = [ "curve" ] }
+ark-poly = { version = "^0.6.0", default-features = false, features = ["parallel"] }
+
+# Benchmarks
+[[bench]]
+name = "iop_bench"
+path = "benches/iop_bench.rs"
+harness = false
+required-features = ["cpu"]
 
 # Benchmarks
 [[bench]]
 name = "pcs-benches"
 path = "benches/pcs_bench.rs"
 harness = false
+required-features = ["cpu"]
 
 [features]
-# extensive sanity checks that are useful for debugging
-extensive_sanity_checks = [ ]
+default = ["cpu"]
+cpu = ["backend/cpu"]
 print-trace = [ 
-    "arithmetic/print-trace",
+    "backend/print-trace",
     "ark-std/print-trace",
     ] 

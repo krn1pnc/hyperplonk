@@ -1,0 +1,23 @@
+[package]
+name = "backend"
+version = "0.1.0"
+edition = "2021"
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+ark-ff = { version = "^0.6.0", default-features = false, features = ["parallel"] }
+ark-ec = { version = "^0.6.0", default-features = false, features = ["parallel"] }
+ark-poly = { version = "^0.6.0", default-features = false, features = ["parallel"], optional = true }
+ark-serialize = { version = "^0.6.0", default-features = false, features = ["derive"] }
+ark-std = { version = "^0.6.0", default-features = false, features = ["parallel"] }
+displaydoc = { version = "0.2.3", default-features = false }
+rayon = { version = "1.5.2", default-features = false }
+
+[dev-dependencies]
+ark-bls12-381 = { version = "0.6.0", default-features = false, features = ["curve"] }
+ark-poly = { version = "^0.6.0", default-features = false, features = ["parallel"] }
+
+[features]
+default = ["cpu"]
+cpu = ["dep:ark-poly"]
+print-trace = ["ark-std/print-trace"]

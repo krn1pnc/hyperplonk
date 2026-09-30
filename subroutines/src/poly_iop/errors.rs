@@ -6,9 +6,9 @@
 
 //! Error module.
 
-use crate::pcs::prelude::PCSError;
-use arithmetic::ArithErrors;
+use crate::PCSError;
 use ark_std::string::String;
+use backend::BackendError;
 use displaydoc::Display;
 use transcript::TranscriptError;
 
@@ -23,16 +23,10 @@ pub enum PolyIOPErrors {
     InvalidProof(String),
     /// Invalid parameters: {0}
     InvalidParameters(String),
-    /// Invalid challenge: {0}
-    InvalidChallenge(String),
-    /// Should not arrive to this point
-    ShouldNotArrive,
     /// An error during (de)serialization: {0}
     SerializationErrors(ark_serialize::SerializationError),
     /// Transcript Error: {0}
     TranscriptErrors(TranscriptError),
-    /// Arithmetic Error: {0}
-    ArithmeticErrors(ArithErrors),
     /// PCS error {0}
     PCSErrors(PCSError),
 }
@@ -49,9 +43,12 @@ impl From<TranscriptError> for PolyIOPErrors {
     }
 }
 
-impl From<ArithErrors> for PolyIOPErrors {
-    fn from(e: ArithErrors) -> Self {
-        Self::ArithmeticErrors(e)
+impl From<BackendError> for PolyIOPErrors {
+    fn from(e: BackendError) -> Self {
+        match e {
+            BackendError::InvalidParameters(message) => Self::InvalidParameters(message),
+            BackendError::InvalidState(message) => Self::InvalidProver(message),
+        }
     }
 }
 

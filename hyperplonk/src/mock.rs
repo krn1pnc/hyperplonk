@@ -4,15 +4,13 @@
 // You should have received a copy of the MIT License
 // along with the HyperPlonk library. If not, see <https://mit-license.org/>.
 
-use arithmetic::identity_permutation;
 use ark_ff::PrimeField;
 use ark_std::{log2, test_rng};
+use backend::common::permutation::identity_permutation;
 
 use crate::{
-    custom_gate::CustomizedGates,
-    selectors::SelectorColumn,
     structs::{HyperPlonkIndex, HyperPlonkParams},
-    witness::WitnessColumn,
+    CustomizedGates, SelectorColumn, WitnessColumn,
 };
 
 pub struct MockCircuit<F: PrimeField> {
@@ -116,7 +114,7 @@ impl<F: PrimeField> MockCircuit<F> {
     }
 
     pub fn is_satisfied(&self) -> bool {
-        for current_row in 0..self.num_variables() {
+        for current_row in 0..self.index.params.num_constraints {
             let mut cur = F::zero();
             for (coeff, q, wit) in self.index.params.gate_func.gates.iter() {
                 let mut cur_monomial = if *coeff < 0 {
@@ -142,17 +140,14 @@ impl<F: PrimeField> MockCircuit<F> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu"))]
 mod test {
     use super::*;
-    use crate::{errors::HyperPlonkErrors, HyperPlonkSNARK};
+    use crate::{HyperPlonkErrors, HyperPlonkSNARK};
     use ark_bls12_381::{Bls12_381, Fr};
+    use backend::cpu::CpuBackend;
     use subroutines::{
-        pcs::{
-            prelude::{MultilinearKzgPCS, MultilinearUniversalParams},
-            PolynomialCommitmentScheme,
-        },
-        poly_iop::PolyIOP,
+        MultilinearKzgPCS, MultilinearUniversalParams, PolyIOP, PolynomialCommitmentScheme,
     };
 
     const SUPPORTED_SIZE: usize = 20;
@@ -164,8 +159,11 @@ mod test {
     fn test_mock_circuit_sat() {
         for i in 1..10 {
             let vanilla_gate = CustomizedGates::vanilla_plonk_gate();
-            let circuit = MockCircuit::<Fr>::new(1 << i, &vanilla_gate);
+            let mut circuit = MockCircuit::<Fr>::new(1 << i, &vanilla_gate);
             assert!(circuit.is_satisfied());
+            let last_row = circuit.index.params.num_constraints - 1;
+            circuit.index.selectors[4].0[last_row] += Fr::from(1u64);
+            assert!(!circuit.is_satisfied());
 
             let jf_gate = CustomizedGates::jellyfish_turbo_plonk_gate();
             let circuit = MockCircuit::<Fr>::new(1 << i, &jf_gate);
@@ -190,25 +188,25 @@ mod test {
         assert!(circuit.is_satisfied());
 
         let index = circuit.index;
+        let backend = CpuBackend;
         // generate pk and vks
-        let (pk, vk) =
-            <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, MultilinearKzgPCS<Bls12_381>>>::preprocess(
-                &index, pcs_srs,
-            )?;
+        let (pk, vk) = <PolyIOP<Fr> as HyperPlonkSNARK<
+            Bls12_381,
+            MultilinearKzgPCS<Bls12_381>,
+            CpuBackend,
+        >>::preprocess(&backend, &index, pcs_srs)?;
         // generate a proof and verify
-        let proof =
-            <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, MultilinearKzgPCS<Bls12_381>>>::prove(
-                &pk,
-                &circuit.public_inputs,
-                &circuit.witnesses,
-            )?;
+        let proof = <PolyIOP<Fr> as HyperPlonkSNARK<
+            Bls12_381,
+            MultilinearKzgPCS<Bls12_381>,
+            CpuBackend,
+        >>::prove(&backend, &pk, &circuit.public_inputs, &circuit.witnesses)?;
 
-        let verify =
-            <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, MultilinearKzgPCS<Bls12_381>>>::verify(
-                &vk,
-                &circuit.public_inputs,
-                &proof,
-            )?;
+        let verify = <PolyIOP<Fr> as HyperPlonkSNARK<
+            Bls12_381,
+            MultilinearKzgPCS<Bls12_381>,
+            CpuBackend,
+        >>::verify(&vk, &circuit.public_inputs, &proof)?;
         assert!(verify);
         Ok(())
     }

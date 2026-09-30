@@ -6,7 +6,6 @@
 
 //! This module defines structs that are shared by all sub protocols.
 
-use arithmetic::VirtualPolynomial;
 use ark_ff::PrimeField;
 use ark_serialize::CanonicalSerialize;
 
@@ -27,17 +26,11 @@ pub struct IOPProverMessage<F: PrimeField> {
     pub(crate) evaluations: Vec<F>,
 }
 
-/// Prover State of a PolyIOP.
-pub struct IOPProverState<F: PrimeField> {
-    /// sampled randomness given by the verifier
-    pub challenges: Vec<F>,
-    /// the current round number
-    pub(crate) round: usize,
-    /// pointer to the virtual polynomial
-    pub(crate) poly: VirtualPolynomial<F>,
-    /// points with precomputed barycentric weights for extrapolating smaller
-    /// degree uni-polys to `max_degree + 1` evaluations.
-    pub(crate) extrapolation_aux: Vec<(Vec<F>, Vec<F>)>,
+impl<F: PrimeField> IOPProverMessage<F> {
+    /// Construct a host-ready round message from its evaluations.
+    pub fn new(evaluations: Vec<F>) -> Self {
+        Self { evaluations }
+    }
 }
 
 /// Prover State of a PolyIOP

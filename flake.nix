@@ -36,7 +36,7 @@
               };
               doctest = {
                 enable = true;
-                entry = "cargo test --doc";
+                entry = "cargo test --workspace --doc";
                 files = "\\.rs$";
                 pass_filenames = false;
               };

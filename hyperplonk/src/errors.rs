@@ -6,11 +6,11 @@
 
 //! Error module.
 
-use arithmetic::ArithErrors;
 use ark_serialize::SerializationError;
 use ark_std::string::String;
+use backend::BackendError;
 use displaydoc::Display;
-use subroutines::{pcs::prelude::PCSError, poly_iop::prelude::PolyIOPErrors};
+use subroutines::{PCSError, PolyIOPErrors};
 use transcript::TranscriptError;
 
 /// A `enum` specifying the possible failure modes of hyperplonk.
@@ -32,8 +32,6 @@ pub enum HyperPlonkErrors {
     PCSErrors(PCSError),
     /// Transcript error {0}
     TranscriptError(TranscriptError),
-    /// Arithmetic Error: {0}
-    ArithmeticErrors(ArithErrors),
 }
 
 impl From<SerializationError> for HyperPlonkErrors {
@@ -60,8 +58,11 @@ impl From<TranscriptError> for HyperPlonkErrors {
     }
 }
 
-impl From<ArithErrors> for HyperPlonkErrors {
-    fn from(e: ArithErrors) -> Self {
-        Self::ArithmeticErrors(e)
+impl From<BackendError> for HyperPlonkErrors {
+    fn from(e: BackendError) -> Self {
+        match e {
+            BackendError::InvalidParameters(message) => Self::InvalidParameters(message),
+            BackendError::InvalidState(message) => Self::InvalidProver(message),
+        }
     }
 }
