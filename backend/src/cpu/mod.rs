@@ -13,7 +13,7 @@ pub mod sum_check;
 pub mod virtual_polynomial;
 
 pub use ark_poly::DenseMultilinearExtension;
-pub use multilinear::{fix_last_variables, identity_permutation_mles, merge_polynomials};
+pub use multilinear::identity_permutation_mles;
 
 /// CPU implementation using immutable, shared dense MLEs.
 #[derive(Clone, Copy, Debug, Default)]
