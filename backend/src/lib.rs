@@ -6,7 +6,13 @@
 
 //! Mathematical objects, common host mathematics, and backend execution
 //! interfaces.
+//!
+//! The `cpu` and `ascend910b3` features gate backend implementations, not the
+//! `ark-poly` or `ark-bls12-381` dependencies, which are always available.
+//! Backend-specific tests follow the same implementation feature gates.
 
+#[cfg(feature = "ascend910b3")]
+pub mod ascend910b3;
 pub mod common;
 #[cfg(feature = "cpu")]
 pub mod cpu;
