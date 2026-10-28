@@ -1,164 +1,223 @@
 #include "field.h"
-#include "field_math.h"
 
 #include <array>
-#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
+#include <utility>
 #include <vector>
 
 namespace hp = hyperplonk::ascend910b3;
 namespace {
-using hp::Fr;
-constexpr std::array<uint32_t, 8> modulus = {{1, 0xffffffff, 0xfffe5bfe, 0x53bda402,
-    0x09a1d805, 0x3339d808, 0x299d7d48, 0x73eda753}};
+struct TestPrime64Params {
+    static constexpr unsigned word_count = 2;
+    static constexpr unsigned modulus_bits = 64;
+    static constexpr uint32_t modulus[2] = {0xffffffc5, 0xffffffff};
+    static constexpr uint16_t barrett_mu[5] = {0x003b, 0, 0, 0, 1};
+    static constexpr uint32_t wide_factor[2] = {0x0d99, 0};
+};
+using Prime64 = hp::FieldElement<TestPrime64Params>;
+template<class A, class B, class = void> struct CanAdd : std::false_type {};
+template<class A, class B> struct CanAdd<A, B, std::void_t<decltype(std::declval<A>() + std::declval<B>())>> : std::true_type {};
+template<class A, class B, class = void> struct CanSubtract : std::false_type {};
+template<class A, class B> struct CanSubtract<A, B, std::void_t<decltype(std::declval<A>() - std::declval<B>())>> : std::true_type {};
+template<class A, class B, class = void> struct CanMultiply : std::false_type {};
+template<class A, class B> struct CanMultiply<A, B, std::void_t<decltype(std::declval<A>() * std::declval<B>())>> : std::true_type {};
+static_assert(!CanAdd<hp::Fr, hp::Fq>::value && !CanAdd<hp::Fq, hp::Fr>::value);
+static_assert(!CanSubtract<hp::Fr, hp::Fq>::value && !CanSubtract<hp::Fq, hp::Fr>::value);
+static_assert(!CanMultiply<hp::Fr, hp::Fq>::value && !CanMultiply<hp::Fq, hp::Fr>::value);
+static_assert(!std::is_convertible<hp::Fr, hp::Fq>::value && !std::is_convertible<hp::Fq, hp::Fr>::value);
+static_assert(!std::is_convertible<uint32_t, hp::Fr>::value && !std::is_convertible<uint32_t, hp::Fq>::value);
+static_assert(std::is_aggregate<hp::Fr>::value && std::is_aggregate<hp::Fq>::value);
+static_assert(sizeof(Prime64) == 8 && alignof(Prime64) == 4);
+constexpr std::array<size_t, 11> counts{0,1,2,31,32,33,255,256,257,513,4097};
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
 }
-bool equal(const Fr& a, const Fr& b) {
-    for (unsigned i = 0; i < 8; ++i) if (a.words[i] != b.words[i]) return false;
-    return true;
+std::vector<uint8_t> read_bytes(const std::filesystem::path& path, size_t count) {
+    std::ifstream input(path, std::ios::binary | std::ios::ate);
+    require(bool(input), "missing fixture: " + path.string());
+    require(input.tellg() == static_cast<std::streamoff>(count), "wrong fixture length: " + path.string());
+    input.seekg(0);
+    std::vector<uint8_t> bytes(count);
+    if (count) {
+        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(count));
+        require(static_cast<size_t>(input.gcount()) == count, "truncated fixture: " + path.string());
+    }
+    return bytes;
 }
-bool canonical(const Fr& a) {
-    for (int i = 7; i >= 0; --i) {
-        if (a.words[i] != modulus[i]) return a.words[i] < modulus[i];
+template<class Field> bool canonical(const Field& value) {
+    using P = typename Field::Parameters;
+    for (unsigned i = Field::word_count; i-- > 0;) {
+        if (value.words[i] != P::modulus[i]) return value.words[i] < P::modulus[i];
     }
     return false;
 }
-void expect(const Fr& actual, const Fr& expected, const std::string& context) {
+template<class Field> void expect(const Field& actual, const Field& expected, const std::string& context) {
     require(canonical(actual), context + ": noncanonical result");
-    require(equal(actual, expected), context + ": value mismatch");
+    require(actual == expected, context + ": value mismatch");
 }
-std::vector<Fr> load(const std::filesystem::path& path, size_t count) {
+template<class Field> std::vector<Field> load(const std::filesystem::path& path, size_t count) {
     size_t bytes = 0;
-    require(hp::detail::checked_field_bytes(count, bytes), "fixture size overflow");
-    std::ifstream file(path, std::ios::binary | std::ios::ate);
-    require(bool(file), "missing fixture: " + path.string());
-    require(file.tellg() == static_cast<std::streamoff>(bytes), "wrong fixture length: " + path.string());
-    file.seekg(0);
-    std::vector<Fr> values(count);
+    require(hp::detail::checked_field_bytes<Field>(count, bytes), "fixture size overflow");
+    const auto encoded = read_bytes(path, bytes);
+    std::vector<Field> values(count);
     for (size_t i = 0; i < count; ++i) {
-        uint8_t input[32]{};
-        file.read(reinterpret_cast<char*>(input), sizeof(input));
-        require(bool(file), "truncated fixture: " + path.string());
-        require(hp::from_le_bytes(input, values[i]), "noncanonical fixture: " + path.string());
-        uint8_t output[32]{};
-        hp::to_le_bytes(values[i], output);
-        const auto limbs = hp::to_limbs(values[i]);
-        for (unsigned j = 0; j < 32; ++j) {
-            require(output[j] == input[j], "encoding roundtrip mismatch");
+        const uint8_t* input = encoded.data() + i * sizeof(Field);
+        require(Field::from_le_bytes(input, values[i]), "noncanonical fixture: " + path.string());
+        std::array<uint8_t, sizeof(Field) + 2> output{};
+        output.front() = 0xa5;
+        output.back() = 0x5a;
+        values[i].to_le_bytes(output.data() + 1);
+        require(output.front() == 0xa5 && output.back() == 0x5a, "encoder wrote outside element");
+        const auto limbs = values[i].to_limbs();
+        for (unsigned j = 0; j < sizeof(Field); ++j) {
+            require(output[j + 1] == input[j], "encoding roundtrip mismatch");
             require(limbs.bytes[j] == input[j], "limb encoding mismatch");
-            const uint32_t expected = uint32_t(input[j]) << (8 * (j % 4));
-            require((values[i].words[j / 4] & (uint32_t(0xff) << (8 * (j % 4)))) == expected,
-                    "word little-endian mismatch");
+            require(uint8_t(values[i].words[j / 4] >> (8 * (j % 4))) == input[j], "word order mismatch");
         }
     }
     return values;
 }
-void boundaries() {
-    const Fr zero{};
-    const Fr one{{1}};
-    Fr pm1{};
-    for (unsigned i = 0; i < 8; ++i) pm1.words[i] = modulus[i];
+template<class Field> void boundaries() {
+    using P = typename Field::Parameters;
+    const auto zero = Field::zero();
+    const auto one = Field::one();
+    require(zero.is_zero() && !one.is_zero() && zero != one, "zero/one semantics");
+    Field pm1{};
+    for (unsigned i = 0; i < Field::word_count; ++i) pm1.words[i] = P::modulus[i];
     --pm1.words[0];
-    uint8_t pbytes[32]{};
-    for (unsigned i = 0; i < 32; ++i) pbytes[i] = uint8_t(modulus[i / 4] >> (8 * (i % 4)));
-    Fr output = one;
-    require(!hp::from_le_bytes(pbytes, output), "decoder accepted modulus");
-    for (auto& byte : pbytes) byte = 0xff;
-    require(!hp::from_le_bytes(pbytes, output), "decoder accepted all-FF");
+    uint8_t encoded[sizeof(Field)];
+    for (unsigned i = 0; i < sizeof(Field); ++i) encoded[i] = uint8_t(P::modulus[i / 4] >> (8 * (i % 4)));
+    Field output = pm1;
+    require(!Field::from_le_bytes(encoded, output) && output == pm1, "decode modulus changed output or accepted");
+    for (auto& byte : encoded) byte = 0xff;
+    require(!Field::from_le_bytes(encoded, output) && output == pm1, "decode all-FF changed output or accepted");
+    require(!zero.inverse(output) && output == pm1, "inverse zero changed output or succeeded");
+    expect(pm1 + one, zero, "(p-1)+1");
+    expect(zero - one, pm1, "0-1");
+    expect(pm1 * pm1, one, "(p-1)^2");
+    expect(-zero, zero, "neg zero");
+    expect(-one, pm1, "neg one");
+    // Alias-safe failure/success are part of the reference-output API contract.
+    output = zero;
+    require(!output.inverse(output) && output == zero, "zero inverse alias");
     output = pm1;
-    require(!hp::inverse(zero, output), "inverse zero reported success");
-    require(equal(output, pm1), "inverse zero modified output");
-    expect(hp::add(pm1, one), zero, "(p-1)+1");
-    expect(hp::sub(zero, one), pm1, "0-1");
-    expect(hp::mul(pm1, pm1), one, "(p-1)^2");
-    expect(hp::neg(zero), zero, "neg zero");
-    expect(hp::neg(one), pm1, "neg one");
-    // Independent fixed constants: 2^512 mod p and (2^512 - 1) mod p.
-    const Fr r512{{0xf3f29c6d,0xc999e990,0x87925c23,0x2b6cedcb,
-                    0x7254398f,0x05d31496,0x9f59ff11,0x0748d9d9}};
-    Fr r512minus1 = r512;
-    --r512minus1.words[0];
-    hp::FrWide wide{};
-    wide.bytes[64] = 1;
-    expect(hp::reduce_wide(wide), r512, "wide byte64");
-    wide = {};
-    for (unsigned i = 0; i < 64; ++i) wide.bytes[i] = 0xff;
-    expect(hp::reduce_wide(wide), r512minus1, "maximum 512-bit integer");
-    // Independent Python-integer oracle for (2^544 - 1) mod p.
-    const Fr r544minus1{{0xefe9ec31,0x0408b03a,0x122df55f,0xc98a431e,
-                         0x8277a7be,0xdd74d8f7,0x9163e436,0x1ef2c2b1}};
-    for (auto& byte : wide.bytes) byte = 0xff;
-    expect(hp::reduce_wide(wide), r544minus1, "maximum 544-bit integer");
+    require(output.inverse(output) && output == pm1, "nonzero inverse alias");
     size_t bytes = 987;
-    require(hp::detail::checked_field_bytes(0, bytes) && bytes == 0, "zero checked size");
-    require(hp::detail::checked_field_bytes(1, bytes) && bytes == 32, "unit checked size");
-    const size_t largest = static_cast<size_t>(std::numeric_limits<ptrdiff_t>::max()) / 32;
-    require(hp::detail::checked_field_bytes(largest, bytes) && bytes == largest * 32,
-            "maximum checked size");
+    require(hp::detail::checked_field_bytes<Field>(0, bytes) && bytes == 0, "zero checked size");
+    require(hp::detail::checked_field_bytes<Field>(1, bytes) && bytes == sizeof(Field), "unit checked size");
+    const size_t largest = size_t(PTRDIFF_MAX) / sizeof(Field);
+    require(hp::detail::checked_field_bytes<Field>(largest, bytes) && bytes == largest * sizeof(Field), "maximum checked size");
     bytes = 987;
-    require(!hp::detail::checked_field_bytes(largest + 1, bytes) && bytes == 987,
-            "ptrdiff overflow changes size or succeeds");
-    require(!hp::detail::checked_field_bytes(std::numeric_limits<size_t>::max() / 32 + 1, bytes)
-            && bytes == 987, "multiplication overflow changes size or succeeds");
+    require(!hp::detail::checked_field_bytes<Field>(largest + 1, bytes) && bytes == 987, "ptrdiff overflow");
+    require(!hp::detail::checked_field_bytes<Field>(std::numeric_limits<size_t>::max() / sizeof(Field) + 1, bytes)
+            && bytes == 987, "multiplication overflow");
 }
-void fixture_case(const std::filesystem::path& root, size_t count) {
+template<class Field> void arithmetic_case(const std::filesystem::path& dir, size_t count, bool inverses) {
+    const auto lhs = load<Field>(dir / "lhs.bin", count);
+    const auto rhs = load<Field>(dir / "rhs.bin", count);
+    const auto added = load<Field>(dir / "add.bin", count);
+    const auto subtracted = load<Field>(dir / "sub.bin", count);
+    const auto multiplied = load<Field>(dir / "mul.bin", count);
+    const auto negated = load<Field>(dir / "neg.bin", count);
+    const auto squared = load<Field>(dir / "square.bin", count);
+    for (size_t i = 0; i < count; ++i) {
+        const auto context = dir.string() + "/" + std::to_string(i);
+        expect(lhs[i] + rhs[i], added[i], "add " + context);
+        expect(lhs[i] - rhs[i], subtracted[i], "sub " + context);
+        expect(lhs[i] * rhs[i], multiplied[i], "mul " + context);
+        expect(-lhs[i], negated[i], "neg " + context);
+        expect(lhs[i].square(), squared[i], "square " + context);
+    }
+    if (inverses) {
+        const auto input = load<Field>(dir / "inverse_input.bin", count);
+        const auto expected = load<Field>(dir / "inverse.bin", count);
+        for (size_t i = 0; i < count; ++i) {
+            Field result{};
+            require(input[i].inverse(result), "nonzero inverse failed");
+            expect(result, expected[i], "inverse " + dir.string() + "/" + std::to_string(i));
+        }
+    }
+}
+template<class Field> void parameters(const std::filesystem::path& dir) {
+    using P = typename Field::Parameters;
+    const auto modulus = read_bytes(dir / "modulus.bin", sizeof(Field));
+    const auto mu = read_bytes(dir / "mu.bin", sizeof(Field) + 2);
+    const auto factor = read_bytes(dir / "wide_factor.bin", sizeof(Field));
+    for (unsigned i = 0; i < sizeof(Field); ++i) {
+        require(modulus[i] == uint8_t(P::modulus[i / 4] >> (8 * (i % 4))), "compiled modulus mismatch");
+        require(factor[i] == uint8_t(P::wide_factor[i / 4] >> (8 * (i % 4))), "compiled wide factor mismatch");
+    }
+    for (unsigned i = 0; i < sizeof(Field) + 2; ++i)
+        require(mu[i] == uint8_t(P::barrett_mu[i / 2] >> (8 * (i % 2))), "compiled Barrett mu mismatch");
+}
+template<class Field> void extras(const std::filesystem::path& root) {
+    using P = typename Field::Parameters;
+    const auto input = read_bytes(root / "wide_input.bin", 512 * sizeof(hp::WideInteger<P>));
+    const auto expected = load<Field>(root / "wide_result.bin", 512);
+    for (unsigned i = 0; i < 512; ++i) {
+        hp::WideInteger<P> wide{};
+        for (unsigned j = 0; j < sizeof(wide); ++j) wide.bytes[j] = input[i * sizeof(wide) + j];
+        expect(Field::reduce_wide(wide), expected[i], "wide " + root.string() + "/" + std::to_string(i));
+    }
+    size_t edge_count = 4;
+    for (unsigned bits = 16; bits < P::modulus_bits; bits += 16) edge_count += 3;
+    arithmetic_case<Field>(root / "boundaries", edge_count * 4, false);
+}
+void fr_regression(const std::filesystem::path& root, size_t count) {
+    using hp::Fr;
     const auto dir = root / ("case-" + std::to_string(count));
-    const auto lhs = load(dir / "lhs.bin", count);
-    const auto rhs = load(dir / "rhs.bin", count);
-    const auto added = load(dir / "add.bin", count);
-    const auto subtracted = load(dir / "sub.bin", count);
-    const auto multiplied = load(dir / "mul.bin", count);
-    const auto scaled = load(dir / "scale.bin", count);
-    const auto scalar = load(dir / "scalar.bin", 1);
-    const auto dot = load(dir / "inner_product.bin", 1);
+    const auto lhs = load<Fr>(dir / "lhs.bin", count);
+    const auto rhs = load<Fr>(dir / "rhs.bin", count);
+    const auto scaled = load<Fr>(dir / "scale.bin", count);
+    const auto scalar = load<Fr>(dir / "scalar.bin", 1);
+    const auto dot = load<Fr>(dir / "inner_product.bin", 1);
     Fr sum{};
     for (size_t i = 0; i < count; ++i) {
-        const auto context = std::to_string(count) + "/" + std::to_string(i);
-        expect(hp::add(lhs[i], rhs[i]), added[i], "add " + context);
-        expect(hp::sub(lhs[i], rhs[i]), subtracted[i], "sub " + context);
-        expect(hp::mul(lhs[i], rhs[i]), multiplied[i], "mul " + context);
-        expect(hp::square(lhs[i]), hp::mul(lhs[i], lhs[i]), "square " + context);
-        expect(hp::neg(lhs[i]), hp::sub(Fr{}, lhs[i]), "neg " + context);
-        expect(hp::mul(lhs[i], scalar[0]), scaled[i], "scale " + context);
-        sum = hp::add(sum, hp::mul(lhs[i], rhs[i]));
+        expect(lhs[i] * scalar[0], scaled[i], "scale");
+        sum = sum + lhs[i] * rhs[i];
     }
-    expect(sum, dot[0], "inner product " + std::to_string(count));
-    if (count == 0 || count == 1 || count == 2 || count == 33 || count == 257) {
-        const auto inputs = load(dir / "inverse_input.bin", count);
-        const auto inverses = load(dir / "inverse.bin", count);
-        for (size_t i = 0; i < count; ++i) {
-            Fr result{};
-            require(hp::inverse(inputs[i], result), "nonzero inverse failed");
-            expect(result, inverses[i], "inverse golden " + std::to_string(i));
-        }
-    }
+    expect(sum, dot[0], "dot");
     if (count == 513 || count == 4097) {
-        const auto chain = load(dir / "chain.bin", 1);
         auto state = lhs;
-        for (unsigned round = 0; round < 10; ++round) {
-            for (size_t i = 0; i < count; ++i)
-                state[i] = hp::mul(hp::add(hp::mul(dot[0], state[i]), rhs[i]), lhs[i]);
-        }
+        for (unsigned round = 0; round < 10; ++round)
+            for (size_t i = 0; i < count; ++i) state[i] = (dot[0] * state[i] + rhs[i]) * lhs[i];
         Fr end{};
-        for (size_t i = 0; i < count; ++i) end = hp::add(end, hp::mul(state[i], rhs[i]));
-        expect(end, chain[0], "resident chain golden " + std::to_string(count));
+        for (size_t i = 0; i < count; ++i) end = end + state[i] * rhs[i];
+        expect(end, load<Fr>(dir / "chain.bin", 1)[0], "resident chain");
     }
+}
+template<class Field> void field_suite(const std::filesystem::path& root, const std::filesystem::path& param_dir,
+                                      const char* name) {
+    boundaries<Field>();
+    parameters<Field>(param_dir);
+    for (const size_t count : counts) {
+        const bool inverse = count == 0 || count == 1 || count == 2 || count == 33 || count == 257;
+        arithmetic_case<Field>(root / ("case-" + std::to_string(count)), count, inverse);
+    }
+    extras<Field>(root);
+    std::cout << "FIELD_ELEMENT_HOST_PASS field=" << name << '\n';
 }
 } // namespace
 
 int main(int argc, char** argv) {
     try {
         require(argc == 3 && std::string(argv[1]) == "--fixtures", "usage: field_math_tests --fixtures DIRECTORY");
-        boundaries();
-        for (size_t count : {0u,1u,2u,31u,32u,33u,255u,256u,257u,513u,4097u})
-            fixture_case(argv[2], count);
+        const std::filesystem::path root(argv[2]);
+        field_suite<hp::Fr>(root, root / "params/fr", "Fr");
+        field_suite<hp::Fq>(root / "fq", root / "params/fq", "Fq");
+        boundaries<Prime64>();
+        parameters<Prime64>(root / "params/prime64");
+        arithmetic_case<Prime64>(root / "prime64/case-257", 257, true);
+        extras<Prime64>(root / "prime64");
+        std::cout << "FIELD_ELEMENT_HOST_PASS field=TestPrime64\n";
+        for (const size_t count : counts) fr_regression(root, count);
         std::cout << "FIELD_MATH_HOST_PASS\n";
         return 0;
     } catch (const std::exception& error) {
