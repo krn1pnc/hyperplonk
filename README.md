@@ -39,7 +39,7 @@ Upon modification on `flake.nix`, run `direnv reload` to reflect new dependencie
 > cargo test --release --all
 ```
 
-### Ascend910B3 internal field math
+### Ascend910B3 internal field and G1 math
 
 `backend/src/ascend910b3/native/` contains independently built BLS12-381
 finite-field arithmetic for DAV_2201 (verified with CANN 9.1.0). A single
@@ -53,7 +53,8 @@ The existing internal C++ batch launchers provide Fr add, subtract, multiply,
 inverse, inner product and shared-scalar vector multiplication. The latter two
 use signed INT8 Cube products with exact unsigned correction and integer
 reduction. Fq is a host/device value type, not a new production batch API.
-This does **not** implement G1, MSM or the existing protocol bridge: its
+`g1.h` adds concrete host/device `G1Affine` and `G1Jacobian` value types over Fq.
+This does **not** implement production MSM or the existing protocol bridge: its
 NotImplemented behavior, Rust interfaces and C ABI remain unchanged.
 
 ```bash
@@ -98,6 +99,26 @@ remain Fr-specific. Native callers preflight array sizes with
 not alias. The Fr batch inverse convention is mask 0/output 0 for zero input,
 not a valid inverse.
 
+`G1Affine` stores two Fq coordinates (96 bytes, alignment 4); `G1Jacobian`
+stores three (144 bytes, alignment 4). They are resource-free aggregates, not the
+97-byte G1 interchange packet. Affine identity is `(0,0)`; Jacobian identity is
+recognized by `Z=0`, and point operations produce canonical `(0,1,0)` identity.
+Finite Jacobian coordinates mean `(X/Z²,Y/Z³)`, on `y²=x³+4`.
+
+The point formulas follow pinned
+[cuZK BLS12-381 G1](https://github.com/Tao-Lu-123/cuZK/blob/88e3295cada379abe06240df23ec6c9fc0f648b2/depends/libff-cuda/curves/bls12_381/bls12_381_g1.cu):
+ordinary Jacobian addition, typed Affine mixed addition, doubling, negation,
+projective equality, explicit conversions and variable-time `mul_by_u64`.
+Self-addition is alias-safe. Equality does not normalize; `to_affine()` uses
+one Fq inverse only when Z is neither zero nor one. There is no implicit
+Affine/Jacobian conversion or full-Fr scalar multiplication API.
+
+Raw point writers must supply canonical Fq coordinates and valid curve points;
+production SRS inputs additionally need prior subgroup validation.
+`is_on_curve()` is not a subgroup check: `(0,2)` is on this curve but is not
+in the r-order subgroup. Point arithmetic and future cuZK bucket addressing
+carry no constant-time guarantee.
+
 Launchers only enqueue work. Callers own the stream, buffers, cached device
 tilings and a 512-byte-aligned, 26112-byte workspace per concurrent stream.
 They retain every borrowed allocation until completion. Immutable MLE inputs
@@ -106,12 +127,13 @@ on device, with ping-pong outputs for evolving state. Future protocol kernels
 can consume these device addresses without adding a math ABI.
 
 The smoke program requires `MATRIX_INT8_PASS`, `HBM_RESIDENT_CHAIN_PASS`,
-`FIELD_ELEMENT_NPU_PASS field=Fr`, `FIELD_ELEMENT_NPU_PASS field=Fq` and the
-final `FIELD_MATH_NPU_PASS`. Test-only kernels instantiate the same class on
-device for add/subtract/negate/multiply/square/inverse and wide reduction,
-checking exact Python-integer golden across empty inputs, tails and multiple
-tiles. Host tests also cover a full-storage 64-bit prime to exercise the final
-addition carry, compiled parameters, strict decoding and zero inverse semantics.
+`FIELD_ELEMENT_NPU_PASS field=Fr/Fq`, G1 primitive/diagnostics/generator markers,
+all 16 `G1_CUZK_RESIDENT_PASS` markers, `G1_NPU_PASS`, and the final
+`FIELD_MATH_NPU_PASS`. Field kernels check exact Python-integer golden across
+empty inputs, tails and multiple tiles. Host tests also cover a full-storage
+64-bit prime, compiled parameters, strict decoding and zero inverse semantics.
+The ACL-free host executable requires `G1_HOST_PASS` before its final
+`FIELD_MATH_HOST_PASS`.
 
 Resident-chain cases (513 and 4097 elements) upload inputs once, generate their
 scalar on device, perform ten state-update rounds, then download only the
@@ -119,7 +141,34 @@ scalar on device, perform ten state-update rounds, then download only the
 synchronization or device allocation/free during compute. This audits calls
 from the test and static math library, not CANN shared-library internals, and
 does not establish residency of the still-unimplemented protocol bridge.
-Fq device correctness does not establish G1/MSM performance.
+
+G1 fixtures use an independent Python affine oracle, not the candidate Jacobian
+formulas. Primitive tests cover counts 0/1/2/15/16/17/31/32/33/65, scaled
+projective equality, inverse points, noncanonical Z=0 inputs, self-aliasing,
+full-width u64 factors, non-unit-Z normalization, curve diagnostics and exact
+generator coordinates. Pair-owned DMA preserves compact 96/144-byte layouts;
+guards, physical scalar padding, flag-slot padding and input immutability are
+checked after execution.
+
+The test-only cuZK structure chain uses windows 3 and 4 over eight fixtures:
+counts 0/1/2/7/33, cancellation, zero scalars and identity bases. It computes
+two bucket partials, two weighted segments per window, then combines windows.
+Bases and Fr scalars upload once; intermediate Jacobians stay in HBM between
+kernels. Only the final point is normalized and downloaded as 96 native bytes.
+Its compute audit requires zero explicit copies, host synchronization and
+device allocation/free; the tail requires exactly one download and one stream
+synchronization. Empty MSM allocates only its output/pinned result and executes
+the identity-output finish path. This is a small correctness/residency test,
+not production sorting, ELL/CSR scheduling, a protocol commit implementation,
+or evidence of MSM performance.
+
+For mathematical iterations, build/run `field_math_tests` first; it requires
+neither SDK initialization nor NPU compilation. This does not replace device
+verification. The current smoke target keeps all test kernels in one ASC
+translation unit, so editing a chain kernel also recompiles the field and point
+tests. Deeply inlined Fq arithmetic inside nested point loops can make the
+Release/O3 compilation expensive; build duration is not kernel execution time.
+No device noinline policy or reduced-optimization acceptance mode is enabled.
 
 
 ### Generate and read the documentation

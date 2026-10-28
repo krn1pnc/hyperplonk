@@ -1,4 +1,5 @@
 #include "field.h"
+#include "g1.h"
 
 #include <array>
 #include <filesystem>
@@ -204,6 +205,177 @@ template<class Field> void field_suite(const std::filesystem::path& root, const 
     extras<Field>(root);
     std::cout << "FIELD_ELEMENT_HOST_PASS field=" << name << '\n';
 }
+
+template<class A, class B, class = void> struct CanMixedAdd : std::false_type {};
+template<class A, class B> struct CanMixedAdd<A, B, std::void_t<
+    decltype(std::declval<A&>().mixed_add_assign(std::declval<const B&>()))>> : std::true_type {};
+static_assert(std::is_aggregate<hp::G1Affine>::value && std::is_aggregate<hp::G1Jacobian>::value);
+static_assert(!std::is_convertible<hp::G1Affine, hp::G1Jacobian>::value);
+static_assert(!std::is_convertible<hp::G1Jacobian, hp::G1Affine>::value);
+static_assert(CanMixedAdd<hp::G1Jacobian, hp::G1Affine>::value);
+static_assert(!CanMixedAdd<hp::G1Jacobian, hp::G1Jacobian>::value);
+
+std::vector<hp::G1Affine> load_affine(const std::filesystem::path& path, size_t count) {
+    const auto coords = load<hp::Fq>(path, count * 2);
+    std::vector<hp::G1Affine> out(count);
+    for (size_t i = 0; i < count; ++i) out[i] = {coords[2*i], coords[2*i+1]};
+    return out;
+}
+std::vector<hp::G1Jacobian> load_jacobian(const std::filesystem::path& path, size_t count) {
+    const auto coords = load<hp::Fq>(path, count * 3);
+    std::vector<hp::G1Jacobian> out(count);
+    for (size_t i = 0; i < count; ++i) out[i] = {coords[3*i], coords[3*i+1], coords[3*i+2]};
+    return out;
+}
+template<class T> std::vector<T> load_integers(const std::filesystem::path& path, size_t count) {
+    const auto bytes = read_bytes(path, count * sizeof(T));
+    std::vector<T> values(count);
+    for (size_t i = 0; i < count; ++i)
+        for (size_t j = 0; j < sizeof(T); ++j) values[i] |= T(bytes[i*sizeof(T)+j]) << (8*j);
+    return values;
+}
+bool same_raw(const hp::G1Jacobian& a, const hp::G1Jacobian& b) {
+    return a.x == b.x && a.y == b.y && a.z == b.z;
+}
+void expect_affine(const hp::G1Affine& a, const hp::G1Affine& b, const std::string& context) {
+    expect(a.x, b.x, context + " x");
+    expect(a.y, b.y, context + " y");
+}
+void expect_point(const hp::G1Jacobian& actual, const hp::G1Affine& expected, const std::string& context) {
+    require(canonical(actual.x) && canonical(actual.y) && canonical(actual.z), context + " canonical coords");
+    require(actual.is_on_curve(), context + " off curve");
+    if (actual.is_identity())
+        require(same_raw(actual, hp::G1Jacobian::identity()), context + " noncanonical identity");
+    expect_affine(actual.to_affine(), expected, context);
+}
+hp::G1Jacobian raw_order_mul(const hp::G1Jacobian& point) {
+    hp::G1Jacobian result{};
+    for (unsigned bit = 255; bit-- > 0;) {
+        result.double_in_place();
+        if ((hp::Bls12381FrParams::modulus[bit/32] >> (bit%32)) & 1) result += point;
+    }
+    return result;
+}
+unsigned scalar_digit(const hp::Fr& scalar, unsigned window, unsigned c) {
+    const unsigned bit = window*c, word = bit/32, shift = bit%32;
+    uint32_t digit = scalar.words[word] >> shift;
+    if (shift && shift+c > 32 && word+1 < hp::Fr::word_count)
+        digit |= scalar.words[word+1] << (32-shift);
+    const unsigned available = 255-bit < c ? 255-bit : c;
+    return digit & ((1u << available)-1);
+}
+hp::G1Jacobian weighted_range(const std::vector<hp::G1Jacobian>& buckets, unsigned start, unsigned end) {
+    const unsigned a = start < 1 ? 1 : start;
+    hp::G1Jacobian running{}, local{};
+    if (a > end) return local;
+    for (unsigned b = end+1; b-- > a;) {
+        running += buckets[b];
+        local += running;
+    }
+    if (a > 1) local += running.mul_by_u64(a-1);
+    return local;
+}
+void g1_host_chains(const std::filesystem::path& root) {
+    const std::array<std::pair<const char*, size_t>, 8> cases{{
+        {"case-0",0},{"case-1",1},{"case-2",2},{"case-7",7},{"case-33",33},
+        {"cancel",2},{"zero-scalars",7},{"identity-bases",7}}};
+    for (const auto& item : cases) {
+        const auto dir = root / "chain" / item.first;
+        const auto bases = load_affine(dir / "bases.bin", item.second);
+        const auto scalars = load<hp::Fr>(dir / "scalars.bin", item.second);
+        const auto expected = load_affine(dir / "expected.bin", 1)[0];
+        for (const unsigned c : {3u,4u}) {
+            const unsigned windows = (255+c-1)/c, bucket_count = 1u << c;
+            std::vector<std::array<hp::G1Jacobian, 2>> segments(windows);
+            for (unsigned w = 0; w < windows; ++w) {
+                std::vector<hp::G1Jacobian> buckets(bucket_count);
+                for (unsigned b = 0; b < bucket_count; ++b) {
+                    hp::G1Jacobian partials[2]{};
+                    if (b) for (size_t i = 0; i < item.second; ++i)
+                        if (scalar_digit(scalars[i],w,c) == b)
+                            partials[i < item.second/2 ? 0 : 1].mixed_add_assign(bases[i]);
+                    buckets[b] = partials[0];
+                    buckets[b] += partials[1];
+                }
+                const unsigned split = (bucket_count-1)/2;
+                segments[w][0] = weighted_range(buckets,1,split);
+                segments[w][1] = weighted_range(buckets,split+1,bucket_count-1);
+                require(weighted_range(buckets,3,2).is_identity(), "empty weighted range");
+                require(weighted_range(buckets,0,split) == segments[w][0], "zero-start weighted range");
+                hp::G1Jacobian direct{};
+                for (unsigned b = split+1; b < bucket_count; ++b) direct += buckets[b].mul_by_u64(b);
+                require(direct == segments[w][1], "offset weighted range");
+            }
+            hp::G1Jacobian result{};
+            for (unsigned w = windows; w-- > 0;) {
+                for (unsigned bit = 0; bit < c; ++bit) result.double_in_place();
+                result += segments[w][0];
+                result += segments[w][1];
+            }
+            expect_point(result, expected, "host chain " + dir.string() + "/" + std::to_string(c));
+        }
+    }
+}
+void g1_suite(const std::filesystem::path& fixtures) {
+    const auto root = fixtures / "g1";
+    const auto generator = load_affine(root / "generator.bin",1)[0];
+    expect_affine(hp::G1Affine::generator(), generator, "generator");
+    require(hp::G1Affine{}.is_identity() && same_raw(hp::G1Jacobian{},hp::G1Jacobian::identity()),
+            "default point identity");
+    for (const size_t count : {0,1,2,15,16,17,31,32,33,65}) {
+        const auto dir = root / ("case-" + std::to_string(count));
+        const auto aa = load_affine(dir / "affine_a.bin",count);
+        const auto ab = load_affine(dir / "affine_b.bin",count);
+        const auto ja = load_jacobian(dir / "jacobian_a.bin",count);
+        const auto jb = load_jacobian(dir / "jacobian_b.bin",count);
+        const auto mul = load_integers<uint64_t>(dir / "mul_u64.bin",count);
+        const auto equal = load_integers<uint32_t>(dir / "equal.bin",count);
+        const auto added = load_affine(dir / "add.bin",count);
+        const auto doubled = load_affine(dir / "double.bin",count);
+        const auto negated = load_affine(dir / "neg.bin",count);
+        const auto affine_negated = load_affine(dir / "affine_neg.bin",count);
+        const auto multiplied = load_affine(dir / "mul.bin",count);
+        for (size_t i = 0; i < count; ++i) {
+            const auto a = ja[i], b = jb[i];
+            const auto context = dir.string() + "/" + std::to_string(i);
+            require((a == b) == bool(equal[i]) && (a != b) == !bool(equal[i]), context + " projective equality");
+            require((aa[i] == ab[i]) == bool(equal[i]) && (aa[i] != ab[i]) == !bool(equal[i]),
+                    context + " affine equality");
+            expect_affine(a.to_affine(),aa[i],context + " normalize");
+            expect_point(aa[i].to_jacobian(),aa[i],context + " from affine");
+            auto p = a; p += b; expect_point(p,added[i],context + " add");
+            p = a; p.mixed_add_assign(ab[i]); expect_point(p,added[i],context + " mixed");
+            p = a; p.double_in_place(); expect_point(p,doubled[i],context + " double");
+            p = a; p += p; expect_point(p,doubled[i],context + " self add");
+            expect_point(-a,negated[i],context + " negate");
+            expect_point(a.mul_by_u64(mul[i]),multiplied[i],context + " mul u64");
+            expect_affine(-ab[i],affine_negated[i],context + " affine negate");
+            require(same_raw(a,ja[i]) && same_raw(b,jb[i]) && aa[i] == a.to_affine()
+                    && ab[i] == b.to_affine(), context + " source mutation");
+            if (i == 1) require(!same_raw(a,b) && a == b && !(a != b), "scaled equality fixture");
+            if (i == 8) {
+                p = a; p += b;
+                require(same_raw(p,b), "identity add preserves finite representation");
+                expect_affine(p.to_affine(),generator,"identity add G");
+                p = a; p.mixed_add_assign(ab[i]);
+                require(p.z == hp::Fq::one(), "identity mixed Z1");
+                expect_affine(p.to_affine(),generator,"identity mixed G");
+            }
+        }
+    }
+    const auto da = load_affine(root / "diagnostics/affine.bin",5);
+    const auto dj = load_jacobian(root / "diagnostics/jacobian.bin",5);
+    const auto flags = load_integers<uint32_t>(root / "diagnostics/flags.bin",5);
+    for (size_t i = 0; i < 5; ++i) {
+        const unsigned actual = unsigned(da[i].is_identity()) | (unsigned(da[i].is_on_curve()) << 1)
+            | (unsigned(dj[i].is_identity()) << 2) | (unsigned(dj[i].is_on_curve()) << 3);
+        require(actual == flags[i], "G1 diagnostics flags");
+    }
+    require(raw_order_mul(generator.to_jacobian()).is_identity(), "[r]G must vanish");
+    require(da[2].is_on_curve() && !raw_order_mul(dj[2]).is_identity(), "curve check is not subgroup check");
+    g1_host_chains(root);
+    std::cout << "G1_HOST_PASS\n";
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -218,6 +390,7 @@ int main(int argc, char** argv) {
         extras<Prime64>(root / "prime64");
         std::cout << "FIELD_ELEMENT_HOST_PASS field=TestPrime64\n";
         for (const size_t count : counts) fr_regression(root, count);
+        g1_suite(root);
         std::cout << "FIELD_MATH_HOST_PASS\n";
         return 0;
     } catch (const std::exception& error) {
