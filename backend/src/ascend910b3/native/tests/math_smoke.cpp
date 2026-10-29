@@ -1,9 +1,8 @@
-#include "kernel_operator.h"
-#define HP_FIELD_DEVICE __aicore__
 #include "../math_kernels.h"
 #include "../g1.h"
 #include "../math_tiling.h"
 #include "runtime_audit.h"
+#include "smoke_kernels.h"
 
 #include <acl/acl.h>
 
@@ -20,444 +19,7 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-
-// Test-only device instantiations; no Fq production launcher or ABI is added.
-namespace field_smoke {
-constexpr uint32_t tile_elements = 32;
-enum Operation : uint32_t { add, sub, neg, mul, square, inverse, wide };
-
-template<class Field>
-class Staging {
-public:
-    static constexpr uint32_t field_bytes = sizeof(Field);
-    static constexpr uint32_t wide_bytes = 2 * field_bytes + 4;
-    static constexpr uint32_t rhs_offset = tile_elements * field_bytes;
-    static constexpr uint32_t input_bytes = tile_elements * wide_bytes;
-    static constexpr uint32_t output_bytes = tile_elements * field_bytes;
-    // build_math_tiling validates at least 32 KiB of platform UB before launch.
-    // Fq uses 3200 + 1536 bytes, including the complete 100-byte wide records.
-    static_assert(input_bytes >= 2 * rhs_offset);
-    static_assert((input_bytes % 32) == 0 && (output_bytes % 32) == 0);
-    static_assert(input_bytes + output_bytes <= 32768);
-
-    __aicore__ inline Staging()
-    {
-        pipe_.InitBuffer(input_, 1, input_bytes);
-        pipe_.InitBuffer(output_, 1, output_bytes);
-    }
-
-    __aicore__ inline AscendC::LocalTensor<uint8_t> read(
-        GM_ADDR lhs, uint32_t bytes, GM_ADDR rhs, uint32_t rhs_bytes)
-    {
-        auto local = input_.AllocTensor<uint8_t>();
-        copy_in(local, lhs, bytes);
-        if (rhs_bytes != 0) copy_in(local[rhs_offset], rhs, rhs_bytes);
-        input_.EnQue(local);
-        local = input_.DeQue<uint8_t>();
-        const auto event = pipe_.FetchEventID(AscendC::HardEvent::MTE2_S);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(event);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(event);
-        return local;
-    }
-
-    __aicore__ inline AscendC::LocalTensor<uint8_t> alloc()
-    {
-        return output_.AllocTensor<uint8_t>();
-    }
-
-    __aicore__ inline void release(AscendC::LocalTensor<uint8_t> local)
-    {
-        input_.FreeTensor(local);
-    }
-
-    __aicore__ inline void write(AscendC::LocalTensor<uint8_t> local,
-                                GM_ADDR destination, uint32_t bytes)
-    {
-        output_.EnQue(local);
-        local = output_.DeQue<uint8_t>();
-        auto event = pipe_.FetchEventID(AscendC::HardEvent::S_MTE3);
-        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(event);
-        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(event);
-        AscendC::GlobalTensor<uint8_t> gm;
-        gm.SetGlobalBuffer(destination);
-        AscendC::DataCopyPad(gm, local, AscendC::DataCopyExtParams{1, bytes, 0, 0, 0});
-        event = pipe_.FetchEventID(AscendC::HardEvent::MTE3_S);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(event);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(event);
-        output_.FreeTensor(local);
-    }
-
-private:
-    __aicore__ inline void copy_in(AscendC::LocalTensor<uint8_t> local,
-                                  GM_ADDR source, uint32_t bytes)
-    {
-        AscendC::GlobalTensor<uint8_t> gm;
-        gm.SetGlobalBuffer(source);
-        AscendC::DataCopyPad(local, gm, AscendC::DataCopyExtParams{1, bytes, 0, 0, 0},
-                            AscendC::DataCopyPadExtParams<uint8_t>{false, 0, 0, 0});
-    }
-
-    AscendC::TPipe pipe_;
-    AscendC::TQue<AscendC::QuePosition::VECIN, 1> input_;
-    AscendC::TQue<AscendC::QuePosition::VECOUT, 1> output_;
-};
-
-template<class Field>
-__aicore__ inline Field load(AscendC::LocalTensor<uint8_t> local, uint32_t index)
-{
-    const auto words = local.ReinterpretCast<uint32_t>();
-    Field value{};
-    for (uint32_t w = 0; w < Field::word_count; ++w)
-        value.words[w] = words.GetValue(index * Field::word_count + w);
-    return value;
-}
-
-template<class Field>
-__aicore__ inline void store(AscendC::LocalTensor<uint8_t> local,
-                             uint32_t index, const Field& value)
-{
-    auto words = local.ReinterpretCast<uint32_t>();
-    for (uint32_t w = 0; w < Field::word_count; ++w)
-        words.SetValue(index * Field::word_count + w, value.words[w]);
-}
-} // namespace field_smoke
-
-template<class Field>
-__global__ __aicore__ void field_element_smoke(GM_ADDR lhs, GM_ADDR rhs, GM_ADDR out,
-                                              GM_ADDR mask, uint64_t count, uint32_t op)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    using IO = field_smoke::Staging<Field>;
-    IO io;
-    constexpr uint32_t tile = field_smoke::tile_elements;
-    const uint32_t input_width = op == field_smoke::wide ? IO::wide_bytes : IO::field_bytes;
-    const bool binary = op == field_smoke::add || op == field_smoke::sub || op == field_smoke::mul;
-    for (uint64_t offset = uint64_t(AscendC::GetBlockIdx()) * tile; offset < count;
-         offset += uint64_t(AscendC::GetBlockNum()) * tile) {
-        const uint32_t n = uint32_t(count - offset < tile ? count - offset : tile);
-        auto input = io.read(lhs + offset * input_width, n * input_width,
-                             binary ? rhs + offset * IO::field_bytes : nullptr,
-                             binary ? n * IO::field_bytes : 0);
-        auto result = io.alloc();
-        uint8_t nonzero[tile]{};
-        for (uint32_t i = 0; i < n; ++i) {
-            Field value{};
-            if (op == field_smoke::wide) {
-                hyperplonk::ascend910b3::WideInteger<typename Field::Parameters> integer{};
-                for (uint32_t b = 0; b < IO::wide_bytes; ++b)
-                    integer.bytes[b] = input.GetValue(i * IO::wide_bytes + b);
-                value = Field::reduce_wide(integer);
-            } else {
-                const Field a = field_smoke::load<Field>(input, i);
-                if (op == field_smoke::inverse) {
-                    // The class preserves out on zero; the batch convention is out0/mask0.
-                    nonzero[i] = a.inverse(value) ? 1 : 0;
-                } else if (op == field_smoke::neg) {
-                    value = -a;
-                } else if (op == field_smoke::square) {
-                    value = a.square();
-                } else {
-                    const Field b = field_smoke::load<Field>(input[IO::rhs_offset], i);
-                    value = op == field_smoke::add ? a + b :
-                            op == field_smoke::sub ? a - b : a * b;
-                }
-            }
-            field_smoke::store<Field>(result, i, value);
-        }
-        io.release(input);
-        io.write(result, out + offset * IO::field_bytes, n * IO::field_bytes);
-        if (op == field_smoke::inverse) {
-            auto flags = io.alloc();
-            for (uint32_t i = 0; i < n; ++i) flags.SetValue(i, nonzero[i]);
-            io.write(flags, mask + offset, n);
-        }
-    }
-}
-
-// Test-only compact point transport. Odd records are scalar UB views, not DMA bases.
-namespace g1_smoke {
-using namespace hyperplonk::ascend910b3;
-template<uint32_t InputBytes, uint32_t OutputBytes> class Staging {
-public:
-    static_assert(InputBytes % 32 == 0 && OutputBytes % 32 == 0);
-    static_assert(InputBytes + OutputBytes <= 32768);
-    __aicore__ inline Staging() {
-        pipe_.InitBuffer(input_, 1, InputBytes);
-        pipe_.InitBuffer(output_, 1, OutputBytes);
-    }
-    __aicore__ inline AscendC::LocalTensor<uint8_t> alloc_input() { return input_.AllocTensor<uint8_t>(); }
-    __aicore__ inline void copy_in(AscendC::LocalTensor<uint8_t> local, GM_ADDR source, uint32_t bytes) {
-        if (!bytes) return;
-        AscendC::GlobalTensor<uint8_t> gm;
-        gm.SetGlobalBuffer(source);
-        AscendC::DataCopyPad(local, gm, AscendC::DataCopyExtParams{1,bytes,0,0,0},
-                            AscendC::DataCopyPadExtParams<uint8_t>{false,0,0,0});
-    }
-    __aicore__ inline AscendC::LocalTensor<uint8_t> ready_input(AscendC::LocalTensor<uint8_t> local) {
-        input_.EnQue(local);
-        local = input_.DeQue<uint8_t>();
-        const auto event = pipe_.FetchEventID(AscendC::HardEvent::MTE2_S);
-        AscendC::SetFlag<AscendC::HardEvent::MTE2_S>(event);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE2_S>(event);
-        return local;
-    }
-    __aicore__ inline void release(AscendC::LocalTensor<uint8_t> local) { input_.FreeTensor(local); }
-    __aicore__ inline AscendC::LocalTensor<uint8_t> alloc_output() { return output_.AllocTensor<uint8_t>(); }
-    __aicore__ inline void write(AscendC::LocalTensor<uint8_t> local, GM_ADDR destination, uint32_t bytes) {
-        output_.EnQue(local);
-        local = output_.DeQue<uint8_t>();
-        auto event = pipe_.FetchEventID(AscendC::HardEvent::S_MTE3);
-        AscendC::SetFlag<AscendC::HardEvent::S_MTE3>(event);
-        AscendC::WaitFlag<AscendC::HardEvent::S_MTE3>(event);
-        AscendC::GlobalTensor<uint8_t> gm;
-        gm.SetGlobalBuffer(destination);
-        AscendC::DataCopyPad(gm,local,AscendC::DataCopyExtParams{1,bytes,0,0,0});
-        event = pipe_.FetchEventID(AscendC::HardEvent::MTE3_S);
-        AscendC::SetFlag<AscendC::HardEvent::MTE3_S>(event);
-        AscendC::WaitFlag<AscendC::HardEvent::MTE3_S>(event);
-        output_.FreeTensor(local);
-    }
-private:
-    AscendC::TPipe pipe_;
-    AscendC::TQue<AscendC::QuePosition::VECIN,1> input_;
-    AscendC::TQue<AscendC::QuePosition::VECOUT,1> output_;
-};
-__aicore__ inline G1Affine load_affine(AscendC::LocalTensor<uint8_t> local, uint32_t i) {
-    return {field_smoke::load<Fq>(local,2*i),field_smoke::load<Fq>(local,2*i+1)};
-}
-__aicore__ inline G1Jacobian load_jacobian(AscendC::LocalTensor<uint8_t> local, uint32_t i) {
-    return {field_smoke::load<Fq>(local,3*i),field_smoke::load<Fq>(local,3*i+1),
-            field_smoke::load<Fq>(local,3*i+2)};
-}
-__aicore__ inline void store_affine(AscendC::LocalTensor<uint8_t> local, uint32_t i, const G1Affine& p) {
-    field_smoke::store<Fq>(local,2*i,p.x);
-    field_smoke::store<Fq>(local,2*i+1,p.y);
-}
-__aicore__ inline void store_jacobian(AscendC::LocalTensor<uint8_t> local, uint32_t i, const G1Jacobian& p) {
-    field_smoke::store<Fq>(local,3*i,p.x);
-    field_smoke::store<Fq>(local,3*i+1,p.y);
-    field_smoke::store<Fq>(local,3*i+2,p.z);
-}
-__aicore__ inline void zero_slot(AscendC::LocalTensor<uint8_t> local) {
-    auto words = local.ReinterpretCast<uint32_t>();
-    for (unsigned i = 0; i < 8; ++i) words.SetValue(i,0);
-}
-} // namespace g1_smoke
-
-__global__ __aicore__ void g1_elementwise_smoke(
-    GM_ADDR lhs, GM_ADDR rhs, GM_ADDR affine_rhs, GM_ADDR factors,
-    GM_ADDR out, uint64_t count, uint32_t op)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    using namespace g1_smoke;
-    Staging<800,288> io;
-    for (uint64_t offset = uint64_t(AscendC::GetBlockIdx())*2; offset < count;
-         offset += uint64_t(AscendC::GetBlockNum())*2) {
-        const uint32_t n = count-offset < 2 ? uint32_t(count-offset) : 2;
-        auto input = io.alloc_input();
-        if (op < 6) io.copy_in(input,lhs+offset*144,n*144);
-        if (op == 0) io.copy_in(input[288],rhs+offset*144,n*144);
-        if (op == 1 || op == 6 || op == 7) io.copy_in(input[576],affine_rhs+offset*96,n*96);
-        if (op == 4) io.copy_in(input[768],factors+(offset/4)*32,32);
-        input = io.ready_input(input);
-        auto output = io.alloc_output();
-        for (uint32_t i = 0; i < n; ++i) {
-            G1Jacobian p{};
-            if (op < 6) p = load_jacobian(input,i);
-            if (op == 0) p += load_jacobian(input[288],i);
-            else if (op == 1) p.mixed_add_assign(load_affine(input[576],i));
-            else if (op == 2) p.double_in_place();
-            else if (op == 3) p = -p;
-            else if (op == 4) {
-                const auto words = input[768].ReinterpretCast<uint32_t>();
-                const uint32_t word = uint32_t(offset%4+i)*2;
-                const uint64_t factor = uint64_t(words.GetValue(word)) |
-                                         (uint64_t(words.GetValue(word+1)) << 32);
-                p = p.mul_by_u64(factor);
-            } else if (op == 5) p += p;
-            else if (op == 6) p = load_affine(input[576],i).to_jacobian();
-            else p = (-load_affine(input[576],i)).to_jacobian();
-            store_jacobian(output,i,p);
-        }
-        io.release(input);
-        io.write(output,out+offset*144,n*144);
-    }
-}
-
-__global__ __aicore__ void g1_inspect_smoke(
-    GM_ADDR points, GM_ADDR rhs_jacobian, GM_ADDR rhs_affine,
-    GM_ADDR affine_out, GM_ADDR flags, uint64_t count)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    using namespace g1_smoke;
-    Staging<800,288> io;
-    for (uint64_t offset = uint64_t(AscendC::GetBlockIdx())*2; offset < count;
-         offset += uint64_t(AscendC::GetBlockNum())*2) {
-        const uint32_t n = count-offset < 2 ? uint32_t(count-offset) : 2;
-        auto input = io.alloc_input();
-        io.copy_in(input,points+offset*144,n*144);
-        io.copy_in(input[288],rhs_jacobian+offset*144,n*144);
-        io.copy_in(input[576],rhs_affine+offset*96,n*96);
-        input = io.ready_input(input);
-        auto output = io.alloc_output();
-        uint32_t bits[2]{};
-        for (uint32_t i = 0; i < n; ++i) {
-            const auto p = load_jacobian(input,i);
-            const auto a = p.to_affine();
-            const auto jrhs = load_jacobian(input[288],i);
-            const auto arhs = load_affine(input[576],i);
-            bits[i] = uint32_t(p.is_on_curve()) | (uint32_t(p.is_identity())<<1)
-                | (uint32_t(p==jrhs)<<2) | (uint32_t(p!=jrhs)<<3)
-                | (uint32_t(a.is_on_curve())<<4) | (uint32_t(a.is_identity())<<5)
-                | (uint32_t(a==arhs)<<6) | (uint32_t(a!=arhs)<<7);
-            store_affine(output,i,a);
-        }
-        io.release(input);
-        io.write(output,affine_out+offset*96,n*96);
-        output = io.alloc_output();
-        zero_slot(output);
-        auto words = output.ReinterpretCast<uint32_t>();
-        for (uint32_t i = 0; i < n; ++i) words.SetValue(i,bits[i]);
-        io.write(output,flags+(offset/2)*32,32);
-    }
-}
-
-__global__ __aicore__ void g1_diagnostics_smoke(
-    GM_ADDR affine, GM_ADDR jacobian, GM_ADDR flags, uint64_t count)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    using namespace g1_smoke;
-    Staging<480,32> io;
-    for (uint64_t offset = uint64_t(AscendC::GetBlockIdx())*2; offset < count;
-         offset += uint64_t(AscendC::GetBlockNum())*2) {
-        const uint32_t n = count-offset < 2 ? uint32_t(count-offset) : 2;
-        auto input = io.alloc_input();
-        io.copy_in(input,affine+offset*96,n*96);
-        io.copy_in(input[192],jacobian+offset*144,n*144);
-        input = io.ready_input(input);
-        auto output = io.alloc_output();
-        zero_slot(output);
-        auto words = output.ReinterpretCast<uint32_t>();
-        for (uint32_t i = 0; i < n; ++i) {
-            const auto a = load_affine(input,i);
-            const auto j = load_jacobian(input[192],i);
-            words.SetValue(i,uint32_t(a.is_identity()) | (uint32_t(a.is_on_curve())<<1)
-                | (uint32_t(j.is_identity())<<2) | (uint32_t(j.is_on_curve())<<3));
-        }
-        io.release(input);
-        io.write(output,flags+(offset/2)*32,32);
-    }
-}
-__global__ __aicore__ void g1_generator_smoke(GM_ADDR jacobian, GM_ADDR affine)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    using namespace g1_smoke;
-    Staging<32,160> io;
-    const auto g = G1Affine::generator();
-    auto output = io.alloc_output();
-    store_jacobian(output,0,g.to_jacobian());
-    io.write(output,jacobian,144);
-    output = io.alloc_output();
-    store_affine(output,0,g);
-    io.write(output,affine,96);
-}
-
-namespace g1_smoke {
-__aicore__ inline uint32_t digit(const Fr& scalar, uint32_t window, uint32_t c) {
-    const uint32_t bit = window*c, word = bit/32, shift = bit%32;
-    uint32_t value = scalar.words[word] >> shift;
-    if (shift && shift+c > 32 && word+1 < Fr::word_count)
-        value |= scalar.words[word+1] << (32-shift);
-    const uint32_t available = 255-bit < c ? 255-bit : c;
-    return value & ((1u << available)-1);
-}
-} // namespace g1_smoke
-
-// Three test-only stages, not a production MSM: fixed task ownership, no sorting.
-__global__ __aicore__ void g1_chain_partials(
-    GM_ADDR bases, GM_ADDR scalars, GM_ADDR partials, uint32_t count, uint32_t window_bits)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    using namespace g1_smoke;
-    Staging<6144,288> io;
-    auto input = io.alloc_input();
-    io.copy_in(input,bases,count*96);
-    io.copy_in(input[4096],scalars,count*32);
-    input = io.ready_input(input);
-    const uint32_t buckets = 1u << window_bits, windows = (255+window_bits-1)/window_bits;
-    for (uint32_t task = AscendC::GetBlockIdx(); task < windows*buckets; task += AscendC::GetBlockNum()) {
-        const uint32_t window = task/buckets, bucket = task%buckets;
-        G1Jacobian sums[2]{};
-        if (bucket) for (uint32_t i = 0; i < count; ++i) {
-            const auto scalar = field_smoke::load<Fr>(input[4096],i);
-            if (digit(scalar,window,window_bits) == bucket)
-                sums[i < count/2 ? 0 : 1].mixed_add_assign(load_affine(input,i));
-        }
-        auto output = io.alloc_output();
-        store_jacobian(output,0,sums[0]);
-        store_jacobian(output,1,sums[1]);
-        io.write(output,partials+uint64_t(task)*288,288);
-    }
-    io.release(input);
-}
-
-__global__ __aicore__ void g1_chain_segments(
-    GM_ADDR partials, GM_ADDR segments, uint32_t window_bits)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    using namespace g1_smoke;
-    Staging<4608,288> io;
-    const uint32_t buckets = 1u << window_bits, windows = (255+window_bits-1)/window_bits;
-    for (uint32_t window = AscendC::GetBlockIdx(); window < windows; window += AscendC::GetBlockNum()) {
-        auto input = io.alloc_input();
-        io.copy_in(input,partials+uint64_t(window)*buckets*288,buckets*288);
-        input = io.ready_input(input);
-        auto output = io.alloc_output();
-        const uint32_t split = (buckets-1)/2;
-        for (uint32_t segment = 0; segment < 2; ++segment) {
-            const uint32_t a = segment == 0 ? 1 : split+1;
-            const uint32_t end = segment == 0 ? split : buckets-1;
-            G1Jacobian running{}, local{};
-            for (uint32_t b = end+1; b-- > a;) {
-                auto bucket = load_jacobian(input,b*2);
-                bucket += load_jacobian(input,b*2+1);
-                running += bucket;
-                local += running;
-            }
-            if (a > 1) local += running.mul_by_u64(a-1);
-            store_jacobian(output,segment,local);
-        }
-        io.release(input);
-        io.write(output,segments+uint64_t(window)*288,288);
-    }
-}
-
-__global__ __aicore__ void g1_chain_finish(
-    GM_ADDR segments, GM_ADDR out, uint32_t windows, uint32_t window_bits)
-{
-    KERNEL_TASK_TYPE_DEFAULT(KERNEL_TYPE_AIV_ONLY);
-    using namespace g1_smoke;
-    Staging<24480,96> io;
-    if (!windows) {
-        auto output = io.alloc_output();
-        store_affine(output,0,G1Affine::identity());
-        io.write(output,out,96);
-        return;
-    }
-    auto input = io.alloc_input();
-    io.copy_in(input,segments,windows*288);
-    input = io.ready_input(input);
-    G1Jacobian result{};
-    for (uint32_t window = windows; window-- > 0;) {
-        for (uint32_t bit = 0; bit < window_bits; ++bit) result.double_in_place();
-        result += load_jacobian(input,window*2);
-        result += load_jacobian(input,window*2+1);
-    }
-    io.release(input);
-    auto output = io.alloc_output();
-    store_affine(output,0,result.to_affine());
-    io.write(output,out,96);
-}
+#include <type_traits>
 
 namespace {
 namespace math = hyperplonk::ascend910b3;
@@ -1071,8 +633,13 @@ bool launch_field_element(aclrtStream stream, const void* lhs, const Field* rhs,
     const size_t tiles = count / field_smoke::tile_elements +
                          (count % field_smoke::tile_elements != 0);
     const uint32_t blocks = static_cast<uint32_t>(std::min<size_t>(cores, tiles));
-    field_element_smoke<Field><<<blocks, nullptr, stream>>>(
-        device_address(lhs), device_address(rhs), device_address(out), device_address(mask), count, op);
+    static_assert(std::is_same<Field,Fr>::value || std::is_same<Field,math::Fq>::value);
+    if constexpr (std::is_same<Field,Fr>::value)
+        audit::launch_fr_smoke(blocks,stream,device_address(lhs),device_address(rhs),
+                               device_address(out),mask,count,op);
+    else
+        audit::launch_fq_smoke(blocks,stream,device_address(lhs),device_address(rhs),
+                               device_address(out),mask,count,op);
     return true;
 }
 
@@ -1258,7 +825,7 @@ bool launch_g1_elementwise(aclrtStream stream, uint32_t cores, uint8_t* lhs, uin
     require(cores && op < 8,"invalid G1 primitive configuration");
     for (auto p : {lhs,rhs,affine,factors,out}) require_dma_alignment(p);
     const uint32_t blocks = uint32_t(std::min<size_t>(cores,(count+1)/2));
-    g1_elementwise_smoke<<<blocks,nullptr,stream>>>(lhs,rhs,affine,factors,out,count,op);
+    audit::launch_g1_elementwise_smoke(blocks,stream,lhs,rhs,affine,factors,out,count,op);
     return true;
 }
 void inspect_g1(Runtime& runtime, aclrtStream stream, uint32_t cores, G1Guard& raw,
@@ -1272,7 +839,7 @@ void inspect_g1(Runtime& runtime, aclrtStream stream, uint32_t cores, G1Guard& r
     G1Guard affine(runtime,stream,count*96), flags(runtime,stream,((count+1)/2)*32);
     for (auto p : {raw.payload,rhs.payload,affine_rhs.payload,affine.payload,flags.payload})
         require_dma_alignment(p);
-    g1_inspect_smoke<<<uint32_t(std::min<size_t>(cores,(count+1)/2)),nullptr,stream>>>(
+    audit::launch_g1_inspect_smoke(uint32_t(std::min<size_t>(cores,(count+1)/2)),stream,
         raw.payload,rhs.payload,affine_rhs.payload,affine.payload,flags.payload,count);
     raw.download(runtime,stream);
     affine.download(runtime,stream);
@@ -1348,7 +915,7 @@ void test_g1_primitives(Runtime& runtime, aclrtStream stream, uint32_t cores,
     const auto dj = read_g1_jacobian(root/"diagnostics/jacobian.bin",5);
     const auto expected_flags = read_fixture_bytes(root/"diagnostics/flags.bin",20);
     G1Guard a(runtime,stream,5*96,da.data()), j(runtime,stream,5*144,dj.data()), flags(runtime,stream,3*32);
-    g1_diagnostics_smoke<<<std::min<uint32_t>(cores,3),nullptr,stream>>>(a.payload,j.payload,flags.payload,5);
+    audit::launch_g1_diagnostics_smoke(std::min<uint32_t>(cores,3),stream,a.payload,j.payload,flags.payload,5);
     for (auto p : {&a,&j,&flags}) p->download(runtime,stream);
     check(aclrtSynchronizeStream(stream),"G1 diagnostics synchronize");
     a.verify(true,"diagnostic affine"); j.verify(true,"diagnostic Jacobian"); flags.verify(false,"diagnostic flags");
@@ -1359,7 +926,7 @@ void test_g1_primitives(Runtime& runtime, aclrtStream stream, uint32_t cores,
     }
     const auto generator = read_g1_affine(root/"generator.bin",1);
     G1Guard ga(runtime,stream,96), gj(runtime,stream,144);
-    g1_generator_smoke<<<1,nullptr,stream>>>(gj.payload,ga.payload);
+    audit::launch_g1_generator_smoke(stream,gj.payload,ga.payload);
     ga.download(runtime,stream); gj.download(runtime,stream);
     check(aclrtSynchronizeStream(stream),"G1 generator synchronize");
     ga.verify(false,"generator affine"); gj.verify(false,"generator Jacobian");
@@ -1392,12 +959,12 @@ void test_g1_chain(Runtime& runtime, aclrtStream stream, uint32_t cores,
     runtime.upload(stream,dscalars,scalars.data(),count);
     audit::begin_runtime_audit();
     if (count) {
-        g1_chain_partials<<<std::min(cores,windows*buckets),nullptr,stream>>>(
+        audit::launch_g1_chain_partials(std::min(cores,windows*buckets),stream,
             device_address(dbases),device_address(dscalars),device_address(partials),uint32_t(count),c);
-        g1_chain_segments<<<std::min(cores,windows),nullptr,stream>>>(
+        audit::launch_g1_chain_segments(std::min(cores,windows),stream,
             device_address(partials),device_address(segments),c);
     }
-    g1_chain_finish<<<1,nullptr,stream>>>(device_address(segments),device_address(out),count ? windows : 0,c);
+    audit::launch_g1_chain_finish(stream,device_address(segments),device_address(out),count ? windows : 0,c);
     const auto compute = audit::end_runtime_audit();
     require_no_runtime_transfers(compute);
     audit::begin_runtime_audit();

@@ -76,6 +76,11 @@ struct G1Jacobian {
     // cuZK BLS12-381 Jacobian formulas, revision
     // 88e3295cada379abe06240df23ec6c9fc0f648b2. Keep all old-input
     // dependencies in temporaries before writing back, including p += p.
+    // Bound device LICM/inlining cost inside nested bucket accumulations while
+    // still optimizing the Fq operations within this function. Host stays inline.
+#if defined(__NPU_DEVICE__)
+    __attribute__((noinline))
+#endif
     HP_G1_INLINE G1Jacobian& operator+=(const G1Jacobian& other) {
         if (is_identity()) {
             *this = other.is_identity() ? identity() : other;

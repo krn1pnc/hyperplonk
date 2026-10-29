@@ -164,11 +164,26 @@ or evidence of MSM performance.
 
 For mathematical iterations, build/run `field_math_tests` first; it requires
 neither SDK initialization nor NPU compilation. This does not replace device
-verification. The current smoke target keeps all test kernels in one ASC
-translation unit, so editing a chain kernel also recompiles the field and point
-tests. Deeply inlined Fq arithmetic inside nested point loops can make the
-Release/O3 compilation expensive; build duration is not kernel execution time.
-No device noinline policy or reduced-optimization acceptance mode is enabled.
+verification. The smoke harness is ordinary C++ (`tests/math_smoke.cpp`).
+Its field, G1 primitive and resident-chain kernels compile independently in
+`field_smoke.asc`, `g1_smoke.asc` and `g1_chain_smoke.asc`. Test-only launch
+declarations in `smoke_kernels.h` keep device headers and launch syntax out of
+the harness; they do not add a protocol ABI. Editing a host check no longer
+recompiles kernels, and editing a chain kernel leaves the field/primitive units
+cached. Shared header changes still rebuild their consumers.
+
+On device only, `G1Jacobian::operator+=` retains a non-inlined call boundary
+to prevent heavy Fq/Barrett expressions from expanding repeatedly into nested
+bucket loops and triggering expensive LLVM LICM. Fq arithmetic remains optimized
+within that function; host inlining, point formulas and layouts are unchanged.
+All ASC kernels retain Release `-O3`; no tests or residency audits are skipped.
+
+Measured with CANN 9.1.0, DAV_2201 and four build jobs: a fresh native build took
+85.14 seconds, host-harness-only rebuild 2.77 seconds, chain-only rebuild
+41.98 seconds, and unchanged rebuild 0.08 seconds. These are build wall times
+(excluding configuration, fixture generation and tests), not kernel timings.
+The full host/NPU suite, all 16 G1 resident-chain cases and CPU backend
+regression pass with this organization; per-kernel performance was not profiled.
 
 
 ### Generate and read the documentation

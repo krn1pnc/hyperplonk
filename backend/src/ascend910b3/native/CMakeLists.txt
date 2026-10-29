@@ -45,7 +45,12 @@ if(BUILD_TESTING)
         --fixtures "${CMAKE_BINARY_DIR}/fixtures")
 endif()
 
-add_executable(native_math_smoke tests/math_smoke.asc tests/runtime_audit.cpp)
+add_executable(native_math_smoke
+    tests/math_smoke.cpp
+    tests/field_smoke.asc
+    tests/g1_smoke.asc
+    tests/g1_chain_smoke.asc
+    tests/runtime_audit.cpp)
 target_link_libraries(native_math_smoke PRIVATE hyperplonk_ascend910b3_math)
 target_link_options(native_math_smoke PRIVATE
     "-Wl,--wrap=aclrtMemcpy"
