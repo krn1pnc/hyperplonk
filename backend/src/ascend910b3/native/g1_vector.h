@@ -105,29 +105,42 @@ public:
 
     __aicore__ inline void load_affine(
         Point dst, GM_ADDR src, const uint64_t* byte_offsets, uint32_t valid) {
-        load(dst, src, byte_offsets, valid, true);
+        load<false, true>(dst, src, byte_offsets, valid);
     }
 
     __aicore__ inline void load_points(
         Point dst, GM_ADDR src, const uint64_t* byte_offsets, uint32_t valid) {
-        load(dst, src, byte_offsets, valid, false);
+        load<false, false>(dst, src, byte_offsets, valid);
+    }
+
+    // Internal MSM records contain packed Montgomery integers, not radix-12
+    // banks. Public canonical loaders above retain their conversion semantics.
+    __aicore__ inline void load_affine_montgomery(
+        Point dst, GM_ADDR src, const uint64_t* byte_offsets, uint32_t valid) {
+        load<true, true>(dst, src, byte_offsets, valid);
+    }
+
+    __aicore__ inline void load_points_montgomery(
+        Point dst, GM_ADDR src, const uint64_t* byte_offsets, uint32_t valid) {
+        load<true, false>(dst, src, byte_offsets, valid);
     }
 
     HP_G1_VECTOR_HEAVY __aicore__ inline void store_points(
         Point src, GM_ADDR dst, const uint64_t* byte_offsets, uint32_t valid) {
-        canonical_one(slot(6));
-        for (uint32_t coordinate = 0; coordinate < 3; ++coordinate) {
-            mul(slot(7), slot(src + coordinate), slot(6));
-            fq_.pack_words(fq_.i32(coordinate * word_soa_bytes), slot(7));
-        }
-        interleave(false);
-        fq_.sync<AscendC::HardEvent::V_MTE3>();
-        for (uint32_t lane = 0; lane < valid; ++lane) {
-            if (byte_offsets[lane] != absent)
-                fq_.copy_out(raw()[lane * jacobian_bytes],
-                             dst + byte_offsets[lane], jacobian_bytes);
-        }
-        fq_.sync<AscendC::HardEvent::MTE3_V>();
+        store<false, false>(src, dst, byte_offsets, valid);
+    }
+
+    HP_G1_VECTOR_HEAVY __aicore__ inline void store_points_montgomery(
+        Point src, GM_ADDR dst, const uint64_t* byte_offsets, uint32_t valid) {
+        store<true, false>(src, dst, byte_offsets, valid);
+    }
+
+    // Preconversion only: src is an unchanged affine load, so finite Z=R.
+    // Pack X/Y directly without inversion; normalized identity becomes (0,0).
+    // All source coordinates and the other public point handles are preserved.
+    HP_G1_VECTOR_HEAVY __aicore__ inline void store_affine_montgomery(
+        Point src, GM_ADDR dst, const uint64_t* byte_offsets, uint32_t valid) {
+        store<true, true>(src, dst, byte_offsets, valid);
     }
 
     // Final normalization only: inverse_montgomery clobbers engine banks 4/5,
@@ -386,10 +399,10 @@ private:
         normalize_identity(lhs);
     }
 
+    template<bool montgomery, bool affine>
     HP_G1_VECTOR_HEAVY __aicore__ inline void load(
-        Point dst, GM_ADDR src, const uint64_t* byte_offsets,
-        uint32_t valid, bool affine) {
-        const uint32_t stride = affine ? affine_bytes : jacobian_bytes;
+        Point dst, GM_ADDR src, const uint64_t* byte_offsets, uint32_t valid) {
+        constexpr uint32_t stride = affine ? affine_bytes : jacobian_bytes;
         AscendC::Duplicate(raw().ReinterpretCast<int32_t>(), int32_t(0), raw_bytes / 4);
         fq_.vector_barrier();
         fq_.sync<AscendC::HardEvent::V_MTE2>();
@@ -398,9 +411,11 @@ private:
                 fq_.copy_in(raw()[lane * stride], src + byte_offsets[lane], stride);
         }
         fq_.sync<AscendC::HardEvent::MTE2_V>();
-        for (uint32_t j = 0; j < digits; ++j)
-            fq_.fill(digit(slot(6), j), Params::r2_digits[j]);
-        const uint32_t coordinates = affine ? 2 : 3;
+        if constexpr (!montgomery) {
+            for (uint32_t j = 0; j < digits; ++j)
+                fq_.fill(digit(slot(6), j), Params::r2_digits[j]);
+        }
+        constexpr uint32_t coordinates = affine ? 2 : 3;
         for (uint32_t c = 0; c < coordinates; ++c) {
             fq_.sync<AscendC::HardEvent::V_S>();
             auto indices = fq_.u32(FieldVector<Fq>::offsets);
@@ -413,9 +428,10 @@ private:
                        raw().ReinterpretCast<uint32_t>(), indices,
                        Fq::word_count * tile_size);
             fq_.unpack(slot(dst + c), fq_.u32(FieldVector<Fq>::soa_lhs));
-            mul(slot(dst + c), slot(dst + c), slot(6));
+            if constexpr (!montgomery)
+                mul(slot(dst + c), slot(dst + c), slot(6));
         }
-        if (affine) {
+        if constexpr (affine) {
             nonzero(fq_.tmp(6), slot(dst));
             nonzero(fq_.tmp(7), slot(dst + 1));
             fq_.mul(fq_.tmp(0), fq_.tmp(6), fq_.tmp(7));
@@ -425,6 +441,39 @@ private:
                 fq_.muls(digit(slot(dst + 2), j), fq_.tmp(6), Params::r_digits[j]);
         }
         normalize_identity(dst);
+    }
+
+    template<bool montgomery, bool affine>
+    HP_G1_VECTOR_HEAVY __aicore__ inline void store(
+        Point src, GM_ADDR dst, const uint64_t* byte_offsets, uint32_t valid) {
+        if constexpr (!montgomery) canonical_one(slot(6));
+        if constexpr (affine) nonzero(fq_.tmp(13), slot(src + 2));
+        constexpr uint32_t coordinates = affine ? 2 : 3;
+        for (uint32_t c = 0; c < coordinates; ++c) {
+            auto field = slot(src + c);
+            if constexpr (!montgomery) {
+                mul(slot(7), field, slot(6));
+                field = slot(7);
+            } else if constexpr (affine) {
+                if (c == 1) {
+                    // Every identity has X=0, Y=R, Z=0. Mask only Y in
+                    // private slot7; never modify the caller's source point.
+                    fq_.multiply_rows(slot(7), field, fq_.tmp(13), true);
+                    field = slot(7);
+                }
+            }
+            // pack_words writes only its output and engine tmp10. Neither
+            // aliases any public coordinate or the live tmp13 finite mask.
+            fq_.pack_words(fq_.i32(c * word_soa_bytes), field);
+        }
+        interleave(affine);
+        fq_.sync<AscendC::HardEvent::V_MTE3>();
+        constexpr uint32_t stride = affine ? affine_bytes : jacobian_bytes;
+        for (uint32_t lane = 0; lane < valid; ++lane) {
+            if (byte_offsets[lane] != absent)
+                fq_.copy_out(raw()[lane * stride], dst + byte_offsets[lane], stride);
+        }
+        fq_.sync<AscendC::HardEvent::MTE3_V>();
     }
 
     // Three packed word-SoA arrays reside only in FieldVector's raw region,

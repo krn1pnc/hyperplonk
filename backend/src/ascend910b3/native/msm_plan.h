@@ -9,14 +9,16 @@ struct MsmPlatform { uint32_t aiv_cores = 0; uint64_t ub_bytes = 0; };
 enum class MsmRegion : uint32_t {
     RecordsA, RecordsB, RadixFragments, RadixHistogram, RadixDescriptors,
     RadixDigitTotals, RowStarts, RowLocal, RowPtr, RowBlockMin,
-    RowBlockCarry, TaskPrefix, Tasks, PartialA, PartialB, Buckets, Windows, Count
+    RowBlockCarry, TaskPrefix, Tasks, PartialA, PartialB, Buckets, Windows,
+    MontgomeryBases, Count
 };
+inline constexpr uint32_t msm_region_count = static_cast<uint32_t>(MsmRegion::Count);
 struct MsmPlan {
     MsmPlatform platform{};
     uint64_t count = 0, workspace_bytes = 0, dense_records = 0, fragment_records = 0;
     uint64_t host_workspace_bytes = 0, host_prefix_offset = 0;
     uint64_t partial_capacity[2]{};
-    uint64_t region_offset[17]{}, region_size[17]{};
+    uint64_t region_offset[msm_region_count]{}, region_size[msm_region_count]{};
     uint32_t window_bits = 0, windows = 0, buckets = 0, radix_passes = 0;
     uint32_t chunks = 0, merge_levels = 0, row_blocks = 0;
     uint32_t weighted_segments = 0, weighted_levels = 0;

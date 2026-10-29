@@ -420,7 +420,7 @@ bool same_msm_plan(const hp::detail::MsmPlan& a, const hp::detail::MsmPlan& b) {
         || a.weighted_levels != b.weighted_levels) return false;
     for (unsigned i = 0; i < 2; ++i)
         if (a.partial_capacity[i] != b.partial_capacity[i]) return false;
-    for (unsigned i = 0; i < 17; ++i)
+    for (unsigned i = 0; i < hp::detail::msm_region_count; ++i)
         if (a.region_offset[i] != b.region_offset[i] || a.region_size[i] != b.region_size[i]) return false;
     return true;
 }
@@ -451,7 +451,7 @@ void msm_host_suite() {
                     && !p.row_blocks && !p.radix_passes && !p.weighted_segments && !p.weighted_levels
                     && !p.dense_records && !p.fragment_records
                     && !p.partial_capacity[0] && !p.partial_capacity[1], "MSM empty plan shape");
-            for (unsigned i = 0; i < 17; ++i)
+            for (unsigned i = 0; i < msm_region_count; ++i)
                 require(!p.region_size[i] && !p.region_offset[i], "MSM empty region");
             continue;
         }
@@ -467,23 +467,29 @@ void msm_host_suite() {
         require(p.dense_records == round8(n) && p.fragment_records == round8(n + 112 * chunks)
                 && p.partial_capacity[0] == m0 && p.partial_capacity[1] == ((l || wl) ? m1 : 0),
                 "MSM plan record and partial capacities");
-        const std::array<uint64_t, 17> bytes{
+        const std::array<uint64_t, msm_region_count> bytes{
             8 * round8(n), 8 * round8(n), 8 * round8(n + 112 * chunks),
             64 * chunks, 64 * 16 * chunks, 64 * 16, 64 * (b + 1), t, t,
             64 * ceil_div(b + 1, 256), 64 * ceil_div(b + 1, 256), t * (l + 1),
-            64 * m0, 192 * m0, 192 * ((l || wl) ? m1 : 0), 192 * b, 192 * ceil_div(255, c)};
+            64 * m0, 192 * m0, 192 * ((l || wl) ? m1 : 0), 192 * b, 192 * ceil_div(255, c),
+            96 * n};
         uint64_t end = 0;
         for (unsigned i = 0; i < bytes.size(); ++i) {
             require(p.region_size[i] == bytes[i], "MSM region capacity");
             if (!bytes[i]) {
                 require(!p.region_offset[i], "MSM zero region offset");
             } else {
-                const uint64_t start = ceil_div(end, 64) * 64;
-                require(p.region_offset[i] == start && !(start % 64), "MSM region alignment/layout");
-                end = start + bytes[i];
+                const uint64_t start = p.region_offset[i];
+                require(!(start % 64) && start <= p.workspace_bytes
+                        && bytes[i] <= p.workspace_bytes - start, "MSM region alignment/bounds");
+                for (unsigned j = 0; j < i; ++j)
+                    if (bytes[j])
+                        require(start + bytes[i] <= p.region_offset[j]
+                                || p.region_offset[j] + bytes[j] <= start, "MSM region overlap");
+                if (start + bytes[i] > end) end = start + bytes[i];
             }
         }
-        require(p.workspace_bytes == ceil_div(end, 64) * 64
+        require(!(p.workspace_bytes % 64) && p.workspace_bytes >= end
                 && p.workspace_bytes <= static_cast<uint64_t>(PTRDIFF_MAX)
                 && p.workspace_bytes <= static_cast<uint64_t>(SIZE_MAX)
                 && p.host_prefix_offset == t && p.host_workspace_bytes == t * (l + 2),

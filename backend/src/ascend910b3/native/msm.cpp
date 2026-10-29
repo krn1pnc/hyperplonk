@@ -13,7 +13,7 @@ bool same_plan(const MsmPlan& a, const MsmPlan& b) {
         a.row_blocks != b.row_blocks || a.weighted_segments != b.weighted_segments ||
         a.weighted_levels != b.weighted_levels) return false;
     for (unsigned i=0;i<2;++i) if (a.partial_capacity[i]!=b.partial_capacity[i]) return false;
-    for (unsigned i=0;i<17;++i)
+    for (unsigned i=0;i<msm_region_count;++i)
         if (a.region_offset[i]!=b.region_offset[i] || a.region_size[i]!=b.region_size[i]) return false;
     return true;
 }
@@ -56,6 +56,7 @@ aclError run_msm(aclrtStream stream,const G1Affine* bases,const Fr* scalars,
     auto* rows=static_cast<uint64_t*>(pinned_host_workspace);
     auto* prefix=reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(pinned_host_workspace)+p.host_prefix_offset);
     const size_t row_bytes=8*(static_cast<size_t>(p.buckets)+1);
+    launch_msm_prepare_bases(stream,bases,workspace,p);
     for (uint32_t w=0;w<p.windows;++w) {
         launch_msm_extract(stream,scalars,workspace,p,w);
         for (uint32_t pass=0;pass<p.radix_passes;++pass)
@@ -76,7 +77,7 @@ aclError run_msm(aclrtStream stream,const G1Affine* bases,const Fr* scalars,
                                     prefix,bytes,ACL_MEMCPY_HOST_TO_DEVICE,stream);
             if (status!=ACL_SUCCESS) return status;
             launch_msm_tasks(stream,workspace,p,0,schedule.task_count[0]);
-            launch_msm_partial_sums(stream,bases,workspace,p,schedule.task_count[0]);
+            launch_msm_partial_sums(stream,workspace,p,schedule.task_count[0]);
             for (uint32_t level=1;level<=schedule.merge_levels;++level) {
                 launch_msm_tasks(stream,workspace,p,level,schedule.task_count[level]);
                 launch_msm_partial_merge(stream,workspace,p,level,schedule.task_count[level]);

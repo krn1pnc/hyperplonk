@@ -80,6 +80,7 @@ bool make_msm_plan(size_t count, const MsmPlatform& platform, uint32_t bits,
         !region(MsmRegion::PartialB,p.partial_capacity[1],192) ||
         !region(MsmRegion::Buckets,p.buckets,192) ||
         !region(MsmRegion::Windows,p.windows,192) ||
+        !region(MsmRegion::MontgomeryBases,count,96) ||
         !round_up(cursor,64,p.workspace_bytes)) return false;
     out = p; return true;
 }

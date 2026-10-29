@@ -1761,8 +1761,7 @@ void test_msm_preflight(Runtime& runtime, aclrtStream stream, const std::filesys
     bad = valid; bad.out = reinterpret_cast<math::G1Affine*>(last_aligned); reject(bad,"out address wrap");
     bad = valid; bad.device = reinterpret_cast<void*>(last_aligned); reject(bad,"device address wrap");
     bad = valid; bad.host = reinterpret_cast<void*>(last_aligned); reject(bad,"host address wrap");
-    // Forge derived fields; a count change within the same rounded shape is a
-    // valid new plan, so cross a task-capacity boundary when changing count.
+    // Forge derived fields, including every workspace region.
     const auto reject_plan = [&](const detail::MsmPlan& changed) {
         auto input = valid; input.plan = &changed; reject(input,"forged plan");
     };
@@ -1787,7 +1786,7 @@ void test_msm_preflight(Runtime& runtime, aclrtStream stream, const std::filesys
     for (unsigned i = 0; i < 2; ++i) {
         changed = plan; ++changed.partial_capacity[i]; reject_plan(changed);
     }
-    for (unsigned i = 0; i < 17; ++i) {
+    for (unsigned i = 0; i < detail::msm_region_count; ++i) {
         changed = plan; ++changed.region_offset[i]; reject_plan(changed);
         changed = plan; ++changed.region_size[i]; reject_plan(changed);
     }

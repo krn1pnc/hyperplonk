@@ -267,9 +267,12 @@ propagation until the eliminated Montgomery coefficient and final carry sweep.
 Partial sums use exact mixed-affine addition for freshly loaded affine bases.
 Generic and mixed additions retain every exceptional case; an exact tile-wide
 vote skips doubling only when no lane needs the equal-point result.
-Coordinates remain Montgomery in UB and return to canonical HBM records at
-stage boundaries. No per-Fq host launches, extra GM scratch or point transfers.
-Bucket materialization only copies canonical 192-byte tuples and synthesizes
+One NPU ingress kernel converts bases into a `96*N`-byte HBM workspace once per
+`run_msm` call, amortized across all windows. Internal coordinates remain packed
+Montgomery integers in both UB and HBM; public inputs and final output remain
+canonical. Ingress time is included in the complete-MSM measurements below.
+No per-Fq host launches or numerical host transfers are added.
+Bucket materialization copies Montgomery 192-byte tuples and synthesizes
 empty-bucket identities; it does not perform Montgomery conversions or field
 arithmetic. Its UB tile is 64 records, with public prefix metadata controlling
 DMA addresses.
@@ -287,6 +290,11 @@ tree8.866%, finish0.723%. Host/idle gaps were about29.7ms and metadata copies
 about0.695ms. These are diagnostic measurements of the old radix15 Vector
 binary, not profiles or timing samples of the current implementation.
 
+A subsequent single-call diagnostic of the Montgomery-resident version attributes
+69.782% of task time to partial sums, 14.926% to weighted segments and 7.961% to
+the weighted tree. The once-per-call base conversion accounts for 0.775%.
+This is stage attribution, not a warmed comparable timing sample.
+
 The following complete-MSM measurements use identical inputs within each size,
 distinct subgroup bases and full-width canonical random Fr scalars. Input
 generation, allocation, file reads and initial upload are excluded; all device
@@ -296,18 +304,20 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | Points | Implementation | Warmups | Timed samples | Reported statistic | Seconds |
 |--------|----------------|---------|---------------|--------------------|---------|
 | 2^20 | Previous radix15 Vector MSM | 1 | 1 | target | 47.703695 |
-| 2^20 | Current radix12 Vector MSM | 1 | 3 | median | 4.589340 |
+| 2^20 | Radix12 before resident-Montgomery IO | 1 | 3 | median | 4.589340 |
+| 2^20 | Current resident-Montgomery radix12 MSM | 1 | 3 | median | 4.189697 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
-| 2^25 | Current radix12 Vector MSM | 1 | 1 | target | 75.465230 |
+| 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
-The million-point result is about 10.40x faster than the previous NPU checkpoint,
-**not 10x faster than CPU**. The integrated binary passed one warmup and three
-exact targets; the old NPU and `2^25` figures remain 1+1 diagnostic checkpoints.
-These do not establish final performance acceptance. The requested CPU10x
-and `2^25<1s` goals remain unmet. A tested exact-FP32-FMA candidate was slower
-and is not integrated. Source, raw records, input/binary identities and rejected
-candidates remain under `target/msm-hotspot/`; those generated artifacts are not
+Resident-Montgomery IO reduces the measured million-point latency by 8.71%
+versus the previous radix12 checkpoint, but remains slower than CPU. The current
+binary passed one warmup and three exact targets; no new `2^25` timing is claimed.
+The old NPU and `2^25` figures remain 1+1 diagnostic checkpoints. These do not
+establish final performance acceptance: CPU10x and `2^25<1s` remain unmet.
+Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
+integrated. Source, raw records, input/binary identities and rejected candidates
+remain under `target/msm-hotspot/`; those generated artifacts are not
 tracked. Reproduce inputs and warmed CPU/NPU comparisons with:
 
 ```bash
@@ -347,6 +357,9 @@ aclError status = run_msm(stream, bases, scalars, out,
 This internal C++ API borrows HBM inputs (`96*N` bytes of canonical Affine bases,
 `32*N` bytes of canonical Fr scalars), a 96-byte device output, and caller-owned
 scratch. `msm_plan.h` is ACL-free and computes exact host/device capacities.
+Device scratch includes `96*N` bytes for the packed Montgomery base cache;
+allocate the queried plan capacity rather than retaining an older byte count.
+The pinned host scratch requirement and numerical host-transfer policy are unchanged.
 `N <= UINT32_MAX`; explicit windows are 2–16 bits, with 0 selecting the cuZK-style
 automatic heuristic capped at 16. Platform requirements are at least one AIV
 and 176576 UB bytes. Input/output addresses must be 32-byte aligned, scratch addresses
