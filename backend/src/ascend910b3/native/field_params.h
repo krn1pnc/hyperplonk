@@ -37,4 +37,75 @@ struct Bls12381FqParams {
         0xb519952d, 0x9a793e85, 0x92cae3aa, 0x11988fe5};
 };
 
+// UB Montgomery domains use radix 2^12; public radix-2^32 constants above do not change.
+template<class Params> struct FieldVectorParams;
+
+template<class Params> struct CanonicalRadix12Params {
+    static constexpr unsigned radix_bits = 12;
+    static constexpr unsigned digit_count = (Params::modulus_bits + radix_bits - 1) / radix_bits;
+    struct Digits {
+        int32_t values[digit_count]{};
+#if defined(__NPU_DEVICE__)
+        __aicore__
+#endif
+        constexpr int32_t operator[](unsigned i) const { return values[i]; }
+    };
+    static constexpr Digits modulus() {
+        Digits result{};
+        for (unsigned j = 0; j < digit_count; ++j) {
+            const unsigned bit = radix_bits * j, w = bit / 32, shift = bit % 32;
+            uint64_t value = uint64_t(Params::modulus[w]) >> shift;
+            if (shift + radix_bits > 32 && w + 1 < Params::word_count)
+                value |= uint64_t(Params::modulus[w + 1]) << (32 - shift);
+            result.values[j] = int32_t(value & 4095);
+        }
+        return result;
+    }
+    static constexpr Digits power_of_two(unsigned exponent) {
+        Digits result{};
+        result.values[0] = 1;
+        const auto p = modulus();
+        for (unsigned bit = 0; bit < exponent; ++bit) {
+            int32_t carry = 0;
+            for (unsigned j = 0; j < digit_count; ++j) {
+                const int32_t value = 2 * result.values[j] + carry;
+                result.values[j] = value & 4095;
+                carry = value >> radix_bits;
+            }
+            bool ge = carry != 0;
+            if (!ge) {
+                for (unsigned j = digit_count; j-- > 0;) {
+                    if (result.values[j] != p.values[j]) {
+                        ge = result.values[j] > p.values[j];
+                        break;
+                    }
+                    if (j == 0) ge = true;
+                }
+            }
+            if (ge) {
+                int32_t borrow = 0;
+                for (unsigned j = 0; j < digit_count; ++j) {
+                    const int32_t value = result.values[j] + 4096 - p.values[j] - borrow;
+                    result.values[j] = value & 4095;
+                    borrow = 1 - (value >> radix_bits);
+                }
+            }
+        }
+        return result;
+    }
+    static constexpr int32_t negative_inverse() {
+        unsigned inverse = 1;
+        for (unsigned bit = 1; bit < radix_bits; ++bit)
+            if ((Params::modulus[0] * inverse) & (1U << bit)) inverse += 1U << bit;
+        return int32_t((-inverse) & 4095);
+    }
+    static constexpr auto modulus_digits = modulus();
+    static constexpr auto r_digits = power_of_two(radix_bits * digit_count);
+    static constexpr auto r2_digits = power_of_two(2 * radix_bits * digit_count);
+    static constexpr int32_t n0prime = negative_inverse();
+};
+
+template<> struct FieldVectorParams<Bls12381FrParams> : CanonicalRadix12Params<Bls12381FrParams> {};
+template<> struct FieldVectorParams<Bls12381FqParams> : CanonicalRadix12Params<Bls12381FqParams> {};
+
 } // namespace hyperplonk::ascend910b3

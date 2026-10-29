@@ -17,11 +17,24 @@ struct RuntimeCounts {
     uint64_t device_sync_calls = 0;
     uint64_t malloc_calls = 0;
     uint64_t free_calls = 0;
+    uint64_t host_malloc_calls = 0;
+    uint64_t host_free_calls = 0;
+    uint64_t unexpected_copy_calls = 0;
+};
+
+struct RuntimeCopyAllowance {
+    const void* device_begin;
+    const void* host_begin;
+    size_t max_bytes;
+    bool host_to_device;
 };
 
 // The smoke harness enqueues on one host thread; independent streams do not
 // imply concurrent host calls into these test-only counters.
 void begin_runtime_audit();
+// Borrows allowances until end_runtime_audit(); an empty list rejects every copy.
+// Copies must match both starting addresses, direction, and 0 < bytes <= max_bytes.
+void begin_runtime_audit(const RuntimeCopyAllowance* allowances, size_t count);
 RuntimeCounts end_runtime_audit();
 
 } // namespace hyperplonk::ascend910b3::test

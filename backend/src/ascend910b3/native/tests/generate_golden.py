@@ -6,8 +6,17 @@ import random
 
 P = 52435875175126190479447740508185965837690552500527637822603658699938581184513
 Q = 4002409555221667393417789825735904156556882819939007885332058136124031650490837864442687629129015664037894272559787
-COUNTS = (0, 1, 2, 31, 32, 33, 255, 256, 257, 513, 4097)
-INVERSE_COUNTS = (0, 1, 2, 33, 257)
+# Append new sizes after the original sequence: the old seeded RNG stream and
+# all original Fr/Cube/resident-chain fixtures must remain byte-for-byte stable.
+COUNTS = (0, 1, 2, 31, 32, 33, 255, 256, 257, 513, 4097, 63, 64, 65,
+          47, 48, 49, 95, 96, 97)
+INVERSE_COUNTS = (0, 1, 2, 33, 257, 64, 65, 47, 48, 49, 95, 96, 97)
+
+# Decimal coordinates are independent of the native generator's LE u32 limbs.
+G1_GENERATOR = (
+    3685416753713387016781088315183077757961620795782546409894578378688607592378376318836054947676345821548104185464507,
+    1339506544944476473020471379941921221584933875938349620426543736416511423956333506472724655353366534992391756441569,
+)
 
 
 def write_values(path, values, width=32):
@@ -89,6 +98,15 @@ def extra_fixtures(output, p, width, seed, params):
     write_values(params / "modulus.bin", [p], width)
     write_values(params / "mu.bin", [r2 // p], width + 2)
     write_values(params / "wide_factor.bin", [r2 % p], width)
+    if p in (P, Q):
+        digit_count = (p.bit_length() + 11) // 12
+        radix = 1 << 12
+        vector_r = (1 << (12 * digit_count)) % p
+        for name, value in (("modulus", p), ("r", vector_r),
+                            ("r2", pow(2, 24 * digit_count, p))):
+            digits = [(value >> (12 * j)) & (radix - 1) for j in range(digit_count)]
+            write_values(params / f"vector_{name}.bin", digits, 4)
+        write_values(params / "vector_n0prime.bin", [(-pow(p, -1, radix)) % radix], 4)
     rng = random.Random(seed)
     wide_width = 2 * width + 4
     wide = [0, p - 1, p, p + 1, r2 - 1, r2, (0x89abcdef << (16 * width)) + p,
@@ -112,6 +130,25 @@ def extra_fixtures(output, p, width, seed, params):
         ("square", [a * a % p for a, _ in pairs]),
     ):
         write_values(directory / f"{name}.bin", values, width)
+
+    if p in (P, Q):
+        # Include k=0 as well as every positive boundary of the new radix.
+        edges = [value for bits in range(0, p.bit_length(), 12)
+                 for value in ((1 << bits) - 1, 1 << bits, (1 << bits) + 1)
+                 if value < p]
+        pairs = [(a, b) for a in edges for b in (0, 1, p - 1, p - 2)]
+        directory = output / "radix-boundaries"
+        directory.mkdir(parents=True, exist_ok=True)
+        write_values(directory / "count.bin", [len(pairs)], 4)
+        for name, values in (
+            ("lhs", [a for a, _ in pairs]), ("rhs", [b for _, b in pairs]),
+            ("add", [(a + b) % p for a, b in pairs]),
+            ("sub", [(a - b) % p for a, b in pairs]),
+            ("mul", [(a * b) % p for a, b in pairs]),
+            ("neg", [-a % p for a, _ in pairs]),
+            ("square", [a * a % p for a, _ in pairs]),
+        ):
+            write_values(directory / f"{name}.bin", values, width)
 
 
 def g1_affine_neg(point):
@@ -173,11 +210,7 @@ def g1_scaled(point, index, rng):
 def generate_g1(output):
     root = output / "g1"
     root.mkdir(parents=True, exist_ok=True)
-    # Decimal coordinates are independent of the native generator's LE u32 limbs.
-    generator = (
-        3685416753713387016781088315183077757961620795782546409894578378688607592378376318836054947676345821548104185464507,
-        1339506544944476473020471379941921221584933875938349620426543736416511423956333506472724655353366534992391756441569,
-    )
+    generator = G1_GENERATOR
     write_g1_affine(root / "generator.bin", [generator])
     neg_generator = g1_affine_neg(generator)
     twice = g1_affine_mul(generator, 2)
@@ -191,7 +224,7 @@ def generate_g1(output):
                seventeen, generator, generator)
     factors = (0, 1, 2, 31, 32, 33, 255, 256, 257, (1 << 32) - 1,
                1 << 32, (1 << 64) - 1)
-    for count in (0, 1, 2, 15, 16, 17, 31, 32, 33, 65):
+    for count in (0, 1, 2, 15, 16, 17, 31, 32, 33, 65, 63, 64, 47, 48, 49, 95, 96, 97):
         directory = root / f"case-{count}"
         directory.mkdir(parents=True, exist_ok=True)
         rng = random.Random(20261101 + count)
@@ -286,6 +319,97 @@ def generate_g1(output):
         write_g1_affine(directory / "expected.bin", [expected])
 
 
+def generate_msm(output):
+    """Native MSM inputs with an independent generator-coefficient oracle."""
+    counts = (0, 1, 2, 15, 16, 17, 63, 64, 65, 255, 256, 257,
+              2047, 2048, 2049, 4097, 8193, 65536, 47, 48, 49, 95, 96, 97)
+    cases = [(f"uniform-{count}", count) for count in counts]
+    cases.extend((
+        ("zero-2049", 2049), ("ones-2049", 2049), ("hot-65537", 65537),
+        ("identity-2049", 2049), ("cancel-2048", 2048),
+        ("alternating-2049", 2049), ("boundary-257", 257),
+        ("mixed-exceptions-65", 65), ("mixed-vote-tail-192", 192),
+    ))
+
+    # Generate a genuine distinct-point SRS-like sequence once with one affine
+    # addition per point, rather than doing a full scalar multiplication per base.
+    consecutive = []
+    point = None
+    for _ in range(max(count for _, count in cases)):
+        point = g1_affine_add(point, G1_GENERATOR)
+        consecutive.append(point)
+
+    for name, count in cases:
+        rng = random.Random(20261103 + count)
+        scalars = ([rng.randrange(P) for _ in range(count)]
+                   if name.startswith(("uniform-", "identity-")) else [])
+        coefficients = list(range(1, count + 1))
+        bases = consecutive[:count]
+        if name.startswith("uniform-") and count <= 65:
+            coefficients = [rng.randrange(1, P) for _ in range(count)]
+            bases = [g1_affine_mul(G1_GENERATOR, a) for a in coefficients]
+        elif name.startswith("zero-"):
+            scalars = [0] * count
+        elif name.startswith(("ones-", "hot-")):
+            scalars = [1] * count
+        elif name.startswith("identity-"):
+            coefficients = [0] * count
+            bases = [None] * count
+        elif name.startswith("cancel-"):
+            coefficients, bases, scalars = [], [], []
+            for index in range(count // 2):
+                a = index + 1
+                base = consecutive[index]
+                scalar = rng.randrange(P)
+                coefficients.extend((a, -a))
+                bases.extend((base, g1_affine_neg(base)))
+                scalars.extend((scalar, scalar))
+        elif name.startswith("alternating-"):
+            cycle = (P - 1, 0, 1 << 254, (1 << 254) + 1)
+            scalars = [cycle[index % len(cycle)] for index in range(count)]
+        elif name.startswith("boundary-"):
+            # Shuffle point/coefficient pairs together, independently of the
+            # scalar sequence, so the candidate cannot assume ordered bases.
+            paired = list(zip(bases, coefficients))
+            rng.shuffle(paired)
+            bases = [base for base, _ in paired]
+            coefficients = [a for _, a in paired]
+            scalars = list(range(256)) + [P - 1]
+        elif name == "mixed-exceptions-65":
+            # Stable bucket order gives (G + 2G) + 3G with a nonunit lhs Z,
+            # then 6G + (-6G), identities, and another cancellation. Cross the
+            # 64-point partial boundary without assuming unique input bases.
+            cycle = (0, 1, 2, 3, -6, 0, 5, -5, 0)
+            coefficients = [cycle[index % len(cycle)] for index in range(count)]
+            bases = [g1_affine_mul(G1_GENERATOR, a % P) for a in coefficients]
+            scalars = [1] * count
+        elif name == "mixed-vote-tail-192":
+            # One four-point task in each of buckets 1..48. Only lane 47
+            # encounters equal points on iteration three; lanes 0..46 do not.
+            coefficients, bases, scalars = [], [], []
+            for bucket in range(1, 49):
+                pattern = (1, 2, 3, -6) if bucket == 48 else (1, 2, 4, 8)
+                coefficients.extend(pattern)
+                bases.extend(g1_affine_mul(G1_GENERATOR, a % P) for a in pattern)
+                scalars.extend([bucket] * 4)
+
+        coefficient = sum(a * s for a, s in zip(coefficients, scalars)) % P
+        expected = g1_affine_mul(G1_GENERATOR, coefficient)
+        if count <= 65 or name == "mixed-vote-tail-192":
+            # Cross-check the coefficient shortcut using actual input points,
+            # ordinary affine multiplication and addition, not bucket formulas.
+            direct = None
+            for base, scalar in zip(bases, scalars):
+                direct = g1_affine_add(direct, g1_affine_mul(base, scalar))
+            assert direct == expected, f"independent MSM oracle mismatch: {name}"
+
+        directory = output / "msm" / name
+        directory.mkdir(parents=True, exist_ok=True)
+        write_g1_affine(directory / "bases.bin", bases)
+        write_values(directory / "scalars.bin", scalars)
+        write_g1_affine(directory / "expected.bin", [expected])
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
@@ -301,6 +425,7 @@ def main():
     ):
         extra_fixtures(root, p, width, seed, args.output / "params" / name)
     generate_g1(args.output)
+    generate_msm(args.output)
 
 
 if __name__ == "__main__":

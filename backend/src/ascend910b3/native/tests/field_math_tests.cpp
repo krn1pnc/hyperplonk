@@ -1,5 +1,6 @@
 #include "field.h"
 #include "g1.h"
+#include "msm_plan.h"
 
 #include <array>
 #include <filesystem>
@@ -35,7 +36,7 @@ static_assert(!std::is_convertible<hp::Fr, hp::Fq>::value && !std::is_convertibl
 static_assert(!std::is_convertible<uint32_t, hp::Fr>::value && !std::is_convertible<uint32_t, hp::Fq>::value);
 static_assert(std::is_aggregate<hp::Fr>::value && std::is_aggregate<hp::Fq>::value);
 static_assert(sizeof(Prime64) == 8 && alignof(Prime64) == 4);
-constexpr std::array<size_t, 11> counts{0,1,2,31,32,33,255,256,257,513,4097};
+constexpr std::array<size_t, 20> counts{0,1,2,31,32,33,63,64,65,255,256,257,513,4097,47,48,49,95,96,97};
 
 void require(bool condition, const std::string& message) {
     if (!condition) throw std::runtime_error(message);
@@ -158,6 +159,28 @@ template<class Field> void parameters(const std::filesystem::path& dir) {
     for (unsigned i = 0; i < sizeof(Field) + 2; ++i)
         require(mu[i] == uint8_t(P::barrett_mu[i / 2] >> (8 * (i % 2))), "compiled Barrett mu mismatch");
 }
+template<class Field> void vector_parameters(const std::filesystem::path& dir) {
+    using P = typename Field::Parameters;
+    using V = hp::FieldVectorParams<P>;
+    const auto check_digits = [&](const char* name, const auto& digits) {
+        const auto bytes = read_bytes(dir / name, 4 * V::digit_count);
+        for (unsigned j = 0; j < V::digit_count; ++j) {
+            require(digits[j] >= 0 && digits[j] < (1 << 12), "vector digit outside radix");
+            for (unsigned b = 0; b < 4; ++b)
+                require(bytes[4*j+b] == uint8_t(uint32_t(digits[j]) >> (8*b)),
+                        std::string("compiled vector parameter mismatch: ") + name);
+        }
+    };
+    check_digits("vector_modulus.bin", V::modulus_digits);
+    check_digits("vector_r.bin", V::r_digits);
+    check_digits("vector_r2.bin", V::r2_digits);
+    const auto n0prime = read_bytes(dir / "vector_n0prime.bin", 4);
+    require(V::n0prime >= 0 && V::n0prime < (1 << 12), "vector n0prime outside radix");
+    for (unsigned b = 0; b < 4; ++b)
+        require(n0prime[b] == uint8_t(uint32_t(V::n0prime) >> (8*b)), "compiled vector n0prime mismatch");
+    require((uint32_t(V::modulus_digits[0]) * uint32_t(V::n0prime) + 1) % (1 << 12) == 0,
+            "vector Montgomery inverse identity");
+}
 template<class Field> void extras(const std::filesystem::path& root) {
     using P = typename Field::Parameters;
     const auto input = read_bytes(root / "wide_input.bin", 512 * sizeof(hp::WideInteger<P>));
@@ -198,11 +221,20 @@ template<class Field> void field_suite(const std::filesystem::path& root, const 
                                       const char* name) {
     boundaries<Field>();
     parameters<Field>(param_dir);
+    vector_parameters<Field>(param_dir);
     for (const size_t count : counts) {
-        const bool inverse = count == 0 || count == 1 || count == 2 || count == 33 || count == 257;
+        const bool inverse = count == 0 || count == 1 || count == 2 || count == 33
+                             || count == 64 || count == 65 || count == 257
+                             || count == 47 || count == 48 || count == 49
+                             || count == 95 || count == 96 || count == 97;
         arithmetic_case<Field>(root / ("case-" + std::to_string(count)), count, inverse);
     }
     extras<Field>(root);
+    const auto radix_dir = root / "radix-boundaries";
+    const auto count_bytes = read_bytes(radix_dir / "count.bin", 4);
+    uint32_t radix_count = 0;
+    for (unsigned b = 0; b < 4; ++b) radix_count |= uint32_t(count_bytes[b]) << (8*b);
+    arithmetic_case<Field>(radix_dir, radix_count, false);
     std::cout << "FIELD_ELEMENT_HOST_PASS field=" << name << '\n';
 }
 
@@ -322,7 +354,7 @@ void g1_suite(const std::filesystem::path& fixtures) {
     expect_affine(hp::G1Affine::generator(), generator, "generator");
     require(hp::G1Affine{}.is_identity() && same_raw(hp::G1Jacobian{},hp::G1Jacobian::identity()),
             "default point identity");
-    for (const size_t count : {0,1,2,15,16,17,31,32,33,65}) {
+    for (const size_t count : {0,1,2,15,16,17,31,32,33,65,63,64,47,48,49,95,96,97}) {
         const auto dir = root / ("case-" + std::to_string(count));
         const auto aa = load_affine(dir / "affine_a.bin",count);
         const auto ab = load_affine(dir / "affine_b.bin",count);
@@ -376,6 +408,170 @@ void g1_suite(const std::filesystem::path& fixtures) {
     g1_host_chains(root);
     std::cout << "G1_HOST_PASS\n";
 }
+
+bool same_msm_plan(const hp::detail::MsmPlan& a, const hp::detail::MsmPlan& b) {
+    if (a.platform.aiv_cores != b.platform.aiv_cores || a.platform.ub_bytes != b.platform.ub_bytes
+        || a.count != b.count || a.workspace_bytes != b.workspace_bytes
+        || a.dense_records != b.dense_records || a.fragment_records != b.fragment_records
+        || a.host_workspace_bytes != b.host_workspace_bytes || a.host_prefix_offset != b.host_prefix_offset
+        || a.window_bits != b.window_bits || a.windows != b.windows || a.buckets != b.buckets
+        || a.radix_passes != b.radix_passes || a.chunks != b.chunks || a.merge_levels != b.merge_levels
+        || a.row_blocks != b.row_blocks || a.weighted_segments != b.weighted_segments
+        || a.weighted_levels != b.weighted_levels) return false;
+    for (unsigned i = 0; i < 2; ++i)
+        if (a.partial_capacity[i] != b.partial_capacity[i]) return false;
+    for (unsigned i = 0; i < 17; ++i)
+        if (a.region_offset[i] != b.region_offset[i] || a.region_size[i] != b.region_size[i]) return false;
+    return true;
+}
+
+void msm_host_suite() {
+    using namespace hp::detail;
+    const MsmPlatform platform{20, msm_required_ub_bytes};
+    const auto ceil_div = [](uint64_t n, uint64_t d) { return n / d + (n % d != 0); };
+    const auto round8 = [&](uint64_t n) { return ceil_div(n, 8) * 8; };
+    const auto levels = [&](uint64_t n) {
+        uint32_t result = 0;
+        while (n > 1) { n = ceil_div(n, 64); ++result; }
+        return result;
+    };
+    const std::array<uint64_t, 9> sizes{0,1,64,65,2048,2049,65537,UINT32_MAX,4097};
+    for (const uint64_t n : sizes) for (const uint32_t requested : {0u,2u,3u,4u,12u,16u}) {
+        MsmPlan p{};
+        require(make_msm_plan(static_cast<size_t>(n), platform, requested, p), "MSM valid plan rejected");
+        uint32_t ell = 0;
+        for (uint64_t x = n ? n - 1 : 0; x; x >>= 1) ++ell;
+        const uint32_t automatic = n ? (ell - ell / 3 + 2 > 16 ? 16 : ell - ell / 3 + 2) : 2;
+        const uint32_t c = requested ? requested : automatic;
+        require(p.count == n && p.window_bits == c && p.platform.aiv_cores == platform.aiv_cores
+                && p.platform.ub_bytes == platform.ub_bytes, "MSM plan identity");
+        if (!n) {
+            require(!p.workspace_bytes && !p.host_workspace_bytes && !p.host_prefix_offset
+                    && !p.windows && !p.buckets && !p.chunks && !p.merge_levels
+                    && !p.row_blocks && !p.radix_passes && !p.weighted_segments && !p.weighted_levels
+                    && !p.dense_records && !p.fragment_records
+                    && !p.partial_capacity[0] && !p.partial_capacity[1], "MSM empty plan shape");
+            for (unsigned i = 0; i < 17; ++i)
+                require(!p.region_size[i] && !p.region_offset[i], "MSM empty region");
+            continue;
+        }
+        const uint64_t b = uint64_t{1} << c, chunks = ceil_div(n, 2048);
+        const uint64_t t = 8 * round8(b + 1);
+        const uint64_t m0 = ceil_div(n, 64) + b, m1 = ceil_div(n, 4096) + b;
+        const uint32_t l = levels(ceil_div(n, 64));
+        const uint32_t wl = levels(ceil_div(b - 1, 64));
+        require(p.windows == ceil_div(255, c) && p.buckets == b && p.radix_passes == ceil_div(c, 4)
+                && p.chunks == chunks && p.merge_levels == l && p.row_blocks == ceil_div(b + 1, 256)
+                && p.weighted_segments == ceil_div(b - 1, 64) && p.weighted_levels == wl,
+                "MSM plan derived shape");
+        require(p.dense_records == round8(n) && p.fragment_records == round8(n + 112 * chunks)
+                && p.partial_capacity[0] == m0 && p.partial_capacity[1] == ((l || wl) ? m1 : 0),
+                "MSM plan record and partial capacities");
+        const std::array<uint64_t, 17> bytes{
+            8 * round8(n), 8 * round8(n), 8 * round8(n + 112 * chunks),
+            64 * chunks, 64 * 16 * chunks, 64 * 16, 64 * (b + 1), t, t,
+            64 * ceil_div(b + 1, 256), 64 * ceil_div(b + 1, 256), t * (l + 1),
+            64 * m0, 192 * m0, 192 * ((l || wl) ? m1 : 0), 192 * b, 192 * ceil_div(255, c)};
+        uint64_t end = 0;
+        for (unsigned i = 0; i < bytes.size(); ++i) {
+            require(p.region_size[i] == bytes[i], "MSM region capacity");
+            if (!bytes[i]) {
+                require(!p.region_offset[i], "MSM zero region offset");
+            } else {
+                const uint64_t start = ceil_div(end, 64) * 64;
+                require(p.region_offset[i] == start && !(start % 64), "MSM region alignment/layout");
+                end = start + bytes[i];
+            }
+        }
+        require(p.workspace_bytes == ceil_div(end, 64) * 64
+                && p.workspace_bytes <= static_cast<uint64_t>(PTRDIFF_MAX)
+                && p.workspace_bytes <= static_cast<uint64_t>(SIZE_MAX)
+                && p.host_prefix_offset == t && p.host_workspace_bytes == t * (l + 2),
+                "MSM total host/device workspace");
+    }
+    MsmPlan sentinel{};
+    require(make_msm_plan(2049, platform, 12, sentinel), "MSM sentinel plan");
+    const auto reject_plan = [&](size_t n, MsmPlatform hw, uint32_t c) {
+        MsmPlan out = sentinel;
+        require(!make_msm_plan(n, hw, c, out) && same_msm_plan(out, sentinel),
+                "MSM invalid plan accepted or output changed");
+    };
+    for (const uint32_t c : {1u,17u,UINT32_MAX}) reject_plan(65, platform, c);
+    reject_plan(65, MsmPlatform{0,msm_required_ub_bytes}, 0);
+    reject_plan(65, MsmPlatform{20,msm_required_ub_bytes-1}, 0);
+    reject_plan(0, MsmPlatform{0,msm_required_ub_bytes}, 0);
+    reject_plan(0, MsmPlatform{20,msm_required_ub_bytes-1}, 0);
+    if (SIZE_MAX > UINT32_MAX) reject_plan(static_cast<size_t>(UINT32_MAX) + size_t{1}, platform, 0);
+
+    constexpr uint64_t untouched = 0xdeadbeef12345678ULL;
+    const auto check_schedule = [&](uint64_t n, const std::array<uint64_t,4>& histogram,
+                                    const std::vector<uint64_t>& expected_counts) {
+        MsmPlan p{};
+        require(make_msm_plan(static_cast<size_t>(n), platform, 2, p), "MSM schedule plan");
+        std::array<uint64_t,5> row{};
+        for (unsigned b = 0; b < 4; ++b) row[b + 1] = row[b] + histogram[b];
+        require(row[4] == n, "MSM test histogram total");
+        const size_t stride = static_cast<size_t>(round8(5));
+        std::vector<uint64_t> prefix(stride * (p.merge_levels + 1) + 1, untouched);
+        MsmSchedule schedule{};
+        require(make_msm_schedule(p, row.data(), prefix.data(), schedule), "MSM schedule rejected");
+        require(schedule.merge_levels + 1 == expected_counts.size(), "MSM actual merge levels");
+        uint64_t divisor = 64;
+        for (unsigned k = 0; k < 6; ++k) {
+            require(schedule.task_count[k] == (k < expected_counts.size() ? expected_counts[k] : 0),
+                    "MSM actual task count");
+            if (k >= expected_counts.size()) continue;
+            uint64_t total = 0;
+            for (unsigned b = 0; b < 4; ++b) {
+                require(prefix[k * stride + b] == total, "MSM bucket task prefix");
+                if (b) total += ceil_div(histogram[b], divisor);
+            }
+            for (size_t b = 4; b < stride; ++b)
+                require(prefix[k * stride + b] == total, "MSM task prefix tail padding");
+            divisor *= 64;
+        }
+        for (size_t i = stride * expected_counts.size(); i < prefix.size(); ++i)
+            require(prefix[i] == untouched, "MSM inactive prefix layer modified");
+    };
+    check_schedule(65, {0,65,0,0}, {2,1});
+    check_schedule(2048, {0,2048,0,0}, {32,1});
+    check_schedule(2049, {0,2049,0,0}, {33,1});
+    check_schedule(65537, {0,0,65537,0}, {1025,17,1});
+    check_schedule(UINT32_MAX, {0,0,0,UINT32_MAX}, {67108864,1048576,16384,256,4,1});
+    check_schedule(130, {1,64,0,65}, {3,2});
+    check_schedule(65537, {65537,0,0,0}, {0});
+    check_schedule(64, {0,0,64,0}, {1});
+    check_schedule(1, {0,0,0,1}, {1});
+    MsmPlan empty{};
+    require(make_msm_plan(0, platform, 0, empty), "MSM empty schedule plan");
+    MsmSchedule empty_out{};
+    empty_out.merge_levels = 5;
+    for (auto& count : empty_out.task_count) count = untouched;
+    require(make_msm_schedule(empty, nullptr, nullptr, empty_out) && !empty_out.merge_levels,
+            "MSM empty null schedule rejected");
+    for (const auto count : empty_out.task_count) require(!count, "MSM empty task count");
+
+    MsmPlan p{};
+    require(make_msm_plan(65, platform, 2, p), "MSM rejection schedule plan");
+    const std::array<uint64_t,5> valid{0,0,65,65,65};
+    const auto reject_schedule = [&](const uint64_t* row, bool null_prefix) {
+        std::vector<uint64_t> prefix(8 * (p.merge_levels + 1), untouched);
+        MsmSchedule out{};
+        out.merge_levels = 123;
+        for (auto& count : out.task_count) count = untouched;
+        require(!make_msm_schedule(p, row, null_prefix ? nullptr : prefix.data(), out),
+                "MSM invalid schedule accepted");
+        require(out.merge_levels == 123, "MSM failed schedule changed levels");
+        for (const auto count : out.task_count) require(count == untouched, "MSM failed schedule changed counts");
+        for (const auto value : prefix) require(value == untouched, "MSM failed schedule changed prefix");
+    };
+    reject_schedule(nullptr, false);
+    reject_schedule(valid.data(), true);
+    for (const auto& bad : std::array<std::array<uint64_t,5>,4>{{
+             {1,1,65,65,65}, {0,32,31,65,65}, {0,0,64,64,64}, {0,0,66,66,65}}})
+        reject_schedule(bad.data(), false);
+    std::cout << "MSM_HOST_PASS\n";
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -391,6 +587,7 @@ int main(int argc, char** argv) {
         std::cout << "FIELD_ELEMENT_HOST_PASS field=TestPrime64\n";
         for (const size_t count : counts) fr_regression(root, count);
         g1_suite(root);
+        msm_host_suite();
         std::cout << "FIELD_MATH_HOST_PASS\n";
         return 0;
     } catch (const std::exception& error) {

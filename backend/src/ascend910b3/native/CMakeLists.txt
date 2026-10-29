@@ -26,7 +26,9 @@ foreach(name IN ITEMS ascendcl register platform unified_dlog graph_base c_sec m
         PATHS "${CANN_LIBRARY_DIR}" NO_DEFAULT_PATH REQUIRED)
 endforeach()
 
-add_library(hyperplonk_ascend910b3_math STATIC math_kernels.asc math_tiling.cpp)
+add_library(hyperplonk_ascend910b3_math STATIC
+    math_kernels.asc field_kernels.asc math_tiling.cpp msm.cpp msm_plan.cpp
+    msm_sort.asc msm_rows.asc msm_accumulate.asc msm_reduce.asc)
 target_include_directories(hyperplonk_ascend910b3_math PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}" ${CANN_INCLUDE_DIRS})
 target_link_libraries(hyperplonk_ascend910b3_math PUBLIC
@@ -38,7 +40,7 @@ target_link_libraries(hyperplonk_ascend910b3_math PUBLIC
 
 include(CTest)
 # This target deliberately has no ACL includes, initialization, or linkage.
-add_executable(field_math_tests tests/field_math_tests.cpp)
+add_executable(field_math_tests tests/field_math_tests.cpp msm_plan.cpp)
 target_include_directories(field_math_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 if(BUILD_TESTING)
     add_test(NAME field_math_tests COMMAND field_math_tests
@@ -47,17 +49,20 @@ endif()
 
 add_executable(native_math_smoke
     tests/math_smoke.cpp
-    tests/field_smoke.asc
     tests/g1_smoke.asc
     tests/g1_chain_smoke.asc
     tests/runtime_audit.cpp)
-target_link_libraries(native_math_smoke PRIVATE hyperplonk_ascend910b3_math)
-target_link_options(native_math_smoke PRIVATE
-    "-Wl,--wrap=aclrtMemcpy"
-    "-Wl,--wrap=aclrtMemcpyAsync"
-    "-Wl,--wrap=aclrtSynchronizeStream"
-    "-Wl,--wrap=aclrtSynchronizeDevice"
-    "-Wl,--wrap=aclrtMalloc"
-    "-Wl,--wrap=aclrtFree")
-set_target_properties(native_math_smoke PROPERTIES
-    BUILD_RPATH "${CANN_LIBRARY_DIR}")
+add_executable(msm_benchmark tests/msm_benchmark.cpp tests/runtime_audit.cpp)
+foreach(runner IN ITEMS native_math_smoke msm_benchmark)
+    target_link_libraries(${runner} PRIVATE hyperplonk_ascend910b3_math)
+    target_link_options(${runner} PRIVATE
+        "-Wl,--wrap=aclrtMemcpy"
+        "-Wl,--wrap=aclrtMemcpyAsync"
+        "-Wl,--wrap=aclrtSynchronizeStream"
+        "-Wl,--wrap=aclrtSynchronizeDevice"
+        "-Wl,--wrap=aclrtMalloc"
+        "-Wl,--wrap=aclrtFree"
+        "-Wl,--wrap=aclrtMallocHost"
+        "-Wl,--wrap=aclrtFreeHost")
+    set_target_properties(${runner} PROPERTIES BUILD_RPATH "${CANN_LIBRARY_DIR}")
+endforeach()

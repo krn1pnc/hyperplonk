@@ -34,8 +34,8 @@ bool build_math_tiling(AscendC::tiling::TCubeTiling& dot,
     const uint32_t cores = platform->GetCoreNumAiv();
     uint64_t ub_bytes = 0;
     platform->GetCoreMemSize(platform_ascendc::CoreMemType::UB, ub_bytes);
-    // Largest fixed vector-kernel allocation; no guessed hardware capacity.
-    constexpr uint64_t required_ub_bytes = 32768;
+    // Fixed 88512-byte Vector arena plus 8192-byte SDK runtime reservation.
+    constexpr uint64_t required_ub_bytes = 96704;
     if (cores == 0 || platform->GetCoreNumAic() == 0 || ub_bytes < required_ub_bytes) {
         return false;
     }
