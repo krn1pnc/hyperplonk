@@ -71,13 +71,13 @@ aclError run_msm(aclrtStream stream,const G1Affine* bases,const Fr* scalars,
         if (!make_msm_schedule(p,rows,prefix,schedule)) return ACL_ERROR_INTERNAL_ERROR;
         const bool empty=schedule.task_count[0]==0;
         if (!empty) {
-            const size_t bytes=static_cast<size_t>(p.host_prefix_offset)*(schedule.merge_levels+1);
+            const size_t bytes=static_cast<size_t>(schedule.order_offset+sizeof(uint32_t)*schedule.task_count[0]);
             status=aclrtMemcpyAsync(region(workspace,p,MsmRegion::TaskPrefix),
                                     p.region_size[static_cast<unsigned>(MsmRegion::TaskPrefix)],
                                     prefix,bytes,ACL_MEMCPY_HOST_TO_DEVICE,stream);
             if (status!=ACL_SUCCESS) return status;
             launch_msm_tasks(stream,workspace,p,0,schedule.task_count[0]);
-            launch_msm_partial_sums(stream,workspace,p,schedule.task_count[0]);
+            launch_msm_partial_sums(stream,workspace,p,schedule.task_count[0],schedule.order_offset);
             for (uint32_t level=1;level<=schedule.merge_levels;++level) {
                 launch_msm_tasks(stream,workspace,p,level,schedule.task_count[level]);
                 launch_msm_partial_merge(stream,workspace,p,level,schedule.task_count[level]);

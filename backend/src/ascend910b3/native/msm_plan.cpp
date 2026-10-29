@@ -17,9 +17,9 @@ bool mul(uint64_t a, uint64_t b, uint64_t& out) noexcept {
 bool round_up(uint64_t n, uint64_t k, uint64_t& out) noexcept {
     return mul(ceil_div(n, k), k, out);
 }
-uint32_t levels(uint64_t n) noexcept {
+uint32_t levels(uint64_t n, uint64_t fan_in = 64) noexcept {
     uint32_t l = 0;
-    while (n > 1) { n = ceil_div(n,64); ++l; }
+    while (n > 1) { n = ceil_div(n,fan_in); ++l; }
     return l;
 }
 }
@@ -42,16 +42,25 @@ bool make_msm_plan(size_t count, const MsmPlatform& platform, uint32_t bits,
     p.chunks = static_cast<uint32_t>(ceil_div(count,2048));
     p.merge_levels = levels(ceil_div(count,64));
     p.row_blocks = static_cast<uint32_t>(ceil_div(uint64_t(p.buckets)+1,256));
-    p.weighted_segments = (p.buckets - 1 + 63) / 64;
-    p.weighted_levels = levels(p.weighted_segments);
+    // Fit one 48-lane segment tile per available AIV, without making tiny
+    // segments pay predominantly for absolute-weight restoration.
+    const uint64_t ideal_segment = ceil_div(uint64_t(p.buckets)-1,uint64_t(platform.aiv_cores)*48);
+    const uint32_t segment_length = ideal_segment < 16 ? 16 : static_cast<uint32_t>(ideal_segment);
+    p.weighted_segments = static_cast<uint32_t>(ceil_div(uint64_t(p.buckets)-1,segment_length));
+    // The weighted tail has much less parallel work than bucket partials.
+    p.weighted_levels = levels(p.weighted_segments,4);
     uint64_t padded_rows = 0, fragment_bound = 0, temp = 0, prefix_bytes = 0;
     if (!round_up(count,8,p.dense_records) || !mul(112,p.chunks,temp) ||
         !add(count,temp,fragment_bound) || !round_up(fragment_bound,8,p.fragment_records) ||
         !round_up(uint64_t(p.buckets)+1,8,padded_rows) || !mul(padded_rows,8,temp)) return false;
     p.host_prefix_offset = temp;
-    if (!mul(temp,p.merge_levels+1,prefix_bytes) ||
-        !mul(temp,p.merge_levels+2,p.host_workspace_bytes) ||
-        !add(ceil_div(count,64),p.buckets,p.partial_capacity[0])) return false;
+    uint64_t order_bytes = 0;
+    if (!add(ceil_div(count,64),p.buckets,p.partial_capacity[0]) ||
+        !mul(temp,p.merge_levels+1,prefix_bytes) ||
+        !mul(p.partial_capacity[0],sizeof(uint32_t),order_bytes) ||
+        !add(prefix_bytes,order_bytes,prefix_bytes) ||
+        !round_up(prefix_bytes,64,prefix_bytes) ||
+        !add(p.host_prefix_offset,prefix_bytes,p.host_workspace_bytes)) return false;
     if ((p.merge_levels || p.weighted_levels) &&
         !add(ceil_div(count,4096),p.buckets,p.partial_capacity[1])) return false;
     uint64_t cursor = 0;
@@ -91,7 +100,7 @@ bool make_msm_schedule(const MsmPlan& p, const uint64_t* rows,
     if (!rows || !prefix || p.merge_levels > 5 || !p.buckets) return false;
     const uint64_t stride = ((uint64_t(p.buckets)+8)/8)*8;
     const uint64_t rb = (uint64_t(p.buckets)+1)*8;
-    const uint64_t pb = stride*(p.merge_levels+1)*8;
+    const uint64_t pb = p.region_size[static_cast<uint32_t>(MsmRegion::TaskPrefix)];
     const uintptr_t r = reinterpret_cast<uintptr_t>(rows), q = reinterpret_cast<uintptr_t>(prefix);
     if (r > UINTPTR_MAX-rb || q > UINTPTR_MAX-pb || (r < q+pb && q < r+rb) ||
         rows[0] || rows[p.buckets] != p.count) return false;
@@ -116,6 +125,27 @@ bool make_msm_schedule(const MsmPlan& p, const uint64_t* rows,
         for (uint64_t b = p.buckets; b < stride; ++b) dst[b] = total;
         s.task_count[k] = total;
         divisor *= 64;
+    }
+    s.order_offset = p.host_prefix_offset*(s.merge_levels+1);
+    auto* order = reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(prefix)+s.order_offset);
+    uint64_t histogram[65]{}, start[65]{};
+    for (uint32_t b = 1; b < p.buckets; ++b) {
+        const uint64_t length = rows[b+1]-rows[b];
+        histogram[64] += length/64;
+        if (length%64) ++histogram[length%64];
+    }
+    uint64_t position = 0;
+    for (uint32_t length = 64; length; --length) {
+        start[length] = position;
+        position += histogram[length];
+    }
+    for (uint32_t b = 1; b < p.buckets; ++b) {
+        const uint64_t length = rows[b+1]-rows[b], full = length/64;
+        const uint64_t base = prefix[b];
+        for (uint64_t task = 0; task < full; ++task)
+            order[start[64]++] = static_cast<uint32_t>(base+task);
+        if (length%64)
+            order[start[length%64]++] = static_cast<uint32_t>(base+full);
     }
     out = s; return true;
 }

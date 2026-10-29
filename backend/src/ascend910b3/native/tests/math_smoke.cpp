@@ -1439,7 +1439,9 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
     const size_t stride = msm_round8(plan.buckets+1);
     for (size_t i = plan.buckets+1; i < stride; ++i)
         require(rows[i] == n,label+" CSR tail padding");
-    std::vector<uint64_t> prefix(stride*(plan.merge_levels+1),UINT64_MAX);
+    std::vector<uint64_t> prefix(
+        plan.region_size[static_cast<uint32_t>(detail::MsmRegion::TaskPrefix)]/sizeof(uint64_t),
+        UINT64_MAX);
     detail::MsmSchedule schedule{};
     require(detail::make_msm_schedule(plan,rows,prefix.data(),schedule),label+" scheduler rejected CSR");
     uint64_t divisor = 64;
@@ -1462,11 +1464,14 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
     }
     for (uint32_t level = model_levels+1; level < 6; ++level)
         require(schedule.task_count[level] == 0,label+" inactive task count");
-    for (size_t i = stride*(model_levels+1); i < prefix.size(); ++i)
-        require(prefix[i] == UINT64_MAX,label+" inactive prefix overwritten");
+    const size_t written_bytes = stride*(model_levels+1)*sizeof(uint64_t)
+        + schedule.task_count[0]*sizeof(uint32_t);
+    const auto* prefix_bytes = reinterpret_cast<const uint8_t*>(prefix.data());
+    for (size_t i = written_bytes; i < prefix.size()*sizeof(uint64_t); ++i)
+        require(prefix_bytes[i] == UINT8_MAX,label+" inactive schedule storage overwritten");
     if (max_tasks) {
-        runtime.upload(stream,reinterpret_cast<uint64_t*>(msm_region(scratch.payload,plan,
-            detail::MsmRegion::TaskPrefix)),prefix.data(),stride*(model_levels+1));
+        runtime.upload(stream,msm_region(scratch.payload,plan,detail::MsmRegion::TaskPrefix),
+                       prefix_bytes,written_bytes);
         for (uint32_t level = 0; level <= model_levels; ++level) {
             detail::launch_msm_tasks(stream,scratch.payload,plan,level,schedule.task_count[level]);
             auto* tasks = runtime.download(stream,msm_region(scratch.payload,plan,
@@ -1578,7 +1583,9 @@ MsmBudget msm_budget(const MsmFixture& fixture, const detail::MsmPlan& plan)
         ++result.active;
         uint32_t levels = 0;
         for (uint64_t tasks = (max_length+63)/64; tasks > 1; tasks = (tasks+63)/64) ++levels;
-        result.h2d += prefix_bytes*(levels+1);
+        uint64_t task_count = 0;
+        for (uint32_t b = 1; b < buckets; ++b) task_count += (lengths[b]+63)/64;
+        result.h2d += prefix_bytes*(levels+1)+task_count*sizeof(uint32_t);
     }
     return result;
 }

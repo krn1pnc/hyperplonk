@@ -23,7 +23,11 @@ struct MsmPlan {
     uint32_t chunks = 0, merge_levels = 0, row_blocks = 0;
     uint32_t weighted_segments = 0, weighted_levels = 0;
 };
-struct MsmSchedule { uint64_t task_count[6]{}; uint32_t merge_levels = 0; };
+struct MsmSchedule {
+    uint64_t task_count[6]{};
+    uint32_t merge_levels = 0;
+    uint64_t order_offset = 0;
+};
 bool make_msm_plan(size_t count, const MsmPlatform&, uint32_t requested_window_bits,
                    MsmPlan& out) noexcept;
 bool make_msm_schedule(const MsmPlan&, const uint64_t* row_ptr,

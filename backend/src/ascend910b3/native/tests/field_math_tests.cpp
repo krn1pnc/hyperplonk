@@ -2,6 +2,7 @@
 #include "g1.h"
 #include "msm_plan.h"
 
+#include <algorithm>
 #include <array>
 #include <filesystem>
 #include <fstream>
@@ -459,19 +460,21 @@ void msm_host_suite() {
         const uint64_t t = 8 * round8(b + 1);
         const uint64_t m0 = ceil_div(n, 64) + b, m1 = ceil_div(n, 4096) + b;
         const uint32_t l = levels(ceil_div(n, 64));
-        const uint32_t wl = levels(ceil_div(b - 1, 64));
+        const bool weighted_tree = p.weighted_segments > 1;
+        const uint64_t prefix_capacity = ceil_div(t * (l + 1) + 4 * m0, 64) * 64;
         require(p.windows == ceil_div(255, c) && p.buckets == b && p.radix_passes == ceil_div(c, 4)
                 && p.chunks == chunks && p.merge_levels == l && p.row_blocks == ceil_div(b + 1, 256)
-                && p.weighted_segments == ceil_div(b - 1, 64) && p.weighted_levels == wl,
+                && p.weighted_segments >= 1 && p.weighted_segments < b
+                && bool(p.weighted_levels) == weighted_tree,
                 "MSM plan derived shape");
         require(p.dense_records == round8(n) && p.fragment_records == round8(n + 112 * chunks)
-                && p.partial_capacity[0] == m0 && p.partial_capacity[1] == ((l || wl) ? m1 : 0),
+                && p.partial_capacity[0] == m0 && p.partial_capacity[1] == ((l || weighted_tree) ? m1 : 0),
                 "MSM plan record and partial capacities");
         const std::array<uint64_t, msm_region_count> bytes{
             8 * round8(n), 8 * round8(n), 8 * round8(n + 112 * chunks),
             64 * chunks, 64 * 16 * chunks, 64 * 16, 64 * (b + 1), t, t,
-            64 * ceil_div(b + 1, 256), 64 * ceil_div(b + 1, 256), t * (l + 1),
-            64 * m0, 192 * m0, 192 * ((l || wl) ? m1 : 0), 192 * b, 192 * ceil_div(255, c),
+            64 * ceil_div(b + 1, 256), 64 * ceil_div(b + 1, 256), prefix_capacity,
+            64 * m0, 192 * m0, 192 * ((l || weighted_tree) ? m1 : 0), 192 * b, 192 * ceil_div(255, c),
             96 * n};
         uint64_t end = 0;
         for (unsigned i = 0; i < bytes.size(); ++i) {
@@ -492,7 +495,7 @@ void msm_host_suite() {
         require(!(p.workspace_bytes % 64) && p.workspace_bytes >= end
                 && p.workspace_bytes <= static_cast<uint64_t>(PTRDIFF_MAX)
                 && p.workspace_bytes <= static_cast<uint64_t>(SIZE_MAX)
-                && p.host_prefix_offset == t && p.host_workspace_bytes == t * (l + 2),
+                && p.host_prefix_offset == t && p.host_workspace_bytes == t + prefix_capacity,
                 "MSM total host/device workspace");
     }
     MsmPlan sentinel{};
@@ -518,9 +521,11 @@ void msm_host_suite() {
         for (unsigned b = 0; b < 4; ++b) row[b + 1] = row[b] + histogram[b];
         require(row[4] == n, "MSM test histogram total");
         const size_t stride = static_cast<size_t>(round8(5));
-        std::vector<uint64_t> prefix(stride * (p.merge_levels + 1) + 1, untouched);
+        const size_t capacity = p.region_size[static_cast<unsigned>(MsmRegion::TaskPrefix)];
+        std::vector<uint64_t> storage(capacity / 8 + 2, untouched);
+        auto* prefix = storage.data() + 1;
         MsmSchedule schedule{};
-        require(make_msm_schedule(p, row.data(), prefix.data(), schedule), "MSM schedule rejected");
+        require(make_msm_schedule(p, row.data(), prefix, schedule), "MSM schedule rejected");
         require(schedule.merge_levels + 1 == expected_counts.size(), "MSM actual merge levels");
         uint64_t divisor = 64;
         for (unsigned k = 0; k < 6; ++k) {
@@ -536,24 +541,67 @@ void msm_host_suite() {
                 require(prefix[k * stride + b] == total, "MSM task prefix tail padding");
             divisor *= 64;
         }
-        for (size_t i = stride * expected_counts.size(); i < prefix.size(); ++i)
-            require(prefix[i] == untouched, "MSM inactive prefix layer modified");
+        require(schedule.order_offset == p.host_prefix_offset * expected_counts.size(),
+                "MSM actual order offset");
+        const auto* order = reinterpret_cast<const uint32_t*>(
+            reinterpret_cast<const uint8_t*>(prefix) + schedule.order_offset);
+        struct Task { uint64_t begin, count; unsigned bucket; };
+        uint64_t model_size = 0;
+        for (unsigned b = 1; b < 4; ++b) model_size += ceil_div(histogram[b], 64);
+        const auto model = [&](uint64_t id) {
+            for (unsigned b = 1; b < 4; ++b) {
+                const uint64_t tasks = ceil_div(histogram[b], 64);
+                if (id < tasks) {
+                    const uint64_t begin = row[b] + id * 64;
+                    return Task{begin, std::min(uint64_t{64}, row[b+1]-begin), b};
+                }
+                id -= tasks;
+            }
+            return Task{0,0,0};
+        };
+        require(model_size == schedule.task_count[0], "MSM row model task count");
+        for (uint64_t i = 0; i < model_size; ++i) {
+            const uint32_t id = order[i];
+            require(id < model_size, "MSM task order range");
+            const auto task = model(id);
+            require(id >= prefix[task.bucket] && id < prefix[task.bucket+1]
+                    && task.begin == row[task.bucket] + 64 * (id-prefix[task.bucket])
+                    && task.begin + task.count <= row[task.bucket+1],
+                    "MSM original bucket/begin boundaries");
+            if (i) {
+                const auto previous = order[i-1];
+                require(model(previous).count >= task.count, "MSM descending task lengths");
+                require(model(previous).count != task.count || previous < id,
+                        "MSM stable equal lengths and unique IDs");
+            }
+        }
+        const size_t written = schedule.order_offset + 4 * model_size;
+        require(written <= capacity, "MSM actual metadata fits capacity");
+        const auto* bytes = reinterpret_cast<const uint8_t*>(prefix);
+        const auto* sentinel_bytes = reinterpret_cast<const uint8_t*>(&untouched);
+        for (size_t i = written; i < capacity; ++i)
+            require(bytes[i] == sentinel_bytes[i % 8], "MSM metadata unwritten tail");
+        require(storage.front() == untouched && storage.back() == untouched,
+                "MSM full prefix allocation canaries");
     };
     check_schedule(65, {0,65,0,0}, {2,1});
     check_schedule(2048, {0,2048,0,0}, {32,1});
     check_schedule(2049, {0,2049,0,0}, {33,1});
-    check_schedule(65537, {0,0,65537,0}, {1025,17,1});
     check_schedule(UINT32_MAX, {0,0,0,UINT32_MAX}, {67108864,1048576,16384,256,4,1});
+    check_schedule(65537, {0,0,65537,0}, {1025,17,1});
     check_schedule(130, {1,64,0,65}, {3,2});
     check_schedule(65537, {65537,0,0,0}, {0});
     check_schedule(64, {0,0,64,0}, {1});
     check_schedule(1, {0,0,0,1}, {1});
+    check_schedule(385, {0,127,129,129}, {8,3});
     MsmPlan empty{};
     require(make_msm_plan(0, platform, 0, empty), "MSM empty schedule plan");
     MsmSchedule empty_out{};
     empty_out.merge_levels = 5;
     for (auto& count : empty_out.task_count) count = untouched;
-    require(make_msm_schedule(empty, nullptr, nullptr, empty_out) && !empty_out.merge_levels,
+    empty_out.order_offset = untouched;
+    require(make_msm_schedule(empty, nullptr, nullptr, empty_out)
+            && !empty_out.merge_levels && !empty_out.order_offset,
             "MSM empty null schedule rejected");
     for (const auto count : empty_out.task_count) require(!count, "MSM empty task count");
 
@@ -561,13 +609,16 @@ void msm_host_suite() {
     require(make_msm_plan(65, platform, 2, p), "MSM rejection schedule plan");
     const std::array<uint64_t,5> valid{0,0,65,65,65};
     const auto reject_schedule = [&](const uint64_t* row, bool null_prefix) {
-        std::vector<uint64_t> prefix(8 * (p.merge_levels + 1), untouched);
+        std::vector<uint64_t> prefix(
+            p.region_size[static_cast<unsigned>(MsmRegion::TaskPrefix)] / 8, untouched);
         MsmSchedule out{};
         out.merge_levels = 123;
+        out.order_offset = untouched;
         for (auto& count : out.task_count) count = untouched;
         require(!make_msm_schedule(p, row, null_prefix ? nullptr : prefix.data(), out),
                 "MSM invalid schedule accepted");
         require(out.merge_levels == 123, "MSM failed schedule changed levels");
+        require(out.order_offset == untouched, "MSM failed schedule changed order offset");
         for (const auto count : out.task_count) require(count == untouched, "MSM failed schedule changed counts");
         for (const auto value : prefix) require(value == untouched, "MSM failed schedule changed prefix");
     };

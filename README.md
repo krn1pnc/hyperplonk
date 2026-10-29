@@ -255,7 +255,11 @@ regression pass with this organization; per-kernel performance was not profiled.
 The native MSM implementation follows pinned
 [cuZK sparse/balanced Pippenger](https://github.com/Tao-Lu-123/cuZK/blob/88e3295cada379abe06240df23ec6c9fc0f648b2/depends/libff-cuda/scalar_multiplication/multiexp.cu),
 adapted to DAV_2201 without CUDA ticket atomics: stable integer radix grouping,
-CSR bucket rows, bounded 64-point tasks and fan-in-64 Jacobian reduction.
+CSR bucket rows, bounded 64-point tasks and fan-in-64 bucket-partial reduction.
+Level-zero tasks are stably grouped by length across SIMD lanes, but retain
+their original point order and partial-output positions. Weighted segments fit
+the available AIV lanes with a minimum span of16; their final tree uses fan-in4
+to avoid serial work on a nearly empty SIMD tile.
 Weighted segments restore absolute bucket weights; only the final result is
 normalized. Each input scalar contributes one unsigned digit record per window,
 including digit zero; bucket zero is excluded from point accumulation.
@@ -305,14 +309,16 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 |--------|----------------|---------|---------------|--------------------|---------|
 | 2^20 | Previous radix15 Vector MSM | 1 | 1 | target | 47.703695 |
 | 2^20 | Radix12 before resident-Montgomery IO | 1 | 3 | median | 4.589340 |
-| 2^20 | Current resident-Montgomery radix12 MSM | 1 | 3 | median | 4.189697 |
+| 2^20 | Resident-Montgomery IO checkpoint | 1 | 3 | median | 4.189697 |
+| 2^20 | Current balanced tasks and weighted reduction | 1 | 3 | median | 2.678516 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
-Resident-Montgomery IO reduces the measured million-point latency by 8.71%
-versus the previous radix12 checkpoint, but remains slower than CPU. The current
-binary passed one warmup and three exact targets; no new `2^25` timing is claimed.
+Balanced tasks and hardware-sized weighted reductions reduce million-point
+latency by 36.07% versus the resident-Montgomery checkpoint, but remain slower
+than CPU. The current binary passed one warmup and three exact targets; no new
+`2^25` timing is claimed.
 The old NPU and `2^25` figures remain 1+1 diagnostic checkpoints. These do not
 establish final performance acceptance: CPU10x and `2^25<1s` remain unmet.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
@@ -359,7 +365,8 @@ This internal C++ API borrows HBM inputs (`96*N` bytes of canonical Affine bases
 scratch. `msm_plan.h` is ACL-free and computes exact host/device capacities.
 Device scratch includes `96*N` bytes for the packed Montgomery base cache;
 allocate the queried plan capacity rather than retaining an older byte count.
-The pinned host scratch requirement and numerical host-transfer policy are unchanged.
+Pinned scratch also includes the bounded task-order metadata; no point or field
+values are added to numerical host transfers.
 `N <= UINT32_MAX`; explicit windows are 2–16 bits, with 0 selecting the cuZK-style
 automatic heuristic capped at 16. Platform requirements are at least one AIV
 and 176576 UB bytes. Input/output addresses must be 32-byte aligned, scratch addresses
@@ -371,12 +378,16 @@ perform subgroup validation or decode external packets.
 
 Unlike the Fr launchers, `run_msm` performs CPU metadata scheduling. For each
 of `W=ceil(255/c)` windows it downloads exactly `8*(2^c+1)` bytes of CSR row
-pointers and synchronizes the caller's stream. It uploads compact task prefixes
-only for active windows and only through their actual merge level. Points,
-scalars, sorted indices, buckets and partial points never return to the CPU.
-No host/device allocation or free occurs inside `run_msm`. At one million points
-(`c=16`, `W=16`), explicit metadata is bounded by about 8 MiB D2H and 32 MiB H2D;
-these byte bounds are not latency measurements.
+pointers and synchronizes the caller's stream. The existing one upload per active
+window contains actual-level task prefixes followed by one uint32 original task
+index per level-zero task. The CPU derives this length-balancing order from the
+CSR rows; point/scalar and sorted-record arrays stay on device. Points, buckets
+and partial points never return to the CPU.
+No host/device allocation or free occurs inside `run_msm`. The measured million-
+point case (`c=16`, `W=16`) transfers8388736B D2H and12440440B H2D metadata with
+16 synchronizations. The new order contributes4050808B H2D across all windows;
+there is no new copy call or numerical host transfer. Allocate queried pinned
+and device capacities rather than reusing the previous smaller scratch sizes.
 
 `ACL_SUCCESS` means internal metadata handoffs succeeded and the finish kernel
 was enqueued, **not** that the final point is ready. Keep inputs, output and

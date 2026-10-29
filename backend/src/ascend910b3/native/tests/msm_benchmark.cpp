@@ -127,7 +127,9 @@ int main(int argc,char**argv){try{
         }
         const uint64_t largest=*std::max_element(lengths.begin()+1,lengths.end());
         if(largest){++active;uint32_t levels=0;for(uint64_t q=(largest+63)/64;q>1;q=(q+63)/64)++levels;
-            expected_h2d+=stride*(levels+1);}
+            uint64_t tasks=0;
+            for(uint32_t b=1;b<p.buckets;++b) tasks+=(lengths[b]+63)/64;
+            expected_h2d+=stride*(levels+1)+tasks*sizeof(uint32_t);}
     }
     std::cout<<"MSM_INITIAL_H2D_BEGIN"<<std::endl;
     const auto setup_start=std::chrono::steady_clock::now();
