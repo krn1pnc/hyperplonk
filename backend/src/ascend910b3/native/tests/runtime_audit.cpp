@@ -3,11 +3,11 @@
 #include <acl/acl_rt.h>
 
 namespace {
-bool auditing = false;
-hyperplonk::ascend910b3::test::RuntimeCounts counts;
-bool checking_copies = false;
-const hyperplonk::ascend910b3::test::RuntimeCopyAllowance* copy_allowances = nullptr;
-size_t copy_allowance_count = 0;
+thread_local bool auditing = false;
+thread_local hyperplonk::ascend910b3::test::RuntimeCounts counts;
+thread_local bool checking_copies = false;
+thread_local const hyperplonk::ascend910b3::test::RuntimeCopyAllowance* copy_allowances = nullptr;
+thread_local size_t copy_allowance_count = 0;
 
 void record_copy(const void* dst, const void* src, size_t bytes, aclrtMemcpyKind kind)
 {

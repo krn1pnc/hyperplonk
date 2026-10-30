@@ -29,8 +29,8 @@ struct RuntimeCopyAllowance {
     bool host_to_device;
 };
 
-// The smoke harness enqueues on one host thread; independent streams do not
-// imply concurrent host calls into these test-only counters.
+// Each host thread owns independent counters and borrowed allowance storage;
+// concurrent callers cannot overwrite another thread's audit scope.
 void begin_runtime_audit();
 // Borrows allowances until end_runtime_audit(); an empty list rejects every copy.
 // Copies must match both starting addresses, direction, and 0 < bytes <= max_bytes.

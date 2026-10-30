@@ -414,6 +414,33 @@ def generate_msm(output):
         write_g1_affine(directory / "expected.bin", [expected])
 
 
+
+def generate_prepared_msm(output):
+    """Independent direct affine MSM for changing scalars on the same public bases."""
+    count = 2049
+    source = output / "msm" / f"uniform-{count}"
+    encoded_bases = (source / "bases.bin").read_bytes()
+    assert len(encoded_bases) == count * 96
+    bases = []
+    for offset in range(0, len(encoded_bases), 96):
+        x = int.from_bytes(encoded_bases[offset:offset + 48], "little")
+        y = int.from_bytes(encoded_bases[offset + 48:offset + 96], "little")
+        point = None if (x, y) == (0, 0) else (x, y)
+        assert point is None or (x < Q and y < Q and g1_affine_on_curve(point))
+        bases.append(point)
+    rng = random.Random(20261121)
+    scalars = [rng.randrange(P) for _ in range(count)]
+    encoded_scalars = b"".join(value.to_bytes(32, "little") for value in scalars)
+    assert encoded_scalars != (source / "scalars.bin").read_bytes()
+    expected = None
+    for base, scalar in zip(bases, scalars):
+        expected = g1_affine_add(expected, g1_affine_mul(base, scalar))
+    directory = output / "msm-prepared" / f"random2-{count}"
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / "bases.bin").write_bytes(encoded_bases)
+    write_values(directory / "scalars.bin", scalars)
+    write_g1_affine(directory / "expected.bin", [expected])
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", required=True, type=Path)
@@ -430,6 +457,7 @@ def main():
         extra_fixtures(root, p, width, seed, args.output / "params" / name)
     generate_g1(args.output)
     generate_msm(args.output)
+    generate_prepared_msm(args.output)
 
 
 if __name__ == "__main__":

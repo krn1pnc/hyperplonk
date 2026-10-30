@@ -24,6 +24,11 @@
 #include <vector>
 #include <utility>
 #include <type_traits>
+#include <atomic>
+#include <exception>
+#include <functional>
+#include <optional>
+#include <thread>
 
 namespace {
 namespace math = hyperplonk::ascend910b3;
@@ -220,8 +225,15 @@ public:
 private:
     void finish()
     {
-        for (auto stream : streams_)
-            cleanup_check(aclrtSynchronizeStream(stream), "aclrtSynchronizeStream");
+        bool drained = true;
+        for (auto stream : streams_) {
+            const auto status = aclrtSynchronizeStream(stream);
+            cleanup_check(status, "aclrtSynchronizeStream");
+            drained = drained && status == ACL_SUCCESS;
+        }
+        // An error return is not cancellation. Leave every allocation, stream
+        // and context alive if any owner stream has not established completion.
+        if (!drained) return;
         for (auto it = device_allocations_.rbegin(); it != device_allocations_.rend(); ++it)
             cleanup_check(aclrtFree(*it), "aclrtFree");
         device_allocations_.clear();
@@ -1853,6 +1865,584 @@ void test_msm_two_streams(Runtime& runtime, const std::filesystem::path& root)
                 "shared-input-257-c3-c4","MSM_CUZK_TWO_STREAM_PASS");
     runtime.release_storage(mark);
 }
+
+static_assert(!std::is_default_constructible<detail::PreparedSrsView>::value,
+              "Only completed cold preparation may construct a view");
+static_assert(!std::is_aggregate<detail::PreparedSrsView>::value,
+              "Prepared cache metadata must not be forgeable");
+static_assert(!std::is_constructible<detail::PreparedSrsView,const void*,uint64_t,
+              uint64_t,uint64_t,const detail::MsmPlatform&,aclrtContext>::value,
+              "Raw metadata construction must remain private");
+static_assert(std::is_copy_constructible<detail::PreparedSrsView>::value &&
+              std::is_copy_assignable<detail::PreparedSrsView>::value,
+              "Completed immutable views must support borrowed metadata copies");
+
+template<class Reject> void msm_corrupt_plans(const detail::MsmPlan& plan, Reject reject)
+{
+    auto changed = plan;
+    changed.platform.aiv_cores = 0; reject(changed);
+    changed = plan; changed.platform.ub_bytes = detail::msm_required_ub_bytes-1; reject(changed);
+    changed = plan; ++changed.count; reject(changed);
+    changed = plan; changed.count = uint64_t(UINT32_MAX)+1; reject(changed);
+    changed = plan; changed.count = UINT64_MAX; reject(changed);
+    changed = plan; ++changed.workspace_bytes; reject(changed);
+    changed = plan; ++changed.dense_records; reject(changed);
+    changed = plan; ++changed.fragment_records; reject(changed);
+    changed = plan; ++changed.host_workspace_bytes; reject(changed);
+    changed = plan; ++changed.host_prefix_offset; reject(changed);
+    changed = plan; changed.window_bits = 1; reject(changed);
+    changed = plan; changed.window_bits = 21; reject(changed);
+    changed = plan; changed.window_bits = UINT32_MAX; reject(changed);
+    changed = plan; ++changed.windows; reject(changed);
+    changed = plan; ++changed.buckets; reject(changed);
+    changed = plan; ++changed.radix_passes; reject(changed);
+    changed = plan; ++changed.chunks; reject(changed);
+    changed = plan; ++changed.merge_levels; reject(changed);
+    changed = plan; ++changed.row_blocks; reject(changed);
+    changed = plan; ++changed.weighted_segments; reject(changed);
+    changed = plan; ++changed.weighted_levels; reject(changed);
+    for (unsigned i = 0; i < 2; ++i) {
+        changed = plan; ++changed.partial_capacity[i]; reject(changed);
+    }
+    for (unsigned i = 0; i < detail::msm_region_count; ++i) {
+        changed = plan; ++changed.region_offset[i]; reject(changed);
+        changed = plan; ++changed.region_size[i]; reject(changed);
+    }
+}
+
+detail::MsmPreparedSizes msm_prepared_sizes(const detail::MsmPlan& plan)
+{
+    detail::MsmPreparedSizes sizes{};
+    require(detail::query_msm_prepared_sizes(plan,sizes),"prepared size query failed");
+    return sizes;
+}
+
+void test_msm_prepared_queries()
+{
+    const detail::MsmPlatform platform{40,196352};
+    constexpr size_t boundaries[] = {0,1,2,47,48,63,64,65,2047,2048,2049,UINT32_MAX};
+    for (size_t n : boundaries) {
+        for (uint32_t bits = 0; bits <= 20; ++bits) {
+            if (bits == 1) continue;
+            detail::MsmPlan plan{};
+            require(detail::make_msm_plan(n,platform,bits,plan),"prepared boundary plan rejected");
+            require(detail::validate_msm_plan(plan),"prepared valid plan rejected");
+            const auto sizes = msm_prepared_sizes(plan);
+            uint64_t end = 0;
+            const auto mont = static_cast<uint32_t>(detail::MsmRegion::MontgomeryBases);
+            for (uint32_t r = 0; r < mont; ++r)
+                if (plan.region_size[r])
+                    end = std::max(end,plan.region_offset[r]+plan.region_size[r]);
+            const uint64_t scratch = (end+63)/64*64;
+            require(sizes.reusable_bytes == uint64_t(n)*96 &&
+                    sizes.scratch_bytes == scratch &&
+                    sizes.host_workspace_bytes == plan.host_workspace_bytes,
+                    "prepared sizes violate independent payload/scratch boundary");
+            require(plan.workspace_bytes == (scratch+uint64_t(n)*96+63)/64*64,
+                    "prepared one-shot layout or odd-count padding changed");
+            if (n%2)
+                require(plan.workspace_bytes-scratch-uint64_t(n)*96 == 32,
+                        "prepared odd count must retain 32-byte final padding");
+            msm_corrupt_plans(plan,[&](const detail::MsmPlan& bad) {
+                detail::MsmPreparedSizes sentinel{11,22,33};
+                require(!detail::validate_msm_plan(bad) &&
+                        !detail::query_msm_prepared_sizes(bad,sentinel) &&
+                        sentinel.reusable_bytes == 11 && sentinel.scratch_bytes == 22 &&
+                        sentinel.host_workspace_bytes == 33,
+                        "prepared corrupt plan query accepted or overwrote sentinel");
+            });
+        }
+    }
+    for (const auto& p : {detail::MsmPlatform{0,196352},
+                          detail::MsmPlatform{40,detail::msm_required_ub_bytes-1}}) {
+        detail::MsmPlan plan{};
+        require(!detail::make_msm_plan(65,p,4,plan),"prepared invalid platform accepted");
+    }
+    for (uint32_t bits : {1u,21u,UINT32_MAX}) {
+        detail::MsmPlan plan{};
+        require(!detail::make_msm_plan(65,platform,bits,plan),"prepared invalid window accepted");
+    }
+    for (size_t n : {size_t(UINT32_MAX)+1,SIZE_MAX}) {
+        detail::MsmPlan plan{};
+        require(!detail::make_msm_plan(n,platform,20,plan),"prepared overflowing count accepted");
+    }
+    for (const auto& expected : std::array<std::array<uint64_t,5>,2>{{
+             {{uint64_t(1)<<20,16,100663296,80073280,2949440}},
+             {{uint64_t(1)<<25,20,3221225472,1777340480,56623488}}}}) {
+        detail::MsmPlan plan{};
+        require(detail::make_msm_plan(expected[0],platform,expected[1],plan),
+                "prepared full-size capacity plan failed");
+        const auto sizes = msm_prepared_sizes(plan);
+        require(sizes.reusable_bytes == expected[2] && sizes.scratch_bytes == expected[3] &&
+                sizes.host_workspace_bytes == expected[4],"prepared frozen capacity model mismatch");
+    }
+    std::cout << "MSM_PREPARED_QUERY_PASS\n";
+}
+
+void msm_prepared_no_work(const audit::RuntimeCounts& counts, const std::string& label)
+{
+    require_no_runtime_transfers(counts);
+    msm_require_resources_zero(counts,label);
+    require(counts.stream_sync_calls == 0,label+" unexpectedly synchronized");
+}
+
+uint64_t msm_prepared_hash(const uint8_t* bytes, size_t count)
+{
+    uint64_t hash = 14695981039346656037ull;
+    for (size_t i = 0; i < count; ++i) {
+        hash ^= bytes[i];
+        hash *= 1099511628211ull;
+    }
+    return hash;
+}
+
+detail::PreparedSrsView msm_prepare(Runtime& runtime, aclrtStream stream,
+                                   MsmGuard& bases, MsmGuard& cache,
+                                   const detail::MsmPlan& plan)
+{
+    std::optional<detail::PreparedSrsView> view;
+    audit::begin_runtime_audit(nullptr,0);
+    const auto status = detail::prepare_msm_srs(stream,
+        reinterpret_cast<const math::G1Affine*>(bases.payload),bases.bytes,
+        cache.payload,cache.bytes,plan,view);
+    const auto counts = audit::end_runtime_audit();
+    check(status,"prepare_msm_srs");
+    require(counts.h2d_calls == 0 && counts.h2d_bytes == 0 &&
+            counts.d2h_calls == 0 && counts.d2h_bytes == 0 &&
+            counts.other_copy_calls == 0 && counts.unexpected_copy_calls == 0,
+            "cold preparation transferred numerical data");
+    msm_require_resources_zero(counts,"prepared cold");
+    require(counts.stream_sync_calls == 1 && view.has_value(),"cold did not publish completed view");
+    aclrtContext context = nullptr;
+    check(aclrtGetCurrentContext(&context),"prepared capture context");
+    require(view->cache() == cache.payload && view->payload_bytes() == cache.bytes &&
+            view->capacity_bytes() == cache.bytes && view->count() == plan.count &&
+            view->context() == context && view->platform().aiv_cores == plan.platform.aiv_cores &&
+            view->platform().ub_bytes == plan.platform.ub_bytes &&
+            view->format() == detail::PreparedSrsFormat::PositiveAffineMontgomeryV1,
+            "completed prepared descriptor mismatch");
+    cache.download(runtime,stream);
+    check(aclrtSynchronizeStream(stream),"prepared baseline cache download");
+    cache.verify(false,"prepared baseline cache");
+    if (cache.bytes)
+        std::memcpy(cache.initial.data()+64,cache.after+64,cache.bytes);
+    std::cout << "MSM_PREPARED_COLD_PASS count=" << plan.count << " cache_bytes=" << cache.bytes << '\n';
+    return *view;
+}
+
+struct MsmPreparedCall {
+    const MsmFixture* fixture;
+    const detail::MsmPlan* plan;
+    aclrtStream stream;
+    MsmGuard* scalars;
+    MsmGuard* scratch;
+    MsmGuard* host;
+    MsmGuard* out;
+    math::G1Affine* actual;
+};
+
+void msm_prepared_compute(const detail::PreparedSrsView& view, const MsmPreparedCall& call)
+{
+    const auto& plan = *call.plan;
+    const auto budget = msm_budget(*call.fixture,plan);
+    std::array<audit::RuntimeCopyAllowance,2> allowances{};
+    if (plan.count) {
+        allowances[0] = {msm_region(call.scratch->payload,plan,detail::MsmRegion::RowPtr),
+                         call.host->payload,size_t(8*(uint64_t(plan.buckets)+1)),false};
+        allowances[1] = {msm_region(call.scratch->payload,plan,detail::MsmRegion::TaskPrefix),
+                         call.host->payload+plan.host_prefix_offset,
+                         size_t(plan.region_size[static_cast<uint32_t>(detail::MsmRegion::TaskPrefix)]),true};
+    }
+    audit::begin_runtime_audit(allowances.data(),plan.count ? 2 : 0);
+    const auto status = detail::run_msm_prepared(call.stream,view,
+        reinterpret_cast<const Fr*>(call.scalars->payload),call.fixture->count,
+        reinterpret_cast<math::G1Affine*>(call.out->payload),call.scratch->payload,
+        call.scratch->bytes,call.host->payload,call.host->bytes,plan);
+    const auto counts = audit::end_runtime_audit();
+    check(status,"run_msm_prepared");
+    msm_require_resources_zero(counts,"prepared compute");
+    require(counts.d2h_calls == budget.windows && counts.d2h_bytes == budget.d2h &&
+            counts.h2d_calls == budget.active && counts.h2d_bytes == budget.h2d &&
+            counts.stream_sync_calls == budget.windows,"prepared exact metadata budget mismatch");
+}
+
+void msm_prepared_finish(Runtime& runtime, const MsmPreparedCall& call)
+{
+    const audit::RuntimeCopyAllowance result{
+        call.out->payload,call.actual,sizeof(math::G1Affine),false};
+    audit::begin_runtime_audit(&result,1);
+    runtime.copy_down(call.stream,call.actual,
+                      reinterpret_cast<const math::G1Affine*>(call.out->payload),1);
+    const auto status = aclrtSynchronizeStream(call.stream);
+    const auto counts = audit::end_runtime_audit();
+    check(status,"prepared result synchronize");
+    msm_require_resources_zero(counts,"prepared final");
+    require(counts.d2h_calls == 1 && counts.d2h_bytes == 96 &&
+            counts.h2d_calls == 0 && counts.h2d_bytes == 0 &&
+            counts.stream_sync_calls == 1,"prepared exact result download budget mismatch");
+    compare_g1_affine(call.actual,call.fixture->expected,"prepared "+call.fixture->name);
+}
+
+void msm_prepared_guards(Runtime& runtime, aclrtStream stream, MsmGuard& cache,
+                         const std::vector<MsmGuard*>& guards)
+{
+    cache.download(runtime,stream);
+    for (auto* guard : guards) guard->download(runtime,stream);
+    check(aclrtSynchronizeStream(stream),"prepared validation download synchronize");
+    const auto before = msm_prepared_hash(cache.bytes ? cache.initial.data()+64 : nullptr,cache.bytes);
+    const auto after = msm_prepared_hash(cache.bytes ? cache.after+64 : nullptr,cache.bytes);
+    require(before == after,"prepared full cache payload hash changed");
+    // Also compare every byte, so a hash collision cannot hide a cache write.
+    cache.verify(true,"prepared full immutable cache");
+    for (auto* guard : guards) guard->verify(false,"prepared mutable guard");
+    std::cout << "MSM_PREPARED_CACHE_IMMUTABLE_PASS bytes=" << cache.bytes
+              << " before_fnv1a64=" << before << " after_fnv1a64=" << after << '\n';
+}
+
+void test_msm_prepared_fixture(Runtime& runtime, aclrtStream stream,
+                               const std::filesystem::path& root, const std::string& name)
+{
+    const auto mark = runtime.storage_mark();
+    MsmFixture fixture(root,name);
+    const auto plan = msm_plan(fixture.count,0);
+    const auto sizes = msm_prepared_sizes(plan);
+    MsmGuard bases(runtime,stream,fixture.count*96,fixture.bases.data());
+    MsmGuard cache(runtime,stream,sizes.reusable_bytes);
+    MsmGuard scalars(runtime,stream,fixture.count*32,fixture.scalars.data());
+    MsmGuard scratch(runtime,stream,sizes.scratch_bytes);
+    MsmGuard host(runtime,stream,sizes.host_workspace_bytes,nullptr,true);
+    MsmGuard out(runtime,stream,96);
+    const auto view = msm_prepare(runtime,stream,bases,cache,plan);
+    const MsmPreparedCall call{&fixture,&plan,stream,&scalars,&scratch,&host,&out,
+                               runtime.host<math::G1Affine>(1)};
+    msm_prepared_compute(view,call);
+    msm_prepared_finish(runtime,call);
+    msm_prepared_guards(runtime,stream,cache,{&bases,&scalars,&scratch,&host,&out});
+    bases.verify(true,"prepared canonical bases");
+    scalars.verify(true,"prepared scalars");
+    runtime.release_storage(mark);
+    std::cout << "MSM_PREPARED_FIXTURE_PASS case=" << name << '\n';
+}
+
+void test_msm_prepared_preflight(Runtime& runtime, const detail::PreparedSrsView& view,
+                                 MsmGuard& bases, MsmGuard& cache,
+                                 const MsmPreparedCall& call)
+{
+    struct Cold {
+        aclrtStream stream;
+        const math::G1Affine* bases;
+        size_t bases_bytes;
+        void* cache;
+        size_t cache_bytes;
+        const detail::MsmPlan* plan;
+    };
+    const Cold cold{call.stream,reinterpret_cast<const math::G1Affine*>(bases.payload),
+                     bases.bytes,cache.payload,cache.bytes,call.plan};
+    const auto reject_cold = [&](const Cold& bad) {
+        std::optional<detail::PreparedSrsView> unpublished(view);
+        require(detail::prepare_msm_srs(bad.stream,bad.bases,bad.bases_bytes,
+                bad.cache,bad.cache_bytes,*bad.plan,unpublished) == ACL_ERROR_INVALID_PARAM &&
+                !unpublished.has_value(),"invalid cold call accepted or retained published view");
+    };
+    struct Online {
+        aclrtStream stream;
+        const Fr* scalars;
+        size_t count;
+        math::G1Affine* output;
+        void* scratch;
+        size_t scratch_bytes;
+        void* host;
+        size_t host_bytes;
+        const detail::MsmPlan* plan;
+    };
+    const Online online{call.stream,reinterpret_cast<const Fr*>(call.scalars->payload),
+        call.fixture->count,reinterpret_cast<math::G1Affine*>(call.out->payload),
+        call.scratch->payload,call.scratch->bytes,call.host->payload,call.host->bytes,call.plan};
+    const auto reject_online = [&](const Online& bad) {
+        require(detail::run_msm_prepared(bad.stream,view,bad.scalars,bad.count,bad.output,
+                bad.scratch,bad.scratch_bytes,bad.host,bad.host_bytes,*bad.plan) ==
+                ACL_ERROR_INVALID_PARAM,"invalid prepared online call accepted");
+    };
+    const uintptr_t last = UINTPTR_MAX&~uintptr_t(63);
+    audit::begin_runtime_audit(nullptr,0);
+    auto c = cold;
+    c.stream = nullptr; reject_cold(c);
+    c = cold; c.bases = nullptr; reject_cold(c);
+    c = cold; c.cache = nullptr; reject_cold(c);
+    c = cold; --c.bases_bytes; reject_cold(c);
+    c = cold; --c.cache_bytes; reject_cold(c);
+    c = cold; c.bases = reinterpret_cast<const math::G1Affine*>(bases.payload+1); reject_cold(c);
+    c = cold; c.cache = cache.payload+32; reject_cold(c);
+    c = cold; c.bases = reinterpret_cast<const math::G1Affine*>(last); reject_cold(c);
+    c = cold; c.cache = reinterpret_cast<void*>(last); reject_cold(c);
+    c = cold; c.bases_bytes = SIZE_MAX; reject_cold(c);
+    c = cold; c.cache_bytes = SIZE_MAX; reject_cold(c);
+    c = cold; c.cache = bases.payload; reject_cold(c);
+    c = cold; c.cache = bases.payload+64; reject_cold(c);
+    c = cold; c.bases = reinterpret_cast<const math::G1Affine*>(cache.payload+64); reject_cold(c);
+    auto o = online;
+    o.stream = nullptr; reject_online(o);
+    o = online; o.scalars = nullptr; reject_online(o);
+    o = online; o.output = nullptr; reject_online(o);
+    o = online; o.scratch = nullptr; reject_online(o);
+    o = online; o.host = nullptr; reject_online(o);
+    o = online; --o.scratch_bytes; reject_online(o);
+    o = online; --o.host_bytes; reject_online(o);
+    o = online; ++o.count; reject_online(o);
+    o = online; --o.count; reject_online(o);
+    o = online; o.scalars = reinterpret_cast<const Fr*>(call.scalars->payload+1); reject_online(o);
+    o = online; o.output = reinterpret_cast<math::G1Affine*>(call.out->payload+1); reject_online(o);
+    o = online; o.scratch = call.scratch->payload+32; reject_online(o);
+    o = online; o.host = call.host->payload+32; reject_online(o);
+    o = online; o.scalars = reinterpret_cast<const Fr*>(last); reject_online(o);
+    o = online; o.output = reinterpret_cast<math::G1Affine*>(last); reject_online(o);
+    o = online; o.scratch = reinterpret_cast<void*>(last); reject_online(o);
+    o = online; o.host = reinterpret_cast<void*>(last); reject_online(o);
+    o = online; o.scratch_bytes = SIZE_MAX; reject_online(o);
+    o = online; o.host_bytes = SIZE_MAX; reject_online(o);
+    // Every pair among immutable cache, scalars, output, device scratch and
+    // pinned scratch is exercised without fabricating a private descriptor.
+    o = online; o.scalars = reinterpret_cast<const Fr*>(cache.payload); reject_online(o);
+    o = online; o.output = reinterpret_cast<math::G1Affine*>(cache.payload); reject_online(o);
+    o = online; o.scratch = cache.payload; reject_online(o);
+    o = online; o.host = cache.payload; reject_online(o);
+    o = online; o.output = reinterpret_cast<math::G1Affine*>(call.scalars->payload); reject_online(o);
+    o = online; o.scalars = reinterpret_cast<const Fr*>(call.scratch->payload); reject_online(o);
+    o = online; o.host = call.scalars->payload; reject_online(o);
+    o = online; o.output = reinterpret_cast<math::G1Affine*>(call.scratch->payload); reject_online(o);
+    o = online; o.host = call.out->payload; reject_online(o);
+    o = online; o.host = call.scratch->payload; reject_online(o);
+    o = online; o.output = reinterpret_cast<math::G1Affine*>(call.scratch->payload+64); reject_online(o);
+    o = online; o.scalars = reinterpret_cast<const Fr*>(cache.payload+64); reject_online(o);
+    msm_corrupt_plans(*call.plan,[&](const detail::MsmPlan& bad) {
+        auto changed_cold = cold; changed_cold.plan = &bad; reject_cold(changed_cold);
+        auto changed_online = online; changed_online.plan = &bad; reject_online(changed_online);
+    });
+    auto mismatch = *call.plan;
+    ++mismatch.platform.aiv_cores;
+    require(detail::make_msm_plan(call.fixture->count,mismatch.platform,
+            call.plan->window_bits,mismatch),"prepared alternate platform plan failed");
+    c = cold; c.plan = &mismatch; reject_cold(c);
+    o = online; o.plan = &mismatch; reject_online(o);
+    mismatch = *call.plan;
+    ++mismatch.platform.ub_bytes;
+    require(detail::make_msm_plan(call.fixture->count,mismatch.platform,
+            call.plan->window_bits,mismatch),"prepared alternate UB plan failed");
+    c = cold; c.plan = &mismatch; reject_cold(c);
+    o = online; o.plan = &mismatch; reject_online(o);
+    const auto other_count = msm_plan(call.fixture->count+1,call.plan->window_bits);
+    o = online; o.plan = &other_count; o.count = other_count.count; reject_online(o);
+    msm_prepared_no_work(audit::end_runtime_audit(),"prepared preflight");
+
+    aclrtContext original = nullptr, other = nullptr;
+    int32_t device = 0;
+    check(aclrtGetCurrentContext(&original),"prepared preflight original context");
+    check(aclrtGetDevice(&device),"prepared preflight device");
+    check(aclrtCreateContext(&other,device),"prepared preflight other context");
+    try {
+        check(aclrtSetCurrentContext(other),"prepared preflight set other context");
+        audit::begin_runtime_audit(nullptr,0);
+        reject_online(online);
+        const auto counts = audit::end_runtime_audit();
+        check(aclrtSetCurrentContext(original),"prepared preflight restore context");
+        msm_prepared_no_work(counts,"prepared wrong current context");
+    } catch (...) {
+        audit::end_runtime_audit();
+        cleanup_check(aclrtSetCurrentContext(original),"prepared restore context on error");
+        cleanup_check(aclrtDestroyContext(other),"prepared destroy unused context on error");
+        throw;
+    }
+    check(aclrtDestroyContext(other),"prepared destroy unused context");
+    msm_prepared_guards(runtime,call.stream,cache,
+                         {&bases,call.scalars,call.scratch,call.host,call.out});
+    for (auto* guard : {&bases,call.scalars,call.scratch,call.host,call.out})
+        guard->verify(true,"prepared rejected call sentinel");
+    std::cout << "MSM_PREPARED_PREFLIGHT_PASS\n";
+}
+
+void test_msm_prepared_queued_error(Runtime& runtime, const detail::PreparedSrsView& view,
+                                   MsmGuard& bases, MsmGuard& cache,
+                                   const MsmPreparedCall& call)
+{
+    for (bool invalid_cold : {false,true}) {
+        msm_prepared_compute(view,call); // Final affine finish remains asynchronous.
+        const audit::RuntimeCopyAllowance result{call.out->payload,call.actual,96,false};
+        audit::begin_runtime_audit(&result,1);
+        runtime.copy_down(call.stream,call.actual,
+                          reinterpret_cast<const math::G1Affine*>(call.out->payload),1);
+        const auto queued = audit::end_runtime_audit();
+        msm_require_resources_zero(queued,"prepared queued legitimate result copy");
+        require(queued.d2h_calls == 1 && queued.d2h_bytes == 96 &&
+                queued.h2d_calls == 0 && queued.h2d_bytes == 0 &&
+                queued.stream_sync_calls == 0,"prepared lifetime copy unexpectedly drained");
+        audit::begin_runtime_audit(nullptr,0);
+        aclError status;
+        std::optional<detail::PreparedSrsView> unpublished(view);
+        if (invalid_cold)
+            status = detail::prepare_msm_srs(call.stream,
+                reinterpret_cast<const math::G1Affine*>(bases.payload),bases.bytes,
+                cache.payload,cache.bytes-1,*call.plan,unpublished);
+        else
+            status = detail::run_msm_prepared(call.stream,view,
+                reinterpret_cast<const Fr*>(call.scalars->payload),call.fixture->count+1,
+                reinterpret_cast<math::G1Affine*>(call.out->payload),call.scratch->payload,
+                call.scratch->bytes,call.host->payload,call.host->bytes,*call.plan);
+        const auto rejected = audit::end_runtime_audit();
+        require(status == ACL_ERROR_INVALID_PARAM &&
+                (!invalid_cold || !unpublished.has_value()),"queued-work invalid next call accepted");
+        msm_prepared_no_work(rejected,"queued-work rejected next call");
+        // No inspection or release precedes successful completion of prior work.
+        check(aclrtSynchronizeStream(call.stream),"prepared queued-work lifetime drain");
+        compare_g1_affine(call.actual,call.fixture->expected,"prepared queued-work independent oracle");
+    }
+    msm_prepared_guards(runtime,call.stream,cache,
+                         {&bases,call.scalars,call.scratch,call.host,call.out});
+    std::cout << "MSM_PREPARED_QUEUED_ERROR_LIFETIME_PASS\n";
+}
+
+void test_msm_prepared_threads(Runtime& runtime, const detail::PreparedSrsView& view,
+                              MsmGuard& cache, const MsmFixture& first,
+                              const MsmFixture& second, MsmGuard& scalar_a, MsmGuard& scalar_b)
+{
+    const auto mark = runtime.storage_mark();
+    const auto a = runtime.stream(), b = runtime.stream();
+    const auto pa = msm_plan(first.count,3), pb = msm_plan(second.count,4);
+    const auto za = msm_prepared_sizes(pa), zb = msm_prepared_sizes(pb);
+    MsmGuard sa(runtime,a,za.scratch_bytes), sb(runtime,b,zb.scratch_bytes);
+    MsmGuard ha(runtime,a,za.host_workspace_bytes,nullptr,true);
+    MsmGuard hb(runtime,b,zb.host_workspace_bytes,nullptr,true);
+    MsmGuard oa(runtime,a,96), ob(runtime,b,96);
+    const MsmPreparedCall ca{&first,&pa,a,&scalar_a,&sa,&ha,&oa,runtime.host<math::G1Affine>(1)};
+    const MsmPreparedCall cb{&second,&pb,b,&scalar_b,&sb,&hb,&ob,runtime.host<math::G1Affine>(1)};
+    check(aclrtSynchronizeStream(a),"prepared concurrent setup a");
+    check(aclrtSynchronizeStream(b),"prepared concurrent setup b");
+    aclrtContext context = nullptr;
+    check(aclrtGetCurrentContext(&context),"prepared concurrent capture context");
+    std::atomic<unsigned> ready{0};
+    std::atomic<bool> start{false};
+    std::exception_ptr errors[2];
+    const auto worker = [&](const MsmPreparedCall& call, unsigned index) {
+        ready.fetch_add(1,std::memory_order_release);
+        while (!start.load(std::memory_order_acquire)) std::this_thread::yield();
+        try {
+            check(aclrtSetCurrentContext(context),"prepared worker set captured context");
+            msm_prepared_compute(view,call);
+            msm_prepared_finish(runtime,call);
+        } catch (...) {
+            audit::end_runtime_audit();
+            errors[index] = std::current_exception();
+        }
+    };
+    std::thread ta(worker,std::cref(ca),0);
+    std::thread tb;
+    try {
+        tb = std::thread(worker,std::cref(cb),1);
+    } catch (...) {
+        start.store(true,std::memory_order_release);
+        ta.join();
+        throw;
+    }
+    while (ready.load(std::memory_order_acquire) != 2) std::this_thread::yield();
+    start.store(true,std::memory_order_release);
+    ta.join();
+    tb.join();
+    // Both drains are attempted on failure; Runtime retains ownership on unwind.
+    const auto drained_a = aclrtSynchronizeStream(a);
+    const auto drained_b = aclrtSynchronizeStream(b);
+    check(drained_a,"prepared concurrent owner drain a");
+    check(drained_b,"prepared concurrent owner drain b");
+    for (const auto& error : errors) if (error) std::rethrow_exception(error);
+    msm_prepared_guards(runtime,a,cache,{&scalar_a,&scalar_b,&sa,&sb,&ha,&hb,&oa,&ob});
+    scalar_a.verify(true,"prepared thread scalar a");
+    scalar_b.verify(true,"prepared thread scalar b");
+    runtime.release_storage(mark);
+    std::cout << "MSM_PREPARED_CONCURRENT_HOST_THREADS_PASS windows=3,4\n";
+}
+
+void test_msm_prepared_reuse(Runtime& runtime, aclrtStream stream,
+                             const std::filesystem::path& root)
+{
+    const auto mark = runtime.storage_mark();
+    std::vector<MsmFixture> fixtures;
+    fixtures.reserve(6);
+    for (const char* name : {"uniform-2049","zero-2049","ones-2049","alternating-2049"})
+        fixtures.emplace_back(root,name);
+    fixtures.push_back(fixtures.front());
+    fixtures.push_back(fixtures.front());
+    auto& random2 = fixtures.back();
+    random2.name = "independent-random2-2049";
+    const auto oracle = root/"msm-prepared"/"random2-2049";
+    random2.bases = read_g1_affine(oracle/"bases.bin",2049);
+    random2.scalars = read_fields(oracle/"scalars.bin",2049);
+    random2.expected = read_g1_affine(oracle/"expected.bin",1);
+    require(std::memcmp(random2.scalars.data(),fixtures.front().scalars.data(),2049*32) != 0,
+            "second independent random scalar vector must differ");
+    for (const auto& fixture : fixtures)
+        require(fixture.count == 2049 &&
+                std::memcmp(fixture.bases.data(),fixtures.front().bases.data(),2049*96) == 0,
+                "prepared reuse fixture SRS differs; equal counts are not sufficient");
+    const auto plan = msm_plan(2049,0);
+    const auto sizes = msm_prepared_sizes(plan);
+    MsmGuard bases(runtime,stream,2049*96,fixtures.front().bases.data());
+    MsmGuard cache(runtime,stream,sizes.reusable_bytes);
+    MsmGuard scratch(runtime,stream,sizes.scratch_bytes);
+    MsmGuard host(runtime,stream,sizes.host_workspace_bytes,nullptr,true);
+    std::vector<MsmGuard> scalars, outputs;
+    scalars.reserve(fixtures.size()); outputs.reserve(fixtures.size());
+    std::vector<math::G1Affine*> actual;
+    for (const auto& fixture : fixtures) {
+        scalars.emplace_back(runtime,stream,2049*32,fixture.scalars.data());
+        outputs.emplace_back(runtime,stream,96);
+        actual.push_back(runtime.host<math::G1Affine>(1));
+    }
+    const auto view = msm_prepare(runtime,stream,bases,cache,plan);
+    const MsmPreparedCall first{&fixtures[0],&plan,stream,&scalars[0],&scratch,&host,&outputs[0],actual[0]};
+    test_msm_prepared_preflight(runtime,view,bases,cache,first);
+    for (size_t i = 0; i < fixtures.size(); ++i) {
+        const MsmPreparedCall call{&fixtures[i],&plan,stream,&scalars[i],&scratch,&host,&outputs[i],actual[i]};
+        // Deliberately reuse dirty device and pinned scratch without clearing.
+        msm_prepared_compute(view,call);
+        msm_prepared_finish(runtime,call);
+    }
+    test_msm_prepared_queued_error(runtime,view,bases,cache,first);
+    for (uint32_t bits = 0; bits <= 20; ++bits) {
+        if (bits == 1) continue;
+        const auto window_mark = runtime.storage_mark();
+        const auto window = msm_plan(2049,bits);
+        const auto size = msm_prepared_sizes(window);
+        MsmGuard device(runtime,stream,size.scratch_bytes);
+        MsmGuard pinned(runtime,stream,size.host_workspace_bytes,nullptr,true);
+        const MsmPreparedCall call{&fixtures[0],&window,stream,&scalars[0],&device,&pinned,
+                                   &outputs[0],actual[0]};
+        msm_prepared_compute(view,call);
+        msm_prepared_finish(runtime,call);
+        msm_prepared_guards(runtime,stream,cache,{&device,&pinned,&outputs[0]});
+        runtime.release_storage(window_mark);
+        std::cout << "MSM_PREPARED_WINDOW_PASS requested_window=" << bits << '\n';
+    }
+    test_msm_prepared_threads(runtime,view,cache,fixtures[0],fixtures[5],scalars[0],scalars[5]);
+    std::vector<MsmGuard*> guards{&bases,&scratch,&host};
+    for (size_t i = 0; i < fixtures.size(); ++i) {
+        guards.push_back(&scalars[i]); guards.push_back(&outputs[i]);
+    }
+    msm_prepared_guards(runtime,stream,cache,guards);
+    bases.verify(true,"prepared reuse original bases");
+    for (auto& scalar : scalars) scalar.verify(true,"prepared reuse immutable scalar");
+    runtime.release_storage(mark);
+    std::cout << "MSM_PREPARED_DISTINCT_SCALARS_REPLAY_PASS calls=6\n";
+}
+
+void test_msm_prepared_suite(Runtime& runtime, aclrtStream stream,
+                            const std::filesystem::path& root)
+{
+    test_msm_prepared_queries();
+    test_msm_prepared_reuse(runtime,stream,root);
+    for (const auto& item : msm_cases()) {
+        if (item.first == "uniform-65536") continue; // Same explicit-only legacy case.
+        test_msm_prepared_fixture(runtime,stream,root,item.first);
+    }
+    std::cout << "MSM_PREPARED_NPU_PASS\n";
+}
 void test_msm_suite(Runtime& runtime, aclrtStream stream, const std::filesystem::path& root)
 {
     test_msm_metadata(runtime,stream);
@@ -1871,6 +2461,7 @@ void test_msm_suite(Runtime& runtime, aclrtStream stream, const std::filesystem:
     test_msm_fixture(runtime,stream,root,"uniform-4097",20);
     test_msm_replay(runtime,stream,root);
     test_msm_two_streams(runtime,root);
+    test_msm_prepared_suite(runtime,stream,root);
 }
 
 struct Arguments {

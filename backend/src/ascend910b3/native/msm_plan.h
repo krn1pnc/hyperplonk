@@ -30,6 +30,14 @@ struct MsmSchedule {
     uint32_t merge_levels = 0;
     uint64_t order_offset = 0;
 };
+struct MsmPreparedSizes {
+    uint64_t reusable_bytes = 0;
+    uint64_t scratch_bytes = 0;
+    uint64_t host_workspace_bytes = 0;
+};
+// Pure metadata queries: failures leave the caller's output unchanged.
+bool validate_msm_plan(const MsmPlan&) noexcept;
+bool query_msm_prepared_sizes(const MsmPlan&, MsmPreparedSizes&) noexcept;
 bool make_msm_plan(size_t count, const MsmPlatform&, uint32_t requested_window_bits,
                    MsmPlan& out) noexcept;
 bool make_msm_schedule(const MsmPlan&, const uint64_t* row_ptr,

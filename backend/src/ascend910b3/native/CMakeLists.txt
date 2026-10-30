@@ -39,6 +39,7 @@ target_link_libraries(hyperplonk_ascend910b3_math PUBLIC
     "${CANN_profapi_LIBRARY}" "${CANN_runtime_LIBRARY}" dl m)
 
 include(CTest)
+find_package(Threads REQUIRED)
 # This target deliberately has no ACL includes, initialization, or linkage.
 add_executable(field_math_tests tests/field_math_tests.cpp msm_plan.cpp)
 target_include_directories(field_math_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
@@ -52,6 +53,7 @@ add_executable(native_math_smoke
     tests/g1_smoke.asc
     tests/g1_chain_smoke.asc
     tests/runtime_audit.cpp)
+target_link_libraries(native_math_smoke PRIVATE Threads::Threads)
 add_executable(msm_benchmark tests/msm_benchmark.cpp tests/runtime_audit.cpp)
 foreach(runner IN ITEMS native_math_smoke msm_benchmark)
     target_link_libraries(${runner} PRIVATE hyperplonk_ascend910b3_math)

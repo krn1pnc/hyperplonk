@@ -94,6 +94,36 @@ bool make_msm_plan(size_t count, const MsmPlatform& platform, uint32_t bits,
         !round_up(cursor,64,p.workspace_bytes)) return false;
     out = p; return true;
 }
+bool validate_msm_plan(const MsmPlan& a) noexcept {
+    MsmPlan b{};
+    if (a.count > SIZE_MAX ||
+        !make_msm_plan(static_cast<size_t>(a.count),a.platform,a.window_bits,b)) return false;
+    if (a.platform.aiv_cores != b.platform.aiv_cores || a.platform.ub_bytes != b.platform.ub_bytes ||
+        a.count != b.count || a.workspace_bytes != b.workspace_bytes ||
+        a.dense_records != b.dense_records || a.fragment_records != b.fragment_records ||
+        a.host_workspace_bytes != b.host_workspace_bytes || a.host_prefix_offset != b.host_prefix_offset ||
+        a.window_bits != b.window_bits || a.windows != b.windows || a.buckets != b.buckets ||
+        a.radix_passes != b.radix_passes || a.chunks != b.chunks || a.merge_levels != b.merge_levels ||
+        a.row_blocks != b.row_blocks || a.weighted_segments != b.weighted_segments ||
+        a.weighted_levels != b.weighted_levels) return false;
+    for (unsigned i=0;i<2;++i) if (a.partial_capacity[i]!=b.partial_capacity[i]) return false;
+    for (unsigned i=0;i<msm_region_count;++i)
+        if (a.region_offset[i]!=b.region_offset[i] || a.region_size[i]!=b.region_size[i]) return false;
+    return true;
+}
+bool query_msm_prepared_sizes(const MsmPlan& p,MsmPreparedSizes& out) noexcept {
+    if (!validate_msm_plan(p)) return false;
+    MsmPreparedSizes sizes{};
+    if (p.count) {
+        const auto cache=static_cast<unsigned>(MsmRegion::MontgomeryBases);
+        sizes.reusable_bytes=p.region_size[cache];
+        // The old workspace rounds its final region up; odd counts have32B padding.
+        sizes.scratch_bytes=p.region_offset[cache];
+        sizes.host_workspace_bytes=p.host_workspace_bytes;
+    }
+    out=sizes;
+    return true;
+}
 bool make_msm_schedule(const MsmPlan& p, const uint64_t* rows,
                       uint64_t* prefix, MsmSchedule& out) noexcept {
     MsmSchedule s{};

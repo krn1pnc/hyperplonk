@@ -76,6 +76,12 @@ target/ascend910b3-native-math/native_math_smoke \
   --device 0 --fixtures target/ascend910b3-native-math/fixtures
 ```
 
+The fixture command is self-contained Python (standard library only). It preserves
+all 806 original fixture files and also writes the three files under
+`msm-prepared/random2-2049/` (809 files total), used by the default prepared-SRS
+smoke checks. Normal host/native smoke tests do not require the Rust MSM tool or
+an external oracle artifact.
+
 Use an ACL logical device ID valid in your environment; it need not match the
 physical ID printed by `npu-smi`. Missing CANN is a build error, not a CPU
 fallback. The host field-test target itself has no ACL dependency.
@@ -302,6 +308,14 @@ without a terminal subtraction. G1 add/subtract use the same generic engine
 with modulus `2p`; exceptional predicates recognize both `0` and `p` as zero.
 Every external coordinate conversion remains canonical; public field operations
 retain their canonical policy. Ingress time is included in the measurements.
+
+An optional internal prepared-SRS path separates this ingress from repeated MSMs:
+`prepare_msm_srs` synchronously creates one immutable `96*N`-byte positive-base
+Montgomery cache; `run_msm_prepared` reuses it with arbitrary changing canonical
+Fr scalars. The unsigned window algorithm, coordinate arithmetic and existing
+`run_msm` behavior are unchanged. This is a native math interface only, not a
+HyperPlonk commitment/protocol implementation or a claim that CPU10x or
+`2^25<1s` has been achieved.
 The shared CIOS loop uses signed cancellation factors only where constexpr
 coefficient bounds prove the I32 product cannot overflow: all22 Fr iterations
 and the first27 of32 Fq iterations. The remaining Fq iterations retain the
@@ -393,6 +407,26 @@ target/ascend910b3-native-math/msm_benchmark \
 # For 2^25 use 33554432 in both commands and separate input/result directories.
 ```
 
+After generating the same inputs, the optional prepared mode is:
+
+```bash
+target/ascend910b3-native-math/msm_benchmark \
+  target/msm-benchmark-inputs target/msm-benchmark-results-prepared \
+  --count 1048576 --mode prepared --reuse-count 3 --warmups 1 --samples 3
+```
+
+This example repeats the input scalar vector and reports `varying_scalars=false`;
+it is not changing-scalar evidence. Optional `--scalar-cases MANIFEST.tsv` uses
+columns `case_id`, `scalar_file`, `expected_file` (tab-separated), all with the
+same input-root `bases.bin`; relative paths resolve beside the manifest. Each
+scalar file is exactly `32*N` bytes and each expected affine point is 96 bytes.
+`--reuse-count` counts actual calls before warmups. Cold preparation, first call,
+prepared-online samples/median, actual reuse compute sum and wall time, uploads,
+setup and peak memory have separate report fields. Do not substitute the
+prepared-online median for one-shot `median_s` or mix their timing boundaries.
+Full-size performance/oracle generation remains a separate workflow; no Rust
+oracle dependency is added to the normal smoke command above.
+
 The CPU tool performs a separate reference call, one warmup and three targets.
 It excludes preparation/serialization and includes arkworks' internal MSM
 allocations. Native compute permits no allocations or unexpected explicit
@@ -436,6 +470,27 @@ cannot overlap inputs or each other; read-only inputs may alias. Bases must be
 valid subgroup points and scalars canonical; the native entrypoint does not
 perform subgroup validation or decode external packets.
 
+For repeated MSMs on fixed public bases, use `query_msm_prepared_sizes` with a
+validated plan, allocate its `reusable_bytes`, `scratch_bytes` and
+`host_workspace_bytes`, then call `prepare_msm_srs` with the canonical device
+bases and the separate cache allocation. It clears the output
+`std::optional<PreparedSrsView>` first and publishes a borrowed view only after
+successful real stream completion. The canonical bases can then be retired;
+keep the cache/context alive until every reader has completed. No owner,
+allocation or destructor synchronization is hidden in the view.
+`run_msm_prepared` takes that view, scalars and their count, output and both
+scratch buffers; it has no canonical-bases argument or online base preparation.
+The cache is immutable, context/platform/count-bound and window-independent.
+Each concurrent reader must own disjoint mutable scalar/output/scratch storage
+and use a stream in the captured context. Its final output remains asynchronous
+as with `run_msm`, and errors do not cancel earlier queued work. Cache and both
+scratch addresses require 64-byte alignment; scalar/output alignment is 32 bytes.
+The separate cache is exactly `96*N` bytes, while prepared scratch ends at the
+original `MontgomeryBases` offset; do not subtract cache bytes from a rounded
+one-shot capacity (odd counts retain 32 bytes of final padding). For `N=0` these
+three capacities are zero, but output still requires 96 valid bytes; cold
+preparation still completes its stream before publishing the empty view.
+
 Unlike the Fr launchers, `run_msm` performs CPU metadata scheduling. For each
 of `W=ceil(255/c)` windows it downloads exactly `8*(2^c+1)` bytes of CSR row
 pointers and synchronizes the caller's stream. The existing one upload per active
@@ -463,6 +518,13 @@ Production kernels compile separately in `msm_sort.asc`, `msm_rows.asc`,
 `msm_accumulate.asc` and `msm_reduce.asc`; orchestration remains ordinary C++.
 MSM fixtures use independent Python affine arithmetic with known generator
 coefficients, distinct large-case bases and small-case direct-MSM cross-checks.
+
+The extra prepared reuse fixture copies the exact 2049 public affine bases from
+`msm/uniform-2049`, uses a fresh isolated full-domain Fr RNG, and computes its
+expected result by direct Python affine multiply-and-add over those decoded
+points. It never derives expected output from generator coefficients, point
+progression, the native implementation or a Rust-only test dependency. Existing
+806 fixture bytes and seeded streams are unchanged.
 Run a single case without unrelated Cube tests using:
 
 ```bash
@@ -481,6 +543,14 @@ metadata address ranges and requires zero other explicit copies and zero
 compute allocations/frees. Final output download is separately audited as
 96 bytes and one stream sync. `MSM_METADATA_NPU_PASS` and `MSM_NPU_PASS` augment,
 not replace, the existing field/G1 markers; host acceptance adds `MSM_HOST_PASS`.
+
+The default suite additionally checks prepared queries/preflight, empty inputs,
+all automatic/2–20-bit windows, dirty-scratch replay with distinct scalar vectors,
+full cache-byte immutability/guards, queued-error lifetimes and two simultaneous
+host threads sharing only the immutable cache. `MSM_PREPARED_NPU_PASS`,
+`MSM_PREPARED_DISTINCT_SCALARS_REPLAY_PASS` and
+`MSM_PREPARED_CONCURRENT_HOST_THREADS_PASS` augment rather than replace the old
+markers. Single `--msm-case` mode and field-only modes retain their old scope.
 
 The milestone host/NPU gate passes metadata scenarios, full MSM, replay and
 two-stream checks. It forces the mixed-vote-tail-192 fixture to window6,
