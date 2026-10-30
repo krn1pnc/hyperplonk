@@ -26,13 +26,13 @@ uint32_t levels(uint64_t n, uint64_t fan_in = 64) noexcept {
 bool make_msm_plan(size_t count, const MsmPlatform& platform, uint32_t bits,
                    MsmPlan& out) noexcept {
     if (count > UINT32_MAX || !platform.aiv_cores || platform.ub_bytes < msm_required_ub_bytes ||
-        (bits && (bits < 2 || bits > 16))) return false;
+        (bits && (bits < 2 || bits > 20))) return false;
     MsmPlan p{}; p.platform = platform; p.count = count;
     if (!bits) {
         uint32_t ell = 0;
         for (uint64_t v = count ? count - 1 : 0; v; v >>= 1) ++ell;
         bits = ell - ell / 3 + 2;
-        if (bits > 16) bits = 16;
+        if (bits > 20) bits = 20;
     }
     p.window_bits = bits;
     if (!count) { out = p; return true; }

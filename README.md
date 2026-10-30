@@ -333,24 +333,25 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Balanced tasks and weighted reduction checkpoint | 1 | 3 | median | 2.678516 |
 | 2^20 | Seeded accumulators and radix24 add/sub checkpoint | 1 | 3 | median | 2.240379 |
 | 2^20 | Cached G1 and redundant Montgomery checkpoint | 1 | 3 | median | 1.809510 |
-| 2^20 | Current bounded signed cancellation | 1 | 3 | median | 1.768655 |
+| 2^20 | Current signed cancellation, automatic16-bit window | 1 | 3 | median | 1.768330 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
+| 2^25 | Current signed cancellation, automatic19-bit window | 1 | 3 | median | 42.170683 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
-Bounded signed cancellation reduces million-point latency by2.26% versus the
-cached/redundant checkpoint, but remains slower than CPU. The current binary
-passed one warmup and three exact targets plus full native field, G1, MSM,
-replay and two-stream regressions. The unchanged host contracts retain their
-full regression evidence. An independent private-arithmetic probe passed960
-pairs/164160 exact checks covering REDC, aliases, live masks, `0/p`, inversion
-and canonical serialization.
-The warmed `a1ce28d` full-scale checkpoint also matched every CPU result and
-passed strict resource audits, but is5.76% slower than CPU. It predates signed
-cancellation; no full-scale signed-cancellation timing is claimed. Only the old
-pre-cache NPU figures are1+1 diagnostic checkpoints. CPU10x and`2^25<1s`
-remain unmet.
+The current native implementation supports2–20-bit windows. Removing the old
+16-bit ceiling lets the unchanged cuZK heuristic select19 bits at`2^25`,
+reducing the number of windows from16 to14. Complete warmed MSM is2.24%
+faster than the matched CPU reference at this size, but remains slower at`2^20`.
+Both sizes passed one warmup and three exact targets with strict resource
+audits. Full host capacity/rejection checks and native field, G1, MSM, replay
+and two-stream regressions passed, including high bucket bits, a fifth radix
+pass and explicit17/20-bit MSM cases.
+An independent private-arithmetic probe passed960 pairs/164160 exact checks
+covering REDC, aliases, live masks, `0/p`, inversion and canonical serialization.
+Only the old pre-cache NPU figures are1+1 diagnostic checkpoints.
+CPU10x and`2^25<1s` remain unmet.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
 integrated. Source, raw records, input/binary identities and rejected candidates
 remain under `target/msm-hotspot/`; those generated artifacts are not
@@ -373,9 +374,10 @@ allocations. Native compute permits no allocations or unexpected explicit
 copies. The current `2^20` run transfers8388736B D2H and12440440B H2D metadata
 with16 internal syncs; device/pinned scratch is180736576/2949440B, including
 the base cache and stable task order. No numerical intermediate is transferred
-to the host. The measured `a1ce28d` `2^25` checkpoint transfers8388736B D2H
-and52312968B H2D metadata with16 syncs; device/pinned scratch is
-4247032448/5505408B. Final96B D2H and one completion wait are separate.
+to the host. At`2^25`, the current19-bit plan transfers58720368B D2H and
+163712580B H2D metadata with14 syncs; device/pinned scratch is
+4597747968/29360512B. The larger window trades metadata/scratch capacity for
+less point accumulation. Final96B D2H and one completion wait are separate.
 Sorting and CSR are unchanged; point-coordinate arithmetic is Vector throughout.
 
 
@@ -399,8 +401,8 @@ Device scratch includes `96*N` bytes for the packed Montgomery base cache;
 allocate the queried plan capacity rather than retaining an older byte count.
 Pinned scratch also includes the bounded task-order metadata; no point or field
 values are added to numerical host transfers.
-`N <= UINT32_MAX`; explicit windows are 2–16 bits, with 0 selecting the cuZK-style
-automatic heuristic capped at 16. Platform requirements are at least one AIV
+`N <= UINT32_MAX`; explicit windows are2–20 bits, with0 selecting the cuZK-style
+automatic heuristic capped at20. Platform requirements are at least one AIV
 and 190400 UB bytes, including the8192-byte SDK reservation (5952 bytes spare
 on the queried196352-byte UB). Input/output addresses must be32-byte aligned, scratch addresses
 64-byte aligned. Allocate host scratch with `aclrtMallocHost`; if aligning an

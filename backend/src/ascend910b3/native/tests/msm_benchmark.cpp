@@ -43,7 +43,7 @@ struct Options {
     uint32_t warmups=1,samples=1,window_bits=0,count=1U<<20;
 };
 void usage(std::ostream& out){
-    out<<"usage: msm_benchmark INPUT_DIRECTORY OUTPUT_DIRECTORY [--warmups N] [--samples N] [--window-bits 0|2..16] [--count N]\n"
+    out<<"usage: msm_benchmark INPUT_DIRECTORY OUTPUT_DIRECTORY [--warmups N] [--samples N] [--window-bits 0|2..20] [--count N]\n"
         <<"Ordinary complete-MSM benchmark; profiling is not enabled.\n"
         <<"Defaults: 1 warmup, 1 target sample; warmups >= 0, samples >= 1.\n"
         <<"Loads/uploads inputs and allocates borrowed scratch once. Every call must\n"
@@ -91,7 +91,7 @@ int main(int argc,char**argv){try{
         require(input_count?!have_count:(window?!have_window:(samples?!have_samples:!have_warmups)),"duplicate option");
         const uint32_t count=parse_count(argv[++i],samples||input_count);
         if(window){
-            require(count==0||(count>=2&&count<=16),"window bits must be 0 or 2..16");
+            require(count==0||(count>=2&&count<=20),"window bits must be 0 or 2..20");
             options.window_bits=count;have_window=true;
         }else if(input_count){options.count=count;have_count=true;}
         else if(samples){options.samples=count;have_samples=true;}

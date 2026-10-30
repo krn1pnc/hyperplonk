@@ -1349,11 +1349,12 @@ bool msm_same_record(const MsmRecord& a, const MsmRecord& b)
 {
     return a.bucket == b.bucket && a.index == b.index;
 }
-void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsigned pattern)
+void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsigned pattern,
+                            uint32_t window_bits)
 {
     const auto mark = runtime.storage_mark();
     detail::MsmPlan plan{};
-    require(detail::build_msm_plan(n,plan,16),"metadata MSM platform initialization failed");
+    require(detail::build_msm_plan(n,plan,window_bits),"metadata MSM platform initialization failed");
     MsmGuard scratch(runtime,stream,plan.workspace_bytes);
     std::vector<MsmRecord> expected(n);
     for (size_t i = 0; i < n; ++i) {
@@ -1362,6 +1363,8 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
         if (pattern == 2) key = uint32_t((i%2 ? 0xabcd : 0x1234) ^ ((i%16)<<8));
         if (pattern == 3) key = uint32_t((i%23)*0x101);
         if (pattern == 4) key = uint32_t((i*4051+17)&65535);
+        if (pattern == 5) key = i == 0 ? (1u << window_bits)-1 :
+            i == 1 ? 1u << 16 : uint32_t((i*4051+17)&((1u << window_bits)-1));
         expected[i] = {key,i%3 == 0 ? UINT32_MAX-1 : uint32_t((1u<<24)+i)};
     }
     std::vector<MsmRecord> input(msm_round8(n),{0,UINT32_MAX});
@@ -1507,7 +1510,8 @@ void test_msm_metadata(Runtime& runtime, aclrtStream stream)
 {
     for (size_t n : {1,7,8,9,2047,2048,2049,4097})
         for (unsigned pattern = 0; pattern < 5; ++pattern)
-            test_msm_metadata_case(runtime,stream,n,pattern);
+            test_msm_metadata_case(runtime,stream,n,pattern,16);
+    test_msm_metadata_case(runtime,stream,4097,5,17);
     std::cout << "MSM_METADATA_NPU_PASS\n";
 }
 
@@ -1861,6 +1865,8 @@ void test_msm_suite(Runtime& runtime, aclrtStream stream, const std::filesystem:
     test_msm_fixture(runtime,stream,root,"uniform-257",4);
     test_msm_fixture(runtime,stream,root,"alternating-2049",12);
     test_msm_fixture(runtime,stream,root,"uniform-4097",16);
+    test_msm_fixture(runtime,stream,root,"mixed-exceptions-65",17);
+    test_msm_fixture(runtime,stream,root,"uniform-4097",20);
     test_msm_replay(runtime,stream,root);
     test_msm_two_streams(runtime,root);
 }
@@ -1905,11 +1911,11 @@ Arguments arguments(int argc, char** argv)
             have_msm_case = true;
         } else if (option == "--window-bits" && !result.window_override) {
             require(!value.empty() && value.find_first_not_of("0123456789") == std::string::npos,
-                    "window bits must be 0 or 2..16");
+                    "window bits must be 0 or 2..20");
             size_t consumed = 0;
             const auto parsed = std::stoul(value,&consumed);
-            require(consumed == value.size() && (parsed == 0 || (parsed >= 2 && parsed <= 16)),
-                    "window bits must be 0 or 2..16");
+            require(consumed == value.size() && (parsed == 0 || (parsed >= 2 && parsed <= 20)),
+                    "window bits must be 0 or 2..20");
             result.window_bits = uint32_t(parsed);
             result.window_override = true;
         } else {

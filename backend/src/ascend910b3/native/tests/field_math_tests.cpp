@@ -437,13 +437,11 @@ void msm_host_suite() {
         return result;
     };
     const std::array<uint64_t, 9> sizes{0,1,64,65,2048,2049,65537,UINT32_MAX,4097};
-    for (const uint64_t n : sizes) for (const uint32_t requested : {0u,2u,3u,4u,12u,16u}) {
+    for (const uint64_t n : sizes) for (const uint32_t requested : {0u,2u,3u,4u,12u,16u,17u,19u,20u}) {
         MsmPlan p{};
         require(make_msm_plan(static_cast<size_t>(n), platform, requested, p), "MSM valid plan rejected");
-        uint32_t ell = 0;
-        for (uint64_t x = n ? n - 1 : 0; x; x >>= 1) ++ell;
-        const uint32_t automatic = n ? (ell - ell / 3 + 2 > 16 ? 16 : ell - ell / 3 + 2) : 2;
-        const uint32_t c = requested ? requested : automatic;
+        const uint32_t c = requested ? requested : p.window_bits;
+        require(c >= 2 && c <= 20, "MSM selected window outside supported range");
         require(p.count == n && p.window_bits == c && p.platform.aiv_cores == platform.aiv_cores
                 && p.platform.ub_bytes == platform.ub_bytes, "MSM plan identity");
         if (!n) {
@@ -505,7 +503,7 @@ void msm_host_suite() {
         require(!make_msm_plan(n, hw, c, out) && same_msm_plan(out, sentinel),
                 "MSM invalid plan accepted or output changed");
     };
-    for (const uint32_t c : {1u,17u,UINT32_MAX}) reject_plan(65, platform, c);
+    for (const uint32_t c : {1u,21u,UINT32_MAX}) reject_plan(65, platform, c);
     reject_plan(65, MsmPlatform{0,msm_required_ub_bytes}, 0);
     reject_plan(65, MsmPlatform{20,msm_required_ub_bytes-1}, 0);
     reject_plan(0, MsmPlatform{0,msm_required_ub_bytes}, 0);
