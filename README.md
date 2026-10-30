@@ -53,6 +53,10 @@ Internal C++ batch function templates provide Fr/Fq add, subtract, negate,
 multiply, square, inverse and complete wide reduction. One `FieldVector<Field>`
 engine uses exact int32 Vector arithmetic across 48 independent elements,
 radix-2^12 digits (Fr22/Fq32), and UB-only deferred-carry CIOS Montgomery multiplication.
+Modular add/subtract transiently pack pairs of digits into radix-2^24 carry
+words (Fr11/Fq16), then unpack into the same public radix12 banks. This shared
+integer-only path halves carry rounds without enlarging UB or changing
+Montgomery multiplication; all live G1 exception masks remain untouched.
 Fr inner product and shared-scalar vector multiplication retain signed INT8 Cube
 products, exact unsigned correction and Scalar packing/reduction.
 `g1.h` adds concrete host/device `G1Affine` and `G1Jacobian` value types over Fq.
@@ -260,6 +264,9 @@ Level-zero tasks are stably grouped by length across SIMD lanes, but retain
 their original point order and partial-output positions. Weighted segments fit
 the available AIV lanes with a minimum span of16; their final tree uses fan-in4
 to avoid serial work on a nearly empty SIMD tile.
+Every nonempty partial, merge and weighted-tree task seeds its accumulator from
+the first point instead of adding it to identity. Weighted segments similarly
+seed running/local sums while preserving per-lane descending order and tails.
 Weighted segments restore absolute bucket weights; only the final result is
 normalized. Each input scalar contributes one unsigned digit record per window,
 including digit zero; bucket zero is excluded from point accumulation.
@@ -310,15 +317,17 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Previous radix15 Vector MSM | 1 | 1 | target | 47.703695 |
 | 2^20 | Radix12 before resident-Montgomery IO | 1 | 3 | median | 4.589340 |
 | 2^20 | Resident-Montgomery IO checkpoint | 1 | 3 | median | 4.189697 |
-| 2^20 | Current balanced tasks and weighted reduction | 1 | 3 | median | 2.678516 |
+| 2^20 | Balanced tasks and weighted reduction checkpoint | 1 | 3 | median | 2.678516 |
+| 2^20 | Current seeded accumulators and radix24 add/sub | 1 | 3 | median | 2.240379 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
-Balanced tasks and hardware-sized weighted reductions reduce million-point
-latency by 36.07% versus the resident-Montgomery checkpoint, but remain slower
-than CPU. The current binary passed one warmup and three exact targets; no new
-`2^25` timing is claimed.
+Seeded accumulators and transient radix24 addition/subtraction reduce
+million-point latency by 16.36% versus the balanced-reduction checkpoint, but
+remain slower than CPU. The current binary passed one warmup and three exact
+targets plus full host/native field, G1, MSM, replay and two-stream regressions.
+No new `2^25` timing is claimed.
 The old NPU and `2^25` figures remain 1+1 diagnostic checkpoints. These do not
 establish final performance acceptance: CPU10x and `2^25<1s` remain unmet.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
@@ -340,11 +349,13 @@ target/ascend910b3-native-math/msm_benchmark \
 The CPU tool performs a separate reference call, one warmup and three targets.
 It excludes preparation/serialization and includes arkworks' internal MSM
 allocations. Native compute permits no allocations or unexpected explicit
-copies. At `2^20`, metadata is8388736B D2H,8389632B H2D with16 internal syncs;
-device/pinned scratch is79745600/2621760B. At `2^25`, metadata is8388736B D2H,
-16779264B H2D with16 syncs; scratch is1023447680/3146112B. Final96B D2H and
-one completion wait are separate. Sorting, CSR and metadata scheduling remain
-unchanged; point-coordinate arithmetic is Vector throughout.
+copies. The current `2^20` run transfers8388736B D2H and12440440B H2D metadata
+with16 internal syncs; device/pinned scratch is180736576/2949440B, including
+the base cache and stable task order. No numerical intermediate is transferred
+to the host. The historical pre-cache `2^25` checkpoint used8388736B D2H,
+16779264B H2D metadata and1023447680/3146112B scratch; these are not current
+plan capacities. Final96B D2H and one completion wait are separate.
+Sorting and CSR are unchanged; point-coordinate arithmetic is Vector throughout.
 
 
 

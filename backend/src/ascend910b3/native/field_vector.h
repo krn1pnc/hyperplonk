@@ -335,36 +335,137 @@ private:
         multiply_rows(dst, dst, tmp(0), true);
         add_rows(dst, dst, difference);
     }
-    HP_FIELD_VECTOR_HEAVY __aicore__ inline void add_mod(I32 dst, I32 a, I32 b) {
-        fill(tmp(2), 0);
-        for (uint32_t j = 0; j < digits; ++j) {
-            add(tmp(1), digit(a, j), digit(b, j));
-            add(tmp(1), tmp(1), tmp(2));
-            normalize(digit(acc(), j), tmp(2), tmp(1));
+    static constexpr uint32_t packed_digits = (digits + 1) / 2;
+    static constexpr uint32_t packed_bits = 2 * radix_bits;
+    static constexpr int32_t packed_radix = radix * radix;
+    static_assert(4 * packed_digits <= 64 && 2 * packed_digits <= 32,
+                  "packed add/sub exceeds the existing scratch arena");
+
+    // Compact pairs of radix12 rows without lane reads. The final unpaired
+    // digit, if any, has a zero high half; no source row beyond digits is read.
+    __aicore__ inline void pack24(I32 dst, I32 src) {
+        if constexpr (digits / 2 != 0) {
+            AscendC::Muls(dst, digit(src, 1), radix, uint64_t(lanes),
+                          uint8_t(digits / 2),
+                          AscendC::UnaryRepeatParams{1, 1, 6, 12});
+            vector_barrier();
         }
-        copy(digit(acc(), digits), tmp(2));
-        subtract_modulus(dst, acc());
+        if constexpr (digits % 2 != 0) fill(digit(dst, packed_digits - 1), 0);
+        AscendC::Add(dst, dst, src, uint64_t(lanes), uint8_t(packed_digits),
+                     AscendC::BinaryRepeatParams{1, 1, 1, 6, 6, 12});
+        vector_barrier();
+    }
+    __aicore__ inline void normalize24(I32 low, I32 carry, I32 s) {
+        shift_right(carry, s, packed_bits);
+        bit_and(low, s, tmp(5));
+    }
+    // a,b are normalized packed rows. Signed t lies in [-Q,Q-1], so a
+    // logical shift of its uint32 representation extracts exactly borrow=0/1.
+    // Leaves the final borrow in tmp0; clobbers tmp1/tmp4, not tmp2/tmp3/tmp5.
+    __aicore__ inline void subtract24(I32 dst, I32 a, I32 b) {
+        fill(tmp(0), 0);
+        for (uint32_t j = 0; j < packed_digits; ++j) {
+            sub(tmp(1), digit(a, j), digit(b, j));
+            sub(tmp(1), tmp(1), tmp(0));
+            shift_right(tmp(0), tmp(1), 31);
+            muls(tmp(4), tmp(0), packed_radix);
+            add(digit(dst, j), tmp(1), tmp(4));
+        }
+    }
+    // src is accumulator sum, disjoint from dst and odd. Stage every odd half
+    // before the strided stores; in particular dst may overwrite all of bank6.
+    __aicore__ inline void unpack24(I32 dst, I32 src, I32 odd) {
+        AscendC::ShiftRight(as_unsigned(odd), as_unsigned(src), radix_bits,
+                            uint64_t(lanes), uint8_t(packed_digits),
+                            AscendC::UnaryRepeatParams{1, 1, 6, 6});
+        vector_barrier();
+        AscendC::And(src.template ReinterpretCast<uint16_t>(),
+                    src.template ReinterpretCast<uint16_t>(),
+                    tmp(15).template ReinterpretCast<uint16_t>(),
+                    uint64_t(2 * lanes), uint8_t(packed_digits),
+                    AscendC::BinaryRepeatParams{1, 1, 1, 6, 6, 0});
+        vector_barrier();
+        AscendC::Adds(dst, src, int32_t(0), uint64_t(lanes),
+                      uint8_t(packed_digits),
+                      AscendC::UnaryRepeatParams{1, 1, 12, 6});
+        vector_barrier();
+        if constexpr (digits / 2 != 0) {
+            AscendC::Adds(digit(dst, 1), odd, int32_t(0), uint64_t(lanes),
+                          uint8_t(digits / 2),
+                          AscendC::UnaryRepeatParams{1, 1, 12, 6});
+            vector_barrier();
+        }
+    }
+
+    // R11: only add/sub transiently use radix24. Accumulator rows [0,n),
+    // [n,2n), [2n,3n), [3n,4n) hold a,b,sum,odd; bank6 holds p,difference.
+    // Pack BOTH operands before touching bank6 or dst: a/b/dst may alias each
+    // other or bank6. G1 slots never overlap accumulator, bank7, or tmp0..5.
+    // tmp0=borrow/selection, tmp1=work, tmp2=carry, tmp3=add high,
+    // tmp4=borrow*Q or p*borrow, tmp5=Q-1. No helper here writes tmp6..15;
+    // tmp15 is read-only. Existing digits-wide row helpers are not used on
+    // compact tensors, so they cannot cross these packed scratch boundaries.
+    HP_FIELD_VECTOR_HEAVY __aicore__ inline void add_mod(I32 dst, I32 a, I32 b) {
+        auto packed_a = acc();
+        auto packed_b = digit(acc(), packed_digits);
+        auto sum = digit(acc(), 2 * packed_digits);
+        auto odd = digit(acc(), 3 * packed_digits);
+        auto modulus = bank(6);
+        auto difference = digit(bank(6), packed_digits);
+        pack24(packed_a, a);
+        pack24(packed_b, b);
+        pack24(modulus, bank(7));
+        fill(tmp(5), packed_radix - 1);
+        fill(tmp(2), 0);
+        for (uint32_t j = 0; j < packed_digits; ++j) {
+            add(tmp(1), digit(packed_a, j), digit(packed_b, j));
+            add(tmp(1), tmp(1), tmp(2));
+            normalize24(digit(sum, j), tmp(2), tmp(1));
+        }
+        copy(tmp(3), tmp(2));
+        subtract24(difference, sum, modulus);
+        // A+B = high*Q^n+sum. It is >=p iff high-final_borrow>=0.
+        // Select sum only when this signed difference is negative.
+        sub(tmp(1), tmp(3), tmp(0));
+        shift_right(tmp(0), tmp(1), 31);
+        AscendC::Sub(sum, sum, difference, uint64_t(lanes),
+                     uint8_t(packed_digits),
+                     AscendC::BinaryRepeatParams{1, 1, 1, 6, 6, 6});
+        vector_barrier();
+        AscendC::Mul(sum, sum, tmp(0), uint64_t(lanes),
+                     uint8_t(packed_digits),
+                     AscendC::BinaryRepeatParams{1, 1, 1, 6, 6, 0});
+        vector_barrier();
+        AscendC::Add(sum, sum, difference, uint64_t(lanes),
+                     uint8_t(packed_digits),
+                     AscendC::BinaryRepeatParams{1, 1, 1, 6, 6, 6});
+        vector_barrier();
+        // The selected result is now entirely in acc, BEFORE bank6-aliasing
+        // dst stores can destroy difference. A+B<2p makes it canonical.
+        unpack24(dst, sum, odd);
     }
     HP_FIELD_VECTOR_HEAVY __aicore__ inline void sub_mod(I32 dst, I32 a, I32 b) {
-        fill(tmp(0), 0);
-        for (uint32_t j = 0; j < digits; ++j) {
-            adds(tmp(1), digit(a, j), radix);
-            sub(tmp(1), tmp(1), digit(b, j));
-            sub(tmp(1), tmp(1), tmp(0));
-            shift_right(tmp(2), tmp(1), radix_bits);
-            bit_and(digit(dst, j), tmp(1), tmp(15));
-            muls(tmp(0), tmp(2), -1);
-            adds(tmp(0), tmp(0), 1);
-        }
-        // The n-digit subtraction is modulo R. If it borrowed, adding p
-        // overflows R once; deliberately discard only that final carry.
+        auto packed_a = acc();
+        auto packed_b = digit(acc(), packed_digits);
+        auto sum = digit(acc(), 2 * packed_digits);
+        auto odd = digit(acc(), 3 * packed_digits);
+        auto modulus = bank(6);
+        pack24(packed_a, a);
+        pack24(packed_b, b);
+        pack24(modulus, bank(7));
+        fill(tmp(5), packed_radix - 1);
+        subtract24(sum, packed_a, packed_b);
+        // tmp0 remains the final borrow throughout correction. If it is 1,
+        // adding p overflows Q^n once; discard only that final base-Q carry.
         fill(tmp(2), 0);
-        for (uint32_t j = 0; j < digits; ++j) {
-            muls(tmp(4), tmp(0), Params::modulus_digits[j]);
-            add(tmp(1), digit(dst, j), tmp(4));
+        for (uint32_t j = 0; j < packed_digits; ++j) {
+            mul(tmp(4), digit(modulus, j), tmp(0));
+            add(tmp(1), digit(sum, j), tmp(4));
             add(tmp(1), tmp(1), tmp(2));
-            normalize(digit(dst, j), tmp(2), tmp(1));
+            normalize24(digit(sum, j), tmp(2), tmp(1));
         }
+        // -p<A-B<p, so the corrected result is in [0,p).
+        unpack24(dst, sum, odd);
     }
 
     HP_FIELD_VECTOR_HEAVY __aicore__ inline void montgomery(I32 dst, I32 a, I32 b) {
