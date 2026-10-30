@@ -1519,12 +1519,14 @@ const std::vector<std::pair<std::string,size_t>>& msm_cases()
 {
     static const std::vector<std::pair<std::string,size_t>> cases = [] {
         std::vector<std::pair<std::string,size_t>> result;
-        for (size_t n : {0,1,2,15,16,17,63,64,65,255,256,257,2047,2048,2049,4097,8193,65536,47,48,49,95,96,97})
+        for (size_t n : {0,1,2,15,16,17,63,64,65,255,256,257,2047,2048,2049,4097,8193,65536,47,48,49,95,96,97,127,128,129})
             result.emplace_back("uniform-"+std::to_string(n),n);
         for (const auto& item : std::vector<std::pair<std::string,size_t>>{
             {"zero-2049",2049},{"ones-2049",2049},{"hot-65537",65537},
             {"identity-2049",2049},{"cancel-2048",2048},{"alternating-2049",2049},{"boundary-257",257},
-            {"mixed-exceptions-65",65},{"mixed-vote-tail-192",192}})
+            {"mixed-exceptions-65",65},{"mixed-vote-tail-192",192},
+            {"mixed-vote-tail-196",196},
+            {"mixed-vote-tail-256",256},{"mixed-vote-tail-260",260}})
             result.push_back(item);
         return result;
     }();

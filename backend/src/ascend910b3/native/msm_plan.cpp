@@ -42,9 +42,10 @@ bool make_msm_plan(size_t count, const MsmPlatform& platform, uint32_t bits,
     p.chunks = static_cast<uint32_t>(ceil_div(count,2048));
     p.merge_levels = levels(ceil_div(count,64));
     p.row_blocks = static_cast<uint32_t>(ceil_div(uint64_t(p.buckets)+1,256));
-    // Fit one 48-lane segment tile per available AIV, without making tiny
-    // segments pay predominantly for absolute-weight restoration.
-    const uint64_t ideal_segment = ceil_div(uint64_t(p.buckets)-1,uint64_t(platform.aiv_cores)*48);
+    // Fit one packed-coordinate point tile per available AIV, without making
+    // tiny segments pay predominantly for absolute-weight restoration.
+    const uint64_t ideal_segment = ceil_div(uint64_t(p.buckets)-1,
+                                            uint64_t(platform.aiv_cores)*msm_point_lanes);
     const uint32_t segment_length = ideal_segment < 16 ? 16 : static_cast<uint32_t>(ideal_segment);
     p.weighted_segments = static_cast<uint32_t>(ceil_div(uint64_t(p.buckets)-1,segment_length));
     // The weighted tail has much less parallel work than bucket partials.

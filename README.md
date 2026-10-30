@@ -271,7 +271,7 @@ Weighted segments restore absolute bucket weights; only the final result is
 normalized. Each input scalar contributes one unsigned digit record per window,
 including digit zero; bucket zero is excluded from point accumulation.
 
-Production point stages use `g1_vector.h`: 48 lanes process independent
+Production point stages use `g1_vector.h`: 64 lanes process independent
 partial-sum tasks, merge tasks or weighted segments inside each AIV. The shared
 Fr/Fq engine batches digit-row products with repeat strides and defers carry
 propagation until the eliminated Montgomery coefficient and final carry sweep.
@@ -282,6 +282,18 @@ Private generic and mixed additions use `Z1*Z2*H` directly rather than the
 equivalent projectively scaled `(4X,8Y,2Z)` tuple. This removes four modular
 doublings per addition without changing equal/opposite/identity selections,
 the public value types, or packed HBM record formats.
+
+The same `G1VectorEngine<Lanes,Packed>` formulas now process64 points per AIV
+in base preparation, partial sums/merges and weighted reduction. Normalized
+radix12 coordinate digits use exact I16 storage in UB; shared Fr/Fq arithmetic
+and controls remain I32. DAV2201 supports I32→I16 narrowing but not direct
+I16→I32 Cast: widening uses integer Gather, odd-lane shifts and U16 masking,
+with explicit I32 mask restoration. No floating-point conversion is used.
+The packed engine consumes186112B including the8192B SDK reserve. Final
+affine normalization retains the default48-lane full engine and inverse banks
+(190400B including reserve), which determines the unchanged global UB gate.
+Lane width and UB packing do not change192-byte HBM Jacobian records.
+
 One NPU ingress kernel converts bases into a `96*N`-byte HBM workspace once per
 `run_msm` call, amortized across all windows. Private coordinates retain
 normalized Montgomery representatives in `[0,2p)` in both UB and packed HBM
@@ -338,24 +350,31 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Seeded accumulators and radix24 add/sub checkpoint | 1 | 3 | median | 2.240379 |
 | 2^20 | Cached G1 and redundant Montgomery checkpoint | 1 | 3 | median | 1.809510 |
 | 2^20 | Signed cancellation checkpoint | 1 | 3 | median | 1.768330 |
-| 2^20 | Current unscaled point addition, automatic16-bit window | 1 | 3 | median | 1.667716 |
+| 2^20 | Unscaled point addition checkpoint, `97e663f` | 1 | 3 | median | 1.667716 |
+| 2^20 | Current packed64 point stages, automatic16-bit window | 1 | 3 | median | 1.475164 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
 | 2^25 | Signed cancellation and wider-window checkpoint | 1 | 3 | median | 42.170683 |
-| 2^25 | Current unscaled point addition, automatic19-bit window | 1 | 3 | median | 39.730811 |
+| 2^25 | Unscaled point addition checkpoint, `97e663f` | 1 | 3 | median | 39.730811 |
+| 2^25 | Current packed64 point stages, automatic19-bit window | 1 | 3 | median | 34.338448 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
 The current native implementation supports2–20-bit windows. Removing the old
 16-bit ceiling lets the unchanged cuZK heuristic select19 bits at`2^25`,
-reducing the number of windows from16 to14. Complete warmed MSM is8.52%
-faster than the matched CPU reference at this size, but remains slower at`2^20`.
+reducing the number of windows from16 to14. With packed64 point stages,
+complete warmed MSM is25.56% faster than the matched CPU reference at this size,
+and7.22% faster at`2^20`.
 Both sizes passed one warmup and three exact targets with strict resource
 audits. Full host capacity/rejection checks and native field, G1, MSM, replay
 and two-stream regressions passed, including high bucket bits, a fifth radix
-pass and explicit17/20-bit MSM cases.
-An independent private-arithmetic probe passed960 pairs/164160 exact checks
+pass and explicit17/20-bit MSM cases. New point cases isolate equality votes
+in lanes47/48/63, a next-tile tail, and127/128/129 input boundaries.
+An earlier48-lane private-arithmetic probe passed960 pairs/164160 exact checks
 covering REDC, aliases, live masks, `0/p`, inversion and canonical serialization.
+The packed64 integer-bridge probe separately covers all4096 digit values,
+permuted lane/row patterns, source/coordinate guards, I32 return-mask reuse and
+real HBM interleave-index restoration; all655360 output bytes match its CPU oracle.
 Only the old pre-cache NPU figures are1+1 diagnostic checkpoints.
 CPU10x and`2^25<1s` remain unmet.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not

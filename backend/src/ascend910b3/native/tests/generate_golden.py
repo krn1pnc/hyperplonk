@@ -322,13 +322,16 @@ def generate_g1(output):
 def generate_msm(output):
     """Native MSM inputs with an independent generator-coefficient oracle."""
     counts = (0, 1, 2, 15, 16, 17, 63, 64, 65, 255, 256, 257,
-              2047, 2048, 2049, 4097, 8193, 65536, 47, 48, 49, 95, 96, 97)
+              2047, 2048, 2049, 4097, 8193, 65536, 47, 48, 49, 95, 96, 97,
+              127, 128, 129)
     cases = [(f"uniform-{count}", count) for count in counts]
     cases.extend((
         ("zero-2049", 2049), ("ones-2049", 2049), ("hot-65537", 65537),
         ("identity-2049", 2049), ("cancel-2048", 2048),
         ("alternating-2049", 2049), ("boundary-257", 257),
         ("mixed-exceptions-65", 65), ("mixed-vote-tail-192", 192),
+        ("mixed-vote-tail-196", 196),
+        ("mixed-vote-tail-256", 256), ("mixed-vote-tail-260", 260),
     ))
 
     # Generate a genuine distinct-point SRS-like sequence once with one affine
@@ -383,19 +386,20 @@ def generate_msm(output):
             coefficients = [cycle[index % len(cycle)] for index in range(count)]
             bases = [g1_affine_mul(G1_GENERATOR, a % P) for a in coefficients]
             scalars = [1] * count
-        elif name == "mixed-vote-tail-192":
-            # One four-point task in each of buckets 1..48. Only lane 47
-            # encounters equal points on iteration three; lanes 0..46 do not.
+        elif name.startswith("mixed-vote-tail-"):
+            # One four-point task per nonzero bucket. The last lane and the
+            # next tile's tail alone encounter equality followed by cancellation.
             coefficients, bases, scalars = [], [], []
-            for bucket in range(1, 49):
-                pattern = (1, 2, 3, -6) if bucket == 48 else (1, 2, 4, 8)
+            for bucket in range(1, count // 4 + 1):
+                exceptional = bucket >= (64 if count == 260 else count // 4)
+                pattern = (1, 2, 3, -6) if exceptional else (1, 2, 4, 8)
                 coefficients.extend(pattern)
                 bases.extend(g1_affine_mul(G1_GENERATOR, a % P) for a in pattern)
                 scalars.extend([bucket] * 4)
 
         coefficient = sum(a * s for a, s in zip(coefficients, scalars)) % P
         expected = g1_affine_mul(G1_GENERATOR, coefficient)
-        if count <= 65 or name == "mixed-vote-tail-192":
+        if count <= 65 or name.startswith("mixed-vote-tail-"):
             # Cross-check the coefficient shortcut using actual input points,
             # ordinary affine multiplication and addition, not bucket formulas.
             direct = None

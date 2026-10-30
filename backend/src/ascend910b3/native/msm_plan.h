@@ -6,6 +6,7 @@ namespace hyperplonk::ascend910b3::detail {
 // Vector field arena88512B + G1 banks/IO/tables93696B + SDK8192B reserve.
 // Includes the cached packed24 2p table (3072B); 5952B remains on 196352B UB.
 inline constexpr uint64_t msm_required_ub_bytes = 190400;
+inline constexpr uint32_t msm_point_lanes = 64;
 struct MsmPlatform { uint32_t aiv_cores = 0; uint64_t ub_bytes = 0; };
 enum class MsmRegion : uint32_t {
     RecordsA, RecordsB, RadixFragments, RadixHistogram, RadixDescriptors,
