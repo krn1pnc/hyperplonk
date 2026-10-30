@@ -519,29 +519,92 @@ private:
         sub_mod_impl<true>(dst, a, b, packed_2p);
     }
 
+    static constexpr int32_t signed_n0prime =
+        Params::n0prime <= radix / 2 ? Params::n0prime : Params::n0prime - radix;
+    static constexpr uint64_t signed_n0_magnitude =
+        signed_n0prime < 0 ? uint64_t(-int64_t(signed_n0prime)) : uint64_t(signed_n0prime);
+    static_assert(Params::n0prime > 0 && Params::n0prime < radix,
+                  "Montgomery cancellation requires a nonzero radix digit");
+
+    // Highest input digit for normalized integers <2p. Double every public
+    // modulus digit and subtract one with borrow: doubling only the top digit
+    // would miss carry from below. No __aicore__ Digits::operator[] is called.
+    static constexpr uint32_t redundant_top_digit_bound() {
+        uint32_t carry = 0;
+        uint32_t borrow = 1;
+        uint32_t top = 0;
+        for (uint32_t j = 0; j < digits; ++j) {
+            const uint32_t doubled = 2 * uint32_t(Params::modulus_digits.values[j]) + carry;
+            carry = doubled / uint32_t(radix);
+            const uint32_t digit_value = doubled % uint32_t(radix);
+            top = (digit_value + uint32_t(radix) - borrow) % uint32_t(radix);
+            borrow = digit_value < borrow ? 1 : 0;
+        }
+        return top;
+    }
+    static constexpr uint32_t safe_signed_cancellation_prefix() {
+        constexpr uint64_t mask = radix - 1;
+        constexpr uint64_t top = redundant_top_digit_bound();
+        uint64_t prior_modulus = 0;
+        uint64_t carry_bound = 0;
+        for (uint32_t i = 0; i < digits; ++i) {
+            uint64_t diagonal_bound = 0;
+            for (uint32_t j = 0; j <= i; ++j) {
+                const uint64_t a_bound = j == digits - 1 ? top : mask;
+                const uint64_t b_bound = i - j == digits - 1 ? top : mask;
+                diagonal_bound += a_bound * b_bound;
+            }
+            if (i != 0) prior_modulus += Params::modulus_digits.values[i];
+            // Before q_i: H_i = sum(a_j*b_{i-j}) + sum_{j=1..i}
+            // p_j*q_{i-j} + c_{i-1}. Every q is in [0,B-1].
+            const uint64_t head_bound =
+                diagonal_bound + mask * prior_modulus + carry_bound;
+            // Require an exact signed int32 product, never wrapping Muls.
+            // All bound arithmetic is uint64 (n<=32, B=4096).
+            if (signed_n0_magnitude * head_bound > uint64_t(0x7fffffff)) return i;
+            carry_bound =
+                (head_bound + mask * uint64_t(Params::modulus_digits.values[0])) / radix;
+        }
+        return digits;
+    }
+    static constexpr uint32_t signed_cancellation_prefix = safe_signed_cancellation_prefix();
+
+    // Only the first row supplies q. Congruent signed n0 gives the same low
+    // radix digit; the final U16 And also clears the negative product's high
+    // halfword. The unmasked specialization is used only for the proven prefix.
+    template<bool unmasked>
+    __aicore__ inline void montgomery_iteration(I32 a, I32 b, uint32_t i) {
+        auto product = bank(6);
+        auto active = digit(acc(), i);
+        multiply_rows(product, a, digit(b, i), true);
+        add_rows(active, active, product);
+        if constexpr (unmasked) {
+            muls(tmp(4), active, signed_n0prime);
+        } else {
+            bit_and(tmp(4), active, tmp(15));
+            muls(tmp(4), tmp(4), Params::n0prime);
+        }
+        bit_and(tmp(4), tmp(4), tmp(15));
+        multiply_rows(product, bank(7), tmp(4), true);
+        add_rows(active, active, product);
+        shift_right(tmp(2), active, radix_bits);
+        add(digit(active, 1), digit(active, 1), tmp(2));
+    }
+
     // Normalized a,b<2p; inputs are disjoint from acc and engine bank6.
     // dst may alias a/b; canonical dst cannot be bank6 (difference scratch).
     // Engine bank7 remains immutable. Both policies share the product/carry
     // algorithm and preserve tmp6..15.
     template<bool canonical>
     HP_FIELD_VECTOR_HEAVY __aicore__ inline void montgomery_impl(I32 dst, I32 a, I32 b) {
-        auto product = bank(6);
         AscendC::Duplicate(acc(), int32_t(0), 65 * lanes);
         vector_barrier();
         // Radix12 bounds each coefficient by 2*n*4096*4095:
         // Fq1073479680, Fr738017280. Carry only the eliminated coefficient.
-        for (uint32_t i = 0; i < digits; ++i) {
-            auto active = digit(acc(), i);
-            multiply_rows(product, a, digit(b, i), true);
-            add_rows(active, active, product);
-            bit_and(tmp(4), active, tmp(15));
-            muls(tmp(4), tmp(4), Params::n0prime);
-            bit_and(tmp(4), tmp(4), tmp(15));
-            multiply_rows(product, bank(7), tmp(4), true);
-            add_rows(active, active, product);
-            shift_right(tmp(2), active, radix_bits);
-            add(digit(active, 1), digit(active, 1), tmp(2));
-        }
+        for (uint32_t i = 0; i < signed_cancellation_prefix; ++i)
+            montgomery_iteration<true>(a, b, i);
+        for (uint32_t i = signed_cancellation_prefix; i < digits; ++i)
+            montgomery_iteration<false>(a, b, i);
         auto result = digit(acc(), digits);
         for (uint32_t j = 0; j < digits; ++j) {
             shift_right(tmp(2), digit(result, j), radix_bits);
