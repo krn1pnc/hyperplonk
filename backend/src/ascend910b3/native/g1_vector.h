@@ -19,12 +19,29 @@ class G1Vector {
 public:
     using Point = uint32_t;
     static constexpr uint32_t tile_size = FieldVector<Fq>::tile_size;
-    static constexpr uint32_t ub_bytes = FieldVector<Fq>::arena_bytes + 79872;
+    static constexpr uint32_t ub_bytes = FieldVector<Fq>::arena_bytes + 93696;
     static constexpr uint64_t absent = UINT64_MAX;
 
     __aicore__ inline G1Vector() {
         fq_.pipe_.InitBuffer(extra_, extra_bytes);
         extra_memory_ = extra_.Get<uint8_t>();
+        // Immutable public tables are built once per core, not per point load.
+        for (uint32_t j = 0; j < digits; ++j)
+            fq_.fill(digit(cached_mont_one(), j), Params::r_digits[j]);
+        for (uint32_t j = 0; j < FieldVector<Fq>::packed_digits; ++j)
+            fq_.fill(digit(cached_packed_2p(), j),
+                     FieldVector<Fq>::packed_double_modulus.values[j]);
+        fq_.sync<AscendC::HardEvent::V_S>();
+        auto affine_indices = load_indices(true);
+        auto jacobian_indices = load_indices(false);
+        for (uint32_t word = 0; word < Fq::word_count; ++word)
+            for (uint32_t lane = 0; lane < tile_size; ++lane) {
+                affine_indices.SetValue(word * tile_size + lane,
+                                        lane * affine_bytes + word * 4);
+                jacobian_indices.SetValue(word * tile_size + lane,
+                                          lane * jacobian_bytes + word * 4);
+            }
+        fq_.sync<AscendC::HardEvent::S_V>();
     }
 
     __aicore__ inline void set_identity(Point p) {
@@ -113,8 +130,8 @@ public:
         load<false, false>(dst, src, byte_offsets, valid);
     }
 
-    // Internal MSM records contain packed Montgomery integers, not radix-12
-    // banks. Public canonical loaders above retain their conversion semantics.
+    // Internal MSM records contain normalized packed Montgomery integers <2p,
+    // not radix-12 banks. Public canonical loaders retain their conversion.
     __aicore__ inline void load_affine_montgomery(
         Point dst, GM_ADDR src, const uint64_t* byte_offsets, uint32_t valid) {
         load<true, true>(dst, src, byte_offsets, valid);
@@ -155,9 +172,10 @@ public:
         mul(slot(9), slot(12), slot(7));
         mul(slot(9), slot(9), slot(6));
         canonical_one(slot(6));
-        mul(slot(7), slot(8), slot(6));
+        // Public affine coordinates must leave the redundant domain.
+        fq_.montgomery(slot(7), slot(8), slot(6));
         fq_.pack_words(fq_.i32(0), slot(7));
-        mul(slot(7), slot(9), slot(6));
+        fq_.montgomery(slot(7), slot(9), slot(6));
         fq_.pack_words(fq_.i32(word_soa_bytes), slot(7));
         interleave(true);
         fq_.sync<AscendC::HardEvent::V_MTE3>();
@@ -205,14 +223,20 @@ private:
     static constexpr uint32_t metadata_offset = raw_offset + raw_bytes;
     static constexpr uint32_t metadata_stride = 64;
     static constexpr uint32_t metadata_bytes = tile_size * metadata_stride;
-    static constexpr uint32_t extra_bytes = metadata_offset + metadata_bytes;
+    static constexpr uint32_t mont_one_offset = metadata_offset + metadata_bytes;
+    static constexpr uint32_t affine_indices_offset = mont_one_offset + field_bytes;
+    static constexpr uint32_t jacobian_indices_offset = affine_indices_offset + word_soa_bytes;
+    static constexpr uint32_t packed_2p_offset = jacobian_indices_offset + word_soa_bytes;
+    static constexpr uint32_t packed_2p_bytes =
+        FieldVector<Fq>::packed_digits * tile_size * sizeof(int32_t);
+    static constexpr uint32_t extra_bytes = packed_2p_offset + packed_2p_bytes;
     static constexpr uint32_t zero_row_offset = 3 * word_soa_bytes;
-    static_assert(tile_size == 48 && field_bytes == 6144 && extra_bytes == 79872);
-    static_assert(raw_bytes == 9216 && metadata_bytes == 3072);
+    static_assert(tile_size == 48 && field_bytes == 6144 && extra_bytes == 93696);
+    static_assert(raw_bytes == 9216 && metadata_bytes == 3072 && packed_2p_bytes == 3072);
     static_assert(FieldVector<Fq>::arena_bytes + extra_bytes == ub_bytes);
     static_assert(ub_bytes + 8192 == detail::msm_required_ub_bytes);
     static_assert(zero_row_offset + tile_size * 4 <= FieldVector<Fq>::raw_mask);
-    static_assert((raw_offset | metadata_offset | extra_bytes) % 32 == 0);
+    static_assert((raw_offset | metadata_offset | packed_2p_offset | extra_bytes) % 32 == 0);
 
     __aicore__ inline I32 slot(uint32_t index) {
         return index < 6 ? fq_.bank(index) :
@@ -223,32 +247,81 @@ private:
     }
     __aicore__ inline Bytes raw() { return extra_memory_[raw_offset]; }
     __aicore__ inline Bytes meta() { return extra_memory_[metadata_offset]; }
+    __aicore__ inline I32 cached_mont_one() {
+        return extra_memory_[mont_one_offset].ReinterpretCast<int32_t>();
+    }
+    __aicore__ inline I32 cached_packed_2p() {
+        return extra_memory_[packed_2p_offset].ReinterpretCast<int32_t>();
+    }
+    __aicore__ inline U32 load_indices(bool affine) {
+        return extra_memory_[affine ? affine_indices_offset : jacobian_indices_offset]
+            .ReinterpretCast<uint32_t>();
+    }
     __aicore__ inline void copy_field(I32 dst, I32 src) {
-        // tmp15 is the permanent radix mask; only transient tmp0 is available.
-        fq_.fill(fq_.tmp(0), 1);
-        fq_.multiply_rows(dst, src, fq_.tmp(0), true);
+        AscendC::Adds(dst, src, int32_t(0), uint64_t(tile_size), uint8_t(digits),
+                      AscendC::UnaryRepeatParams{1, 1, 6, 6});
+        fq_.vector_barrier();
     }
     __aicore__ inline void mont_one(I32 dst) {
-        for (uint32_t j = 0; j < digits; ++j)
-            fq_.fill(digit(dst, j), Params::r_digits[j]);
+        copy_field(dst, cached_mont_one());
     }
     __aicore__ inline void canonical_one(I32 dst) {
         fq_.fill_bank(dst, 0);
         fq_.fill(digit(dst, 0), 1);
     }
-    __aicore__ inline void add(I32 dst, I32 a, I32 b) { fq_.add_mod(dst, a, b); }
-    __aicore__ inline void sub(I32 dst, I32 a, I32 b) { fq_.sub_mod(dst, a, b); }
-    __aicore__ inline void mul(I32 dst, I32 a, I32 b) { fq_.montgomery(dst, a, b); }
+    // Private coordinates stay normalized in [0,2p); public FieldVector
+    // operations keep their canonical p policy and share these same cores.
+    __aicore__ inline void add(I32 dst, I32 a, I32 b) {
+        fq_.add_mod_redundant(dst, a, b, cached_packed_2p());
+    }
+    __aicore__ inline void sub(I32 dst, I32 a, I32 b) {
+        fq_.sub_mod_redundant(dst, a, b, cached_packed_2p());
+    }
+    __aicore__ inline void mul(I32 dst, I32 a, I32 b) {
+        fq_.montgomery_redundant(dst, a, b);
+    }
     __aicore__ inline void square(I32 dst, I32 a) { mul(dst, a, a); }
 
-    // Exact digit-sum test, not integer Compare/Select or Scalar lane reads.
-    // tmp12 is the reduction workspace; dst may be tmp12 or tmp13.
+    // Exact row-sum tree, also safe with field==workspace. Its first stage
+    // consumes both halves before the next stage; an odd middle row survives.
+    __aicore__ inline void sum_digit_rows(I32 workspace, I32 field) {
+        if constexpr (digits == 1) {
+            fq_.copy(workspace, field);
+        } else {
+            uint32_t half = (digits + 1) / 2;
+            AscendC::Add(workspace, field, digit(field, half), uint64_t(tile_size),
+                          uint8_t(digits - half), AscendC::BinaryRepeatParams{1, 1, 1, 6, 6, 6});
+            fq_.vector_barrier();
+            if constexpr (digits % 2)
+                fq_.adds(digit(workspace, half - 1), digit(field, half - 1), 0);
+            for (uint32_t active = half; active > 1; active = half) {
+                half = (active + 1) / 2;
+                AscendC::Add(workspace, workspace, digit(workspace, half),
+                              uint64_t(tile_size), uint8_t(active - half),
+                              AscendC::BinaryRepeatParams{1, 1, 1, 6, 6, 6});
+                fq_.vector_barrier();
+                // An odd unpaired row is already in place outside the writes.
+            }
+        }
+    }
+    // Zero modulo p has exactly two representatives in [0,2p): 0 and p.
+    // Engine bank6 is disjoint from every G1 slot0..16. tmp12 holds the first
+    // mask; tmp6..11/13..15 are preserved unless they are the requested dst.
+    // dst is a control row, disjoint from bank6, and field is a G1 slot.
     __aicore__ inline void nonzero(I32 dst, I32 field) {
-        fq_.fill(fq_.tmp(12), 0);
-        for (uint32_t j = 0; j < digits; ++j)
-            fq_.add(fq_.tmp(12), fq_.tmp(12), digit(field, j));
-        fq_.adds(dst, fq_.tmp(12), 1048575);
-        fq_.shift_right(dst, dst, 20);
+        auto workspace = fq_.bank(6);
+        sum_digit_rows(workspace, field);
+        // Normalized digits have sum <=32*4095<2^20.
+        fq_.adds(fq_.tmp(12), workspace, 1048575);
+        fq_.shift_right(fq_.tmp(12), fq_.tmp(12), 20);
+        fq_.subtract_rows(workspace, field, fq_.bank(7));
+        fq_.multiply_rows(workspace, workspace, workspace, false);
+        // Each difference is in [-4095,4095]; 32*4095^2 =
+        // 536608800 <2^29. Every tree sum and the final bias stay int32-safe.
+        sum_digit_rows(workspace, workspace);
+        fq_.adds(workspace, workspace, 536870911);
+        fq_.shift_right(workspace, workspace, 29);
+        fq_.mul(dst, fq_.tmp(12), workspace);
     }
     __aicore__ inline void complement(I32 mask) {
         fq_.muls(mask, mask, -1);
@@ -417,16 +490,10 @@ private:
         }
         constexpr uint32_t coordinates = affine ? 2 : 3;
         for (uint32_t c = 0; c < coordinates; ++c) {
-            fq_.sync<AscendC::HardEvent::V_S>();
-            auto indices = fq_.u32(FieldVector<Fq>::offsets);
-            for (uint32_t w = 0; w < Fq::word_count; ++w)
-                for (uint32_t lane = 0; lane < tile_size; ++lane)
-                    indices.SetValue(w * tile_size + lane,
-                                     lane * stride + c * 48 + w * 4);
-            fq_.sync<AscendC::HardEvent::S_V>();
-            fq_.gather(fq_.u32(FieldVector<Fq>::soa_lhs),
-                       raw().ReinterpretCast<uint32_t>(), indices,
-                       Fq::word_count * tile_size);
+            AscendC::Gather(fq_.u32(FieldVector<Fq>::soa_lhs),
+                            raw().ReinterpretCast<uint32_t>(), load_indices(affine),
+                            uint32_t(c * 48), Fq::word_count * tile_size);
+            fq_.vector_barrier();
             fq_.unpack(slot(dst + c), fq_.u32(FieldVector<Fq>::soa_lhs));
             if constexpr (!montgomery)
                 mul(slot(dst + c), slot(dst + c), slot(6));
@@ -452,7 +519,8 @@ private:
         for (uint32_t c = 0; c < coordinates; ++c) {
             auto field = slot(src + c);
             if constexpr (!montgomery) {
-                mul(slot(7), field, slot(6));
+                // Canonical external Jacobian/affine output boundary.
+                fq_.montgomery(slot(7), field, slot(6));
                 field = slot(7);
             } else if constexpr (affine) {
                 if (c == 1) {

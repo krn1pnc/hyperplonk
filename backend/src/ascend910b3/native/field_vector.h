@@ -341,6 +341,26 @@ private:
     static_assert(4 * packed_digits <= 64 && 2 * packed_digits <= 32,
                   "packed add/sub exceeds the existing scratch arena");
 
+    // Public constants only: double p in packed radix24, including carry.
+    // The same construction serves Fr/Fq; G1 caches only its Fq table in UB.
+    struct PackedModulusDigits { int32_t values[packed_digits]{}; };
+    static constexpr PackedModulusDigits double_packed_modulus() {
+        PackedModulusDigits result{};
+        int32_t carry = 0;
+        for (uint32_t j = 0; j < packed_digits; ++j) {
+            int32_t value = Params::modulus_digits.values[2 * j];
+            if (2 * j + 1 < digits)
+                value += radix * Params::modulus_digits.values[2 * j + 1];
+            value = 2 * value + carry;
+            result.values[j] = value & (packed_radix - 1);
+            carry = value >> packed_bits;
+        }
+        return result;
+    }
+    static constexpr auto packed_double_modulus = double_packed_modulus();
+    static_assert(Params::modulus_digits.values[digits - 1] < radix / 4,
+                  "redundant Montgomery products require 4p < R");
+
     // Compact pairs of radix12 rows without lane reads. The final unpaired
     // digit, if any, has a zero high half; no source row beyond digits is read.
     __aicore__ inline void pack24(I32 dst, I32 src) {
@@ -397,15 +417,32 @@ private:
         }
     }
 
+    // Pack/copy only after BOTH operands have been staged: a/b may be bank6.
+    // The prepacked table is immutable and disjoint from engine scratch.
+    template<bool prepacked>
+    __aicore__ inline void load_packed_modulus(I32 dst, I32 modulus) {
+        if constexpr (prepacked) {
+            AscendC::Adds(dst, modulus, int32_t(0), uint64_t(lanes),
+                          uint8_t(packed_digits),
+                          AscendC::UnaryRepeatParams{1, 1, 6, 6});
+            vector_barrier();
+        } else {
+            pack24(dst, modulus);
+        }
+    }
+
     // R11: only add/sub transiently use radix24. Accumulator rows [0,n),
-    // [n,2n), [2n,3n), [3n,4n) hold a,b,sum,odd; bank6 holds p,difference.
+    // [n,2n), [2n,3n), [3n,4n) hold a,b,sum,odd; bank6 holds m,difference.
     // Pack BOTH operands before touching bank6 or dst: a/b/dst may alias each
     // other or bank6. G1 slots never overlap accumulator, bank7, or tmp0..5.
     // tmp0=borrow/selection, tmp1=work, tmp2=carry, tmp3=add high,
-    // tmp4=borrow*Q or p*borrow, tmp5=Q-1. No helper here writes tmp6..15;
+    // tmp4=borrow*Q or m*borrow, tmp5=Q-1. No helper here writes tmp6..15;
     // tmp15 is read-only. Existing digits-wide row helpers are not used on
     // compact tensors, so they cannot cross these packed scratch boundaries.
-    HP_FIELD_VECTOR_HEAVY __aicore__ inline void add_mod(I32 dst, I32 a, I32 b) {
+    // Inputs are in [0,m), where m is p or 2p. They never alias acc.
+    template<bool prepacked>
+    HP_FIELD_VECTOR_HEAVY __aicore__ inline void add_mod_impl(
+        I32 dst, I32 a, I32 b, I32 packed_or_radix_modulus) {
         auto packed_a = acc();
         auto packed_b = digit(acc(), packed_digits);
         auto sum = digit(acc(), 2 * packed_digits);
@@ -414,7 +451,7 @@ private:
         auto difference = digit(bank(6), packed_digits);
         pack24(packed_a, a);
         pack24(packed_b, b);
-        pack24(modulus, bank(7));
+        load_packed_modulus<prepacked>(modulus, packed_or_radix_modulus);
         fill(tmp(5), packed_radix - 1);
         fill(tmp(2), 0);
         for (uint32_t j = 0; j < packed_digits; ++j) {
@@ -424,7 +461,7 @@ private:
         }
         copy(tmp(3), tmp(2));
         subtract24(difference, sum, modulus);
-        // A+B = high*Q^n+sum. It is >=p iff high-final_borrow>=0.
+        // A+B = high*Q^n+sum. It is >=m iff high-final_borrow>=0.
         // Select sum only when this signed difference is negative.
         sub(tmp(1), tmp(3), tmp(0));
         shift_right(tmp(0), tmp(1), 31);
@@ -441,10 +478,12 @@ private:
                      AscendC::BinaryRepeatParams{1, 1, 1, 6, 6, 6});
         vector_barrier();
         // The selected result is now entirely in acc, BEFORE bank6-aliasing
-        // dst stores can destroy difference. A+B<2p makes it canonical.
+        // dst stores can destroy difference. A+B<2m needs one correction.
         unpack24(dst, sum, odd);
     }
-    HP_FIELD_VECTOR_HEAVY __aicore__ inline void sub_mod(I32 dst, I32 a, I32 b) {
+    template<bool prepacked>
+    HP_FIELD_VECTOR_HEAVY __aicore__ inline void sub_mod_impl(
+        I32 dst, I32 a, I32 b, I32 packed_or_radix_modulus) {
         auto packed_a = acc();
         auto packed_b = digit(acc(), packed_digits);
         auto sum = digit(acc(), 2 * packed_digits);
@@ -452,11 +491,11 @@ private:
         auto modulus = bank(6);
         pack24(packed_a, a);
         pack24(packed_b, b);
-        pack24(modulus, bank(7));
+        load_packed_modulus<prepacked>(modulus, packed_or_radix_modulus);
         fill(tmp(5), packed_radix - 1);
         subtract24(sum, packed_a, packed_b);
         // tmp0 remains the final borrow throughout correction. If it is 1,
-        // adding p overflows Q^n once; discard only that final base-Q carry.
+        // adding m overflows Q^n once; discard only that final base-Q carry.
         fill(tmp(2), 0);
         for (uint32_t j = 0; j < packed_digits; ++j) {
             mul(tmp(4), digit(modulus, j), tmp(0));
@@ -464,11 +503,28 @@ private:
             add(tmp(1), tmp(1), tmp(2));
             normalize24(digit(sum, j), tmp(2), tmp(1));
         }
-        // -p<A-B<p, so the corrected result is in [0,p).
+        // -m<A-B<m, so the corrected result is in [0,m).
         unpack24(dst, sum, odd);
     }
+    __aicore__ inline void add_mod(I32 dst, I32 a, I32 b) {
+        add_mod_impl<false>(dst, a, b, bank(7));
+    }
+    __aicore__ inline void sub_mod(I32 dst, I32 a, I32 b) {
+        sub_mod_impl<false>(dst, a, b, bank(7));
+    }
+    __aicore__ inline void add_mod_redundant(I32 dst, I32 a, I32 b, I32 packed_2p) {
+        add_mod_impl<true>(dst, a, b, packed_2p);
+    }
+    __aicore__ inline void sub_mod_redundant(I32 dst, I32 a, I32 b, I32 packed_2p) {
+        sub_mod_impl<true>(dst, a, b, packed_2p);
+    }
 
-    HP_FIELD_VECTOR_HEAVY __aicore__ inline void montgomery(I32 dst, I32 a, I32 b) {
+    // Normalized a,b<2p; inputs are disjoint from acc and engine bank6.
+    // dst may alias a/b; canonical dst cannot be bank6 (difference scratch).
+    // Engine bank7 remains immutable. Both policies share the product/carry
+    // algorithm and preserve tmp6..15.
+    template<bool canonical>
+    HP_FIELD_VECTOR_HEAVY __aicore__ inline void montgomery_impl(I32 dst, I32 a, I32 b) {
         auto product = bank(6);
         AscendC::Duplicate(acc(), int32_t(0), 65 * lanes);
         vector_barrier();
@@ -492,9 +548,23 @@ private:
             bit_and(digit(result, j), digit(result, j), tmp(15));
             add(digit(result, j + 1), digit(result, j + 1), tmp(2));
         }
-        // Canonical a,b imply result<2p. Retain its high row; finish every
-        // operand read before writing dst, including the dst==a==b case.
-        subtract_modulus(dst, result);
+        // 4p<R gives REDC(a*b)<p+4p^2/R<2p<R, so the high
+        // normalized row is zero. Finish ALL input reads before writing dst,
+        // including dst==a==b. Canonical boundaries subtract p exactly once.
+        if constexpr (canonical) {
+            subtract_modulus(dst, result);
+        } else {
+            AscendC::Adds(dst, result, int32_t(0), uint64_t(lanes),
+                          uint8_t(digits),
+                          AscendC::UnaryRepeatParams{1, 1, 6, 6});
+            vector_barrier();
+        }
+    }
+    __aicore__ inline void montgomery(I32 dst, I32 a, I32 b) {
+        montgomery_impl<true>(dst, a, b);
+    }
+    __aicore__ inline void montgomery_redundant(I32 dst, I32 a, I32 b) {
+        montgomery_impl<false>(dst, a, b);
     }
 
     // p-2 is public. Compute its bits from the original u32 parameters, so
@@ -511,7 +581,9 @@ private:
     }
     // Montgomery-in/Montgomery-out primitive shared with the in-kernel G1 engine.
     // Input is copied before exponentiation; banks4/5 and arithmetic scratch are
-    // clobbered. This is not a conversion or a host/kernel launch boundary.
+    // clobbered. Input may be <2p: each product is canonical after its
+    // subtraction, even when the unchanged bank4 base is redundant.
+    // This is not a conversion or a host/kernel launch boundary.
     HP_FIELD_VECTOR_HEAVY __aicore__ inline void inverse_montgomery(I32 dst, I32 input) {
         for (uint32_t j = 0; j < digits; ++j)
             copy(digit(bank(4), j), digit(input, j));

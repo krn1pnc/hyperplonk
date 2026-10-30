@@ -279,10 +279,19 @@ Partial sums use exact mixed-affine addition for freshly loaded affine bases.
 Generic and mixed additions retain every exceptional case; an exact tile-wide
 vote skips doubling only when no lane needs the equal-point result.
 One NPU ingress kernel converts bases into a `96*N`-byte HBM workspace once per
-`run_msm` call, amortized across all windows. Internal coordinates remain packed
-Montgomery integers in both UB and HBM; public inputs and final output remain
-canonical. Ingress time is included in the complete-MSM measurements below.
+`run_msm` call, amortized across all windows. Private coordinates retain
+normalized Montgomery representatives in `[0,2p)` in both UB and packed HBM
+records. Since both domains satisfy `4p<R`, CIOS products remain below `2p`
+without a terminal subtraction. G1 add/subtract use the same generic engine
+with modulus `2p`; exceptional predicates recognize both `0` and `p` as zero.
+Every external coordinate conversion remains canonical; public field operations
+retain their canonical policy. Ingress time is included in the measurements.
 No per-Fq host launches or numerical host transfers are added.
+Each AIV caches Montgomery one, both load-index tables and packed `2p` in UB.
+Exact digit-tree predicates and masked-repeat copies preserve live exception
+masks. Count-mode `Adds` was rejected after a combined equal-point diagnostic
+showed a corrupted scratch copy; explicit mask/repeat addressing passed the
+same case and full regression. No general SDK limitation is inferred.
 Bucket materialization copies Montgomery 192-byte tuples and synthesizes
 empty-bucket identities; it does not perform Montgomery conversions or field
 arithmetic. Its UB tile is 64 records, with public prefix metadata controlling
@@ -318,15 +327,18 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Radix12 before resident-Montgomery IO | 1 | 3 | median | 4.589340 |
 | 2^20 | Resident-Montgomery IO checkpoint | 1 | 3 | median | 4.189697 |
 | 2^20 | Balanced tasks and weighted reduction checkpoint | 1 | 3 | median | 2.678516 |
-| 2^20 | Current seeded accumulators and radix24 add/sub | 1 | 3 | median | 2.240379 |
+| 2^20 | Seeded accumulators and radix24 add/sub checkpoint | 1 | 3 | median | 2.240379 |
+| 2^20 | Current cached G1 and redundant Montgomery coordinates | 1 | 3 | median | 1.809510 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
-Seeded accumulators and transient radix24 addition/subtraction reduce
-million-point latency by 16.36% versus the balanced-reduction checkpoint, but
-remain slower than CPU. The current binary passed one warmup and three exact
-targets plus full host/native field, G1, MSM, replay and two-stream regressions.
+Cached G1 tables and redundant internal coordinates reduce million-point
+latency by 19.23% versus the seeded/radix24 checkpoint, but remain slower than
+CPU. The current binary passed one warmup and three exact targets plus full
+host/native field, G1, MSM, replay and two-stream regressions. An independent
+private-arithmetic probe passed960 pairs/164160 exact checks covering REDC,
+aliases, live masks, `0/p`, inversion and canonical serialization.
 No new `2^25` timing is claimed.
 The old NPU and `2^25` figures remain 1+1 diagnostic checkpoints. These do not
 establish final performance acceptance: CPU10x and `2^25<1s` remain unmet.
@@ -380,7 +392,8 @@ Pinned scratch also includes the bounded task-order metadata; no point or field
 values are added to numerical host transfers.
 `N <= UINT32_MAX`; explicit windows are 2–16 bits, with 0 selecting the cuZK-style
 automatic heuristic capped at 16. Platform requirements are at least one AIV
-and 176576 UB bytes. Input/output addresses must be 32-byte aligned, scratch addresses
+and 190400 UB bytes, including the8192-byte SDK reservation (5952 bytes spare
+on the queried196352-byte UB). Input/output addresses must be32-byte aligned, scratch addresses
 64-byte aligned. Allocate host scratch with `aclrtMallocHost`; if aligning an
 interior pointer, retain and free the original allocation. Output and scratch
 cannot overlap inputs or each other; read-only inputs may alias. Bases must be
