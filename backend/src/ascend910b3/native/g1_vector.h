@@ -432,18 +432,17 @@ private:
         fq_.mul(same, same, fq_.tmp(9));
         if constexpr (affine_rhs)
             fq_.mul(fq_.tmp(10), fq_.tmp(10), fq_.tmp(9));
-        // 2*Z1*Z2*H is algebraically the existing cuZK next-Z expression.
+        // Use Z1*Z2*H directly. The former (4X,8Y,2Z) tuple represented
+        // the same point; avoiding that projective rescaling saves four
+        // modular doublings. Equal/opposite/identity selections are unchanged.
         if constexpr (affine_rhs) {
             mul(slot(lhs + 2), slot(13), h);
         } else {
             mul(slot(lhs + 2), slot(13), slot(rhs + 2));
             mul(slot(lhs + 2), slot(lhs + 2), h);
         }
-        add(slot(lhs + 2), slot(lhs + 2), slot(lhs + 2));
-        add(zz2, h, h);
-        square(zz2, zz2); // I; the old ZZ2 is now dead.
+        square(zz2, h); // H^2; the old ZZ2 is now dead.
         mul(h, h, zz2); // J.
-        add(zz1, zz1, zz1); // R.
         mul(u1, u1, zz2); // V.
         square(slot(lhs), zz1);
         sub(slot(lhs), slot(lhs), h);
@@ -452,7 +451,6 @@ private:
         sub(u1, u1, slot(lhs));
         mul(slot(lhs + 1), zz1, u1);
         mul(s1, s1, h);
-        add(s1, s1, s1);
         sub(slot(lhs + 1), slot(lhs + 1), s1);
         // Backup is still the original lhs here. Always select identity rhs
         // BEFORE the true-vote path can overwrite it. Doubling uses only G1

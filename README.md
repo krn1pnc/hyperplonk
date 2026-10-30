@@ -278,6 +278,10 @@ propagation until the eliminated Montgomery coefficient and final carry sweep.
 Partial sums use exact mixed-affine addition for freshly loaded affine bases.
 Generic and mixed additions retain every exceptional case; an exact tile-wide
 vote skips doubling only when no lane needs the equal-point result.
+Private generic and mixed additions use `Z1*Z2*H` directly rather than the
+equivalent projectively scaled `(4X,8Y,2Z)` tuple. This removes four modular
+doublings per addition without changing equal/opposite/identity selections,
+the public value types, or packed HBM record formats.
 One NPU ingress kernel converts bases into a `96*N`-byte HBM workspace once per
 `run_msm` call, amortized across all windows. Private coordinates retain
 normalized Montgomery representatives in `[0,2p)` in both UB and packed HBM
@@ -333,16 +337,18 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Balanced tasks and weighted reduction checkpoint | 1 | 3 | median | 2.678516 |
 | 2^20 | Seeded accumulators and radix24 add/sub checkpoint | 1 | 3 | median | 2.240379 |
 | 2^20 | Cached G1 and redundant Montgomery checkpoint | 1 | 3 | median | 1.809510 |
-| 2^20 | Current signed cancellation, automatic16-bit window | 1 | 3 | median | 1.768330 |
+| 2^20 | Signed cancellation checkpoint | 1 | 3 | median | 1.768330 |
+| 2^20 | Current unscaled point addition, automatic16-bit window | 1 | 3 | median | 1.667716 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
-| 2^25 | Current signed cancellation, automatic19-bit window | 1 | 3 | median | 42.170683 |
+| 2^25 | Signed cancellation and wider-window checkpoint | 1 | 3 | median | 42.170683 |
+| 2^25 | Current unscaled point addition, automatic19-bit window | 1 | 3 | median | 39.730811 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
 The current native implementation supports2–20-bit windows. Removing the old
 16-bit ceiling lets the unchanged cuZK heuristic select19 bits at`2^25`,
-reducing the number of windows from16 to14. Complete warmed MSM is2.24%
+reducing the number of windows from16 to14. Complete warmed MSM is8.52%
 faster than the matched CPU reference at this size, but remains slower at`2^20`.
 Both sizes passed one warmup and three exact targets with strict resource
 audits. Full host capacity/rejection checks and native field, G1, MSM, replay
