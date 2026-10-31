@@ -128,7 +128,7 @@ std::string point_hex(const G1Affine& point){
 struct ScalarCase{
     std::string id;std::filesystem::path scalar_file,expected_file;
     Fr* host=nullptr;Fr* device=nullptr;G1Affine expected{};
-    double upload_s=0;uint64_t active=0,h2d_bytes=0;
+    double upload_s=0;
 };
 std::vector<ScalarCase> scalar_cases(const Options& options,const std::filesystem::path& root){
     std::vector<ScalarCase> cases;
@@ -160,27 +160,6 @@ std::vector<ScalarCase> scalar_cases(const Options& options,const std::filesyste
     require(options.reuse_count>=cases.size()-1,"reuse-count must cover every manifest record at least once");
     return cases;
 }
-void model_metadata(ScalarCase& input,const MsmPlan& p,size_t n){
-    const uint64_t stride=((uint64_t(p.buckets)+8)/8)*8*8;
-    for(uint32_t window=0;window<p.windows;++window){
-        std::vector<uint64_t> lengths(p.buckets);
-        for(size_t i=0;i<n;++i){
-            uint32_t digit=0;
-            for(uint32_t bit=0;bit<p.window_bits&&window*p.window_bits+bit<255;++bit){
-                const uint32_t pos=window*p.window_bits+bit;
-                digit|=((input.host[i].words[pos/32]>>(pos%32))&1u)<<bit;
-            }
-            ++lengths[digit];
-        }
-        const uint64_t largest=*std::max_element(lengths.begin()+1,lengths.end());
-        if(largest){
-            ++input.active;uint32_t levels=0;
-            for(uint64_t q=(largest+63)/64;q>1;q=(q+63)/64)++levels;
-            uint64_t tasks=0;for(uint32_t b=1;b<p.buckets;++b)tasks+=(lengths[b]+63)/64;
-            input.h2d_bytes+=stride*(levels+1)+tasks*sizeof(uint32_t);
-        }
-    }
-}
 int run_prepared_benchmark(const Options& options,const std::filesystem::path& root,const std::filesystem::path& output){
     using Clock=std::chrono::steady_clock;
     const auto seconds=[](Clock::time_point start,Clock::time_point end){return std::chrono::duration<double>(end-start).count();};
@@ -203,7 +182,7 @@ int run_prepared_benchmark(const Options& options,const std::filesystem::path& r
     constexpr size_t validation_chunk=1U<<20;
     auto* validation=static_cast<uint8_t*>(r.h(validation_chunk));
     std::vector<uint8_t> snapshot_chunk(validation_chunk);
-    double input_load_s=0,metadata_model_s=0;
+    double input_load_s=0;
     const auto base_load_start=Clock::now();
     load(root/"bases.bin",hb,n*96);
     input_load_s+=seconds(base_load_start,Clock::now());
@@ -213,8 +192,6 @@ int run_prepared_benchmark(const Options& options,const std::filesystem::path& r
         try{load(input.scalar_file,input.host,n*32);load(input.expected_file,&input.expected,96);}
         catch(const std::exception& e){throw std::runtime_error("case "+input.id+": "+e.what()+" ["+input.scalar_file.string()+", "+input.expected_file.string()+"]");}
         input_load_s+=seconds(load_start,Clock::now());
-        const auto model_start=Clock::now();model_metadata(input,p,n);
-        metadata_model_s+=seconds(model_start,Clock::now());
     }
     bool varying=false;
     for(size_t i=sequence_begin+1;i<cases.size();++i)
@@ -244,15 +221,13 @@ int run_prepared_benchmark(const Options& options,const std::filesystem::path& r
     check(aclrtMemcpyAsync(cache_allocation+64+sizes.reusable_bytes,64,validation+64,64,ACL_MEMCPY_HOST_TO_DEVICE,r.stream),"cache suffix guard upload");
     check(aclrtSynchronizeStream(r.stream),"cache guard upload sync");
     const double guard_upload_s=seconds(guard_start,Clock::now());
-    const audit::RuntimeCopyAllowance allowed[]{
-        {static_cast<uint8_t*>(scratch)+p.region_offset[static_cast<unsigned>(MsmRegion::RowPtr)],pinned,size_t(8*(uint64_t(p.buckets)+1)),false},
-        {static_cast<uint8_t*>(scratch)+p.region_offset[static_cast<unsigned>(MsmRegion::TaskPrefix)],static_cast<uint8_t*>(pinned)+p.host_prefix_offset,size_t(p.region_size[static_cast<unsigned>(MsmRegion::TaskPrefix)]),true}};
     const audit::RuntimeCopyAllowance final_allowed[]{{out,result,96,false}};
     std::optional<PreparedSrsView> prepared;
     const auto run_call=[&](const char* phase,size_t index,ScalarCase& input,CallResult& call){
         call.case_id=input.id;
         std::cout<<"MSM_PREPARED_"<<phase<<"_BEGIN index="<<index<<" case_id="<<input.id<<std::endl;
-        audit::begin_runtime_audit(allowed,2);
+        // Strict gate: no host metadata transfer is allowed anywhere in compute.
+        audit::begin_runtime_audit(nullptr,0);
         const auto start=Clock::now();
         // No canonical-base pointer is accepted by this online API.
         const aclError status=run_msm_prepared(r.stream,*prepared,input.device,n,out,scratch,
@@ -270,8 +245,8 @@ int run_prepared_benchmark(const Options& options,const std::filesystem::path& r
             !final.device_sync_calls&&!final.malloc_calls&&!final.free_calls&&!final.host_malloc_calls&&!final.host_free_calls,
             "unexpected final download resources");
         const auto& compute=call.compute;
-        require(compute.d2h_calls==p.windows&&compute.d2h_bytes==uint64_t(p.windows)*8*(uint64_t(p.buckets)+1),"D2H budget mismatch");
-        require(compute.h2d_calls==input.active&&compute.h2d_bytes==input.h2d_bytes&&compute.stream_sync_calls==p.windows,"H2D/sync budget mismatch");
+        require(!compute.d2h_calls&&!compute.d2h_bytes&&!compute.h2d_calls&&!compute.h2d_bytes&&
+            !compute.stream_sync_calls,"compute metadata transfer or synchronization");
         require(!compute.other_copy_calls&&!compute.unexpected_copy_calls&&!compute.device_sync_calls&&
             !compute.malloc_calls&&!compute.free_calls&&!compute.host_malloc_calls&&!compute.host_free_calls,"unexpected compute resources");
         require(std::memcmp(result,&input.expected,96)==0,"CPU/NPU point mismatch");
@@ -363,7 +338,7 @@ int run_prepared_benchmark(const Options& options,const std::filesystem::path& r
         <<",\"reuse_online_total_s\":"<<online_total<<",\"reuse_amortized_resident_compute_s\":"<<resident_total/options.reuse_count
         <<",\"reuse_workload_wall_s\":"<<reuse_wall_s<<",\"setup_inclusive_wall_s\":"<<setup_wall_s
         <<",\"reuse_workload_wall_scope\":\"prepare_entry_through_Rth_host_ready_includes_base_retirement_pre_reuse_full_cache_D2H_disk_snapshot_validation_and_host_gaps_excludes_preprepare_scalar_pool_setup_uploads_and_poststeady_validation_not_HyperPlonk_proof_or_economic_preparation_cost\""
-        <<",\"setup_inclusive_scope\":\"runtime_init_through_Rth_host_ready_including_file_loads_metadata_model_allocation_upload_and_pre_reuse_cache_validation\""
+        <<",\"setup_inclusive_scope\":\"runtime_init_through_Rth_host_ready_including_file_loads_allocation_upload_and_pre_reuse_cache_validation\""
         <<",\"bases_file\":"<<json_string((root/"bases.bin").string())
         <<",\"oracle_policy\":\"provided_exact_96B_expected_files_independent_oracle_provenance_parent_owned\""
         <<",\"initial_bases_h2d_s\":"<<bases_upload_s<<",\"allocation_s\":"<<r.allocation_s
@@ -371,7 +346,8 @@ int run_prepared_benchmark(const Options& options,const std::filesystem::path& r
         <<",\"cache_validation_s\":"<<validation_before_s+validation_after_s
         <<",\"cache_validation_d2h_bytes\":"<<validation_d2h_bytes
         <<",\"cache_validation_disk_io_bytes\":"<<2*(sizes.reusable_bytes+128)
-        <<",\"metadata_model_s\":"<<metadata_model_s<<",\"setup_before_prepare_s\":"<<seconds(setup_start,prepare_start)
+        <<",\"compute_metadata_transfer_policy\":\"zero_h2d_zero_d2h_zero_sync\""
+        <<",\"setup_before_prepare_s\":"<<seconds(setup_start,prepare_start)
         <<",\"cache_guard_upload_s\":"<<guard_upload_s<<",\"bases_retirement_s\":"<<bases_retirement_s
         <<",\"cache_retirement_s\":"<<cache_retirement_s<<",\"cache_retired_after_all_readers\":true"
         <<",\"reusable_bytes\":"<<sizes.reusable_bytes<<",\"cache_guard_bytes\":128,\"scratch_bytes\":"<<sizes.scratch_bytes
@@ -478,7 +454,8 @@ int main(int argc,char**argv){try{
     if(options.prepared&&!have_samples)options.samples=3;
     const std::filesystem::path root(argv[1]),output(argv[2]);
     std::cout<<"MSM_SETUP_BEGIN mode="<<(options.prepared?"prepared":"one-shot")
-        <<" warmups="<<options.warmups<<" samples="<<options.samples<<std::endl;
+        <<" warmups="<<options.warmups<<" samples="<<options.samples
+        <<" count="<<options.count<<" window_bits="<<options.window_bits<<std::endl;
     std::filesystem::copy_file("/proc/self/exe",output/"loaded-executable.elf",std::filesystem::copy_options::overwrite_existing);
     std::ifstream maps("/proc/self/maps");std::ofstream(output/"process-maps.txt")<<maps.rdbuf();
     std::ofstream(output/"process-identity.txt")<<"pid="<<getpid()<<"\nexe="<<std::filesystem::read_symlink("/proc/self/exe")<<"\n";
@@ -494,39 +471,19 @@ int main(int argc,char**argv){try{
     // Reserve all benchmark records before any complete-MSM call.
     std::vector<CallResult> warmups(options.warmups),targets(options.samples);
     std::vector<double> elapsed_samples(options.samples),api_samples(options.samples);
-    std::cout<<"MSM_METADATA_MODEL_BEGIN"<<std::endl;
-    // Independent scalar-bit histogram model; outside all timed/audited compute.
-    uint64_t expected_h2d=0,active=0;
-    const uint64_t stride=((uint64_t(p.buckets)+8)/8)*8*8;
-    for(uint32_t window=0;window<p.windows;++window){
-        std::vector<uint64_t> lengths(p.buckets);
-        for(size_t i=0;i<n;++i){uint32_t digit=0;
-            for(uint32_t bit=0;bit<p.window_bits&&window*p.window_bits+bit<255;++bit){
-                const uint32_t pos=window*p.window_bits+bit;
-                digit|=((hs[i].words[pos/32]>>(pos%32))&1u)<<bit;
-            }++lengths[digit];
-        }
-        const uint64_t largest=*std::max_element(lengths.begin()+1,lengths.end());
-        if(largest){++active;uint32_t levels=0;for(uint64_t q=(largest+63)/64;q>1;q=(q+63)/64)++levels;
-            uint64_t tasks=0;
-            for(uint32_t b=1;b<p.buckets;++b) tasks+=(lengths[b]+63)/64;
-            expected_h2d+=stride*(levels+1)+tasks*sizeof(uint32_t);}
-    }
     std::cout<<"MSM_INITIAL_H2D_BEGIN"<<std::endl;
     const auto setup_start=std::chrono::steady_clock::now();
     check(aclrtMemcpyAsync(b,n*96,hb,n*96,ACL_MEMCPY_HOST_TO_DEVICE,r.stream),"upload bases");
     check(aclrtMemcpyAsync(s,n*32,hs,n*32,ACL_MEMCPY_HOST_TO_DEVICE,r.stream),"upload scalars");
     check(aclrtSynchronizeStream(r.stream),"setupSync");
     const double upload_s=std::chrono::duration<double>(std::chrono::steady_clock::now()-setup_start).count();
-    const audit::RuntimeCopyAllowance allowed[]{
-        {static_cast<uint8_t*>(w)+p.region_offset[static_cast<unsigned>(MsmRegion::RowPtr)],h,size_t(8*(uint64_t(p.buckets)+1)),false},
-        {static_cast<uint8_t*>(w)+p.region_offset[static_cast<unsigned>(MsmRegion::TaskPrefix)],static_cast<uint8_t*>(h)+p.host_prefix_offset,size_t(p.region_size[static_cast<unsigned>(MsmRegion::TaskPrefix)]),true}};
     std::cout<<"NPU_INPUTS_READY count="<<n<<" c="<<p.window_bits<<" windows="<<p.windows
         <<" aiv="<<p.platform.aiv_cores<<" workspace="<<p.workspace_bytes<<" host_workspace="<<p.host_workspace_bytes<<std::endl;
     const audit::RuntimeCopyAllowance final_allowed[]{ {out,result,96,false} };
     const auto run_call=[&](const char* phase,size_t index,CallResult& call){
         std::cout<<"MSM_"<<phase<<"_BEGIN index="<<index<<std::endl;
-        audit::begin_runtime_audit(allowed,2);
+        // Device-resident metadata: compute may not copy to or from the host.
+        audit::begin_runtime_audit(nullptr,0);
         const auto start=std::chrono::steady_clock::now();
         const aclError status=run_msm(r.stream,b,s,out,w,p.workspace_bytes,h,p.host_workspace_bytes,p);
         const auto returned=std::chrono::steady_clock::now();
@@ -550,8 +507,8 @@ int main(int argc,char**argv){try{
             !final_counts.host_malloc_calls&&!final_counts.host_free_calls,
             "unexpected final download resources");
         const auto& compute=call.compute;
-        require(compute.d2h_calls==p.windows&&compute.d2h_bytes==uint64_t(p.windows)*8*(uint64_t(p.buckets)+1),"D2H budget mismatch");
-        require(compute.h2d_calls==active&&compute.h2d_bytes==expected_h2d&&compute.stream_sync_calls==p.windows,"H2D/sync budget mismatch");
+        require(!compute.d2h_calls&&!compute.d2h_bytes&&!compute.h2d_calls&&!compute.h2d_bytes&&
+            !compute.stream_sync_calls,"compute metadata transfer or synchronization");
         require(!compute.other_copy_calls&&!compute.unexpected_copy_calls&&!compute.device_sync_calls&&!compute.malloc_calls&&!compute.free_calls,"unexpected compute resources");
         // Unlike the diagnostic profile executable, ordinary calls allow no profiler allocations.
         require(!compute.host_malloc_calls&&!compute.host_free_calls,"unexpected compute host allocations");
@@ -572,7 +529,9 @@ int main(int argc,char**argv){try{
         <<",\"aiv_cores\":"<<p.platform.aiv_cores<<",\"device_workspace_bytes\":"<<p.workspace_bytes<<",\"host_workspace_bytes\":"<<p.host_workspace_bytes
         <<",\"initial_h2d_s\":"<<upload_s<<",\"npu_api_to_return_s\":"<<median_api_s<<",\"npu_api_to_host_point_ready_s\":"<<median_s
         <<",\"median_s\":"<<median_s<<",\"timing_scope\":\"run_msm_entry_through_final_96_byte_D2H_and_stream_completion\""
-        <<",\"metadata_d2h_bytes\":"<<compute.d2h_bytes<<",\"metadata_h2d_bytes\":"<<compute.h2d_bytes<<",\"metadata_sync\":"<<compute.stream_sync_calls
+        <<",\"compute_h2d_calls\":"<<compute.h2d_calls<<",\"compute_d2h_calls\":"<<compute.d2h_calls
+        <<",\"compute_stream_sync_calls\":"<<compute.stream_sync_calls
+        <<",\"compute_metadata_transfer_policy\":\"zero_h2d_zero_d2h_zero_sync\""
         <<",\"unexpected_copy\":"<<compute.unexpected_copy_calls<<",\"compute_device_alloc\":"<<compute.malloc_calls<<",\"compute_device_free\":"<<compute.free_calls
         <<",\"compute_host_malloc_calls\":"<<compute.host_malloc_calls<<",\"compute_host_free_calls\":"<<compute.host_free_calls
         <<",\"samples_s\":[";

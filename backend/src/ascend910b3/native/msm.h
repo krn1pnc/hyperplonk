@@ -7,7 +7,7 @@
 namespace hyperplonk::ascend910b3::detail {
 bool build_msm_plan(size_t count, MsmPlan& out, uint32_t window_bits = 0);
 // Borrowed canonical device inputs. Scratch must not be shared concurrently.
-// CPU metadata scheduling synchronizes each window; final output is still async.
+// Metadata scheduling and every dynamic count stay on device; final output is async.
 // Pinned host scratch, device scratch and inputs must live until stream completes,
 // including when an ACL failure leaves previously submitted work outstanding.
 aclError run_msm(aclrtStream stream, const G1Affine* bases, const Fr* scalars,

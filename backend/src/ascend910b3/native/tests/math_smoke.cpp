@@ -1368,83 +1368,83 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
     detail::MsmPlan plan{};
     require(detail::build_msm_plan(n,plan,window_bits),"metadata MSM platform initialization failed");
     MsmGuard scratch(runtime,stream,plan.workspace_bytes);
+    constexpr uint32_t partition_records = detail::msm_radix_partition_records;
+    const uint32_t mask = (uint32_t{1} << plan.window_bits) - 1;
+    const uint32_t low_bits = plan.radix_pass_bits[0];
+    const uint64_t low_bins = uint64_t{1} << low_bits;
+    // Records are fabricated here, independent of candidate scalar extraction.
     std::vector<MsmRecord> expected(n);
     for (size_t i = 0; i < n; ++i) {
         uint32_t key = 0;
-        if (pattern == 1) key = 0xfedc;
-        if (pattern == 2) key = uint32_t((i%2 ? 0xabcd : 0x1234) ^ ((i%16)<<8));
-        if (pattern == 3) key = uint32_t((i%23)*0x101);
-        if (pattern == 4) key = uint32_t((i*4051+17)&65535);
-        if (pattern == 5) key = i == 0 ? (1u << window_bits)-1 :
-            i == 1 ? 1u << 16 : uint32_t((i*4051+17)&((1u << window_bits)-1));
-        expected[i] = {key,i%3 == 0 ? UINT32_MAX-1 : uint32_t((1u<<24)+i)};
+        switch (pattern) {
+        case 0: key = 0; break; // bucket-0-only window: the CSR has no task at all
+        case 1: key = mask; break;
+        case 2: key = (uint32_t(i % 3) * 0x101u) & mask; break;
+        case 3: key = uint32_t(i % 23) & mask; break;
+        case 4: key = uint32_t(i * 4051 + 17) & mask; break;
+        case 5: key = i == 0 ? mask : i == 1 ? (uint32_t{1} << plan.window_bits) >> 1
+                             : uint32_t(i * 2654435761u) & mask; break;
+        case 6: // bounded high-digit partitions: selects the route-1 fast path
+            key = (uint32_t(i % std::min<uint64_t>(low_bins,200)) << low_bits)
+                | (uint32_t(i) & (uint32_t(low_bins) - 1)); break;
+        case 7: key = uint32_t(i) & (uint32_t(low_bins) - 1); break; // all in coarse digit 0
+        case 8: key = ((uint32_t{1} << low_bits) | (uint32_t(i) & (uint32_t(low_bins) - 1))) & mask; break;
+        default: throw std::runtime_error("unknown metadata pattern");
+        }
+        expected[i] = {key & mask,i%3 == 0 ? UINT32_MAX-1 : uint32_t((1u<<24)+i)};
+    }
+    uint32_t model_max_partition = 0;
+    if (plan.radix_route == 1) {
+        std::vector<uint32_t> counts(size_t{1} << plan.radix_high_bits);
+        for (const auto& record : expected) ++counts[record.bucket >> low_bits];
+        for (uint32_t count : counts) model_max_partition = std::max(model_max_partition,count);
     }
     std::vector<MsmRecord> input(msm_round8(n),{0,UINT32_MAX});
     std::copy(expected.begin(),expected.end(),input.begin());
     runtime.upload(stream,reinterpret_cast<MsmRecord*>(msm_region(scratch.payload,plan,
                    detail::MsmRegion::RecordsA)),input.data(),input.size());
-    const std::string label = "MSM metadata N="+std::to_string(n)+" pattern="+std::to_string(pattern);
-    for (uint32_t pass = 0; pass < plan.radix_passes; ++pass) {
-        std::vector<std::array<uint32_t,16>> counts(plan.chunks);
-        for (size_t i = 0; i < n; ++i) ++counts[i/2048][(expected[i].bucket>>(4*pass))&15];
-        detail::launch_msm_radix_pass(stream,scratch.payload,plan,pass);
-        auto* dense = runtime.download(stream,reinterpret_cast<const MsmRecord*>(msm_region(
-            scratch.payload,plan,pass%2 ? detail::MsmRegion::RecordsA : detail::MsmRegion::RecordsB)),
-            msm_round8(n));
-        auto* hist = runtime.download(stream,msm_region(scratch.payload,plan,
-            detail::MsmRegion::RadixHistogram),size_t(plan.chunks)*64);
-        auto* descriptors = runtime.download(stream,msm_region(scratch.payload,plan,
-            detail::MsmRegion::RadixDescriptors),size_t(plan.chunks)*16*64);
-        auto* headers = runtime.download(stream,msm_region(scratch.payload,plan,
-            detail::MsmRegion::RadixDigitTotals),size_t(16*64));
-        auto* fragments = runtime.download(stream,reinterpret_cast<const MsmRecord*>(msm_region(
-            scratch.payload,plan,detail::MsmRegion::RadixFragments)),size_t(plan.fragment_records));
-        check(aclrtSynchronizeStream(stream),"MSM radix diagnostic synchronize");
-        for (size_t chunk = 0; chunk < plan.chunks; ++chunk)
-            for (size_t digit = 0; digit < 16; ++digit)
-                require(msm_u32(hist+chunk*64+digit*4) == counts[chunk][digit],label+" histogram");
-        uint64_t logical_base = 0, physical_base = 0;
-        for (size_t digit = 0; digit < 16; ++digit) {
-            uint64_t logical = 0, physical = 0;
-            const auto* header = headers+digit*64;
-            for (size_t chunk = 0; chunk < plan.chunks; ++chunk) {
-                const uint64_t count = counts[chunk][digit];
-                const auto* descriptor = descriptors+(digit*plan.chunks+chunk)*64;
-                require(msm_u64(descriptor) == logical && msm_u64(descriptor+8) == physical &&
-                        msm_u32(descriptor+16) == count,label+" fragment descriptor");
-                msm_zero_padding(descriptor,20,64,label+" descriptor");
-                require((physical_base+physical)%8 == 0 &&
-                        physical_base+physical+msm_round8(count) <= plan.fragment_records,
-                        label+" physical span");
-                size_t rank = 0;
-                for (size_t i = chunk*2048; i < std::min(n,(chunk+1)*2048); ++i)
-                    if (((expected[i].bucket>>(4*pass))&15) == digit)
-                        require(msm_same_record(fragments[physical_base+physical+rank++],expected[i]),
-                                label+" stable fragment");
-                for (size_t i = count; i < msm_round8(count); ++i)
-                    require(fragments[physical_base+physical+i].bucket == 0 &&
-                            fragments[physical_base+physical+i].index == UINT32_MAX,label+" fragment tail");
-                logical += count; physical += msm_round8(count);
-            }
-            require(msm_u64(header) == logical && msm_u64(header+8) == physical &&
-                    msm_u64(header+16) == logical_base && msm_u64(header+24) == physical_base,
-                    label+" digit header");
-            msm_zero_padding(header,32,64,label+" header");
-            logical_base += logical; physical_base += physical;
-        }
-        require(logical_base == n && physical_base <= plan.fragment_records,label+" radix totals");
-        const uint32_t mask = (1u<<(4*(pass+1)))-1;
-        std::stable_sort(expected.begin(),expected.end(),[mask](const auto& a,const auto& b) {
-            return (a.bucket&mask) < (b.bucket&mask);
-        });
-        for (size_t i = 0; i < n; ++i) require(msm_same_record(dense[i],expected[i]),label+" stable dense");
-        for (size_t i = n; i < msm_round8(n); ++i)
-            require(dense[i].bucket == 0 && dense[i].index == UINT32_MAX,label+" dense tail");
-    }
+    const std::string label = "MSM metadata N="+std::to_string(n)+" pattern="+std::to_string(pattern)
+        +" c="+std::to_string(plan.window_bits)+" route="+std::to_string(plan.radix_route);
+    // Device grouping, CSR and schedule: no host transfer, synchronization or allocation.
+    audit::begin_runtime_audit(nullptr,0);
+    detail::launch_msm_radix_group(stream,scratch.payload,plan);
     detail::launch_msm_rows(stream,scratch.payload,plan);
+    detail::launch_msm_schedule(stream,scratch.payload,plan);
+    const auto metadata_stage = audit::end_runtime_audit();
+    require_no_runtime_transfers(metadata_stage);
+    require(metadata_stage.unexpected_copy_calls == 0,label+" metadata stage undeclared copy");
+    auto* control = runtime.download(stream,msm_region(scratch.payload,plan,
+        detail::MsmRegion::RadixControl),64);
+    check(aclrtSynchronizeStream(stream),"metadata control readback synchronize");
+    const uint32_t parity = msm_u32(control), fallback = msm_u32(control+4);
+    const uint32_t max_partition = msm_u32(control+8);
+    const auto sorted_region = parity ? detail::MsmRegion::RecordsB : detail::MsmRegion::RecordsA;
+    auto* dense = runtime.download(stream,reinterpret_cast<const MsmRecord*>(
+        msm_region(scratch.payload,plan,sorted_region)),msm_round8(n));
     auto* rows = runtime.download(stream,reinterpret_cast<const uint64_t*>(msm_region(
         scratch.payload,plan,detail::MsmRegion::RowPtr)),msm_round8(plan.buckets+1));
-    check(aclrtSynchronizeStream(stream),"MSM CSR diagnostic synchronize");
+    auto* schedule_bytes = runtime.download(stream,msm_region(scratch.payload,plan,
+        detail::MsmRegion::ScheduleMeta),size_t(plan.region_size[static_cast<uint32_t>(
+            detail::MsmRegion::ScheduleMeta)]));
+    auto* device_prefix = runtime.download(stream,msm_region(scratch.payload,plan,
+        detail::MsmRegion::TaskPrefix),size_t(plan.region_size[static_cast<uint32_t>(
+            detail::MsmRegion::TaskPrefix)]));
+    check(aclrtSynchronizeStream(stream),(label+" metadata readback synchronize").c_str());
+    require(parity <= 1,label+" final parity range");
+    const uint32_t expected_parity = plan.radix_route == 1 ? (fallback ? 0u : 1u) : 1u;
+    require(parity == expected_parity,label+" final parity route");
+    if (plan.radix_route == 1) {
+        require(fallback == (model_max_partition > partition_records),label+" fallback decision");
+        require(max_partition == model_max_partition,label+" maximum coarse partition");
+    } else {
+        require(fallback == 0,label+" fallback flag on routes 0/2");
+    }
+    std::stable_sort(expected.begin(),expected.end(),
+        [](const MsmRecord& a,const MsmRecord& b){ return a.bucket < b.bucket; });
+    for (size_t i = 0; i < n; ++i)
+        require(msm_same_record(dense[i],expected[i]),label+" stable sorted records");
+    for (size_t i = n; i < msm_round8(n); ++i)
+        require(dense[i].bucket == 0 && dense[i].index == UINT32_MAX,label+" dense tail");
     std::vector<uint64_t> model_rows(plan.buckets+1);
     for (uint32_t b = 0; b <= plan.buckets; ++b) {
         model_rows[b] = std::lower_bound(expected.begin(),expected.end(),b,
@@ -1458,7 +1458,19 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
         plan.region_size[static_cast<uint32_t>(detail::MsmRegion::TaskPrefix)]/sizeof(uint64_t),
         UINT64_MAX);
     detail::MsmSchedule schedule{};
-    require(detail::make_msm_schedule(plan,rows,prefix.data(),schedule),label+" scheduler rejected CSR");
+    require(detail::make_msm_schedule(plan,model_rows.data(),prefix.data(),schedule),
+            label+" scheduler rejected CSR");
+    // Device ScheduleMeta/TaskPrefix must be byte-identical to the pure CPU oracle.
+    require(msm_u32(schedule_bytes+48) == schedule.merge_levels,label+" device merge levels");
+    require(msm_u64(schedule_bytes+56) == schedule.order_offset,label+" device order offset");
+    for (unsigned level = 0; level < 6; ++level)
+        require(msm_u64(schedule_bytes+8*level) == schedule.task_count[level],
+                label+" device task count");
+    const size_t written_bytes = stride*(schedule.merge_levels+1)*sizeof(uint64_t)
+        + schedule.task_count[0]*sizeof(uint32_t);
+    const auto* cpu_prefix_bytes = reinterpret_cast<const uint8_t*>(prefix.data());
+    for (size_t i = 0; i < written_bytes; ++i)
+        require(device_prefix[i] == cpu_prefix_bytes[i],label+" device task prefix/order");
     uint64_t divisor = 64;
     uint32_t model_levels = 0;
     uint64_t max_tasks = 0;
@@ -1479,39 +1491,55 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
     }
     for (uint32_t level = model_levels+1; level < 6; ++level)
         require(schedule.task_count[level] == 0,label+" inactive task count");
-    const size_t written_bytes = stride*(model_levels+1)*sizeof(uint64_t)
-        + schedule.task_count[0]*sizeof(uint32_t);
-    const auto* prefix_bytes = reinterpret_cast<const uint8_t*>(prefix.data());
-    for (size_t i = written_bytes; i < prefix.size()*sizeof(uint64_t); ++i)
-        require(prefix_bytes[i] == UINT8_MAX,label+" inactive schedule storage overwritten");
+    const size_t prefix_words = prefix.size()*sizeof(uint64_t);
+    for (size_t i = written_bytes; i < prefix_words; ++i)
+        require(cpu_prefix_bytes[i] == UINT8_MAX,label+" oracle wrote inactive schedule storage");
     if (max_tasks) {
-        runtime.upload(stream,msm_region(scratch.payload,plan,detail::MsmRegion::TaskPrefix),
-                       prefix_bytes,written_bytes);
+        // Device counts drive expansion without any host metadata upload.
+        // Tasks is shared scratch: consume each level before the next overwrites it.
         for (uint32_t level = 0; level <= model_levels; ++level) {
-            detail::launch_msm_tasks(stream,scratch.payload,plan,level,schedule.task_count[level]);
+            const uint64_t tasks_on_device = schedule.task_count[level];
+            if (!tasks_on_device) continue;
+            audit::begin_runtime_audit(nullptr,0);
+            detail::launch_msm_tasks(stream,scratch.payload,plan,level);
+            const auto expansion = audit::end_runtime_audit();
+            require_no_runtime_transfers(expansion);
+            require(expansion.unexpected_copy_calls == 0,label+" task expansion undeclared copy");
             auto* tasks = runtime.download(stream,msm_region(scratch.payload,plan,
-                detail::MsmRegion::Tasks),size_t(schedule.task_count[level])*64);
+                detail::MsmRegion::Tasks),size_t(tasks_on_device)*64);
             check(aclrtSynchronizeStream(stream),"MSM tasks diagnostic synchronize");
             const auto& q = model_prefix[level];
             const auto& previous = level ? model_prefix[level-1] : model_rows;
             for (uint32_t b = 1; b < plan.buckets; ++b)
                 for (uint64_t t = q[b]; t < q[b+1]; ++t) {
                     const uint64_t begin = previous[b]+64*(t-q[b]);
-                    const uint32_t count = uint32_t(std::min<uint64_t>(64,previous[b+1]-begin));
+                    const uint32_t length = uint32_t(std::min<uint64_t>(64,previous[b+1]-begin));
                     const auto* descriptor = tasks+t*64;
-                    require(msm_u64(descriptor) == begin && msm_u32(descriptor+8) == count &&
+                    require(msm_u64(descriptor) == begin && msm_u32(descriptor+8) == length &&
                             msm_u32(descriptor+12) == b,label+" expanded task descriptor");
                     msm_zero_padding(descriptor,16,64,label+" task descriptor");
                 }
         }
     } else {
-        // Same empty dispatch condition as production: no upload or point task.
+        // Device-gated empty window: identity only, no host empty flag and no point work.
+        std::array<uint32_t,48> identity{};
+        for (unsigned word = 0; word < math::Bls12381FqParams::word_count; ++word)
+            identity[12+word] = detail::msm_montgomery_one_words[word];
         audit::begin_runtime_audit(nullptr,0);
-        detail::launch_msm_window_reduce(stream,scratch.payload,plan,0,0,true);
+        const auto cache = msm_region(scratch.payload,plan,detail::MsmRegion::MontgomeryBases);
+        detail::launch_msm_partial_sums(stream,cache,scratch.payload,plan);
+        for (uint32_t level = 0; level <= schedule.merge_levels; ++level)
+            detail::launch_msm_tasks(stream,scratch.payload,plan,level);
+        for (uint32_t level = 1; level <= schedule.merge_levels; ++level)
+            detail::launch_msm_partial_merge(stream,scratch.payload,plan,level);
+        detail::launch_msm_window_reduce(stream,scratch.payload,plan,0);
         const auto empty = audit::end_runtime_audit();
         require_no_runtime_transfers(empty);
-        require(empty.host_malloc_calls == 0 && empty.host_free_calls == 0 &&
-                empty.unexpected_copy_calls == 0,label+" empty dispatch allocated or copied");
+        require(empty.unexpected_copy_calls == 0,label+" empty window undeclared copy");
+        auto* window = runtime.download(stream,msm_region(scratch.payload,plan,
+            detail::MsmRegion::Windows),192);
+        check(aclrtSynchronizeStream(stream),(label+" empty window readback").c_str());
+        require(std::memcmp(window,identity.data(),192) == 0,label+" empty identity window");
     }
     scratch.download(runtime,stream);
     check(aclrtSynchronizeStream(stream),"MSM metadata guard synchronize");
@@ -1520,10 +1548,21 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
 }
 void test_msm_metadata(Runtime& runtime, aclrtStream stream)
 {
-    for (size_t n : {1,7,8,9,2047,2048,2049,4097})
+    for (size_t n : {1,7,8,9,63,64,65,2047,2048,2049,4097})
         for (unsigned pattern = 0; pattern < 5; ++pattern)
             test_msm_metadata_case(runtime,stream,n,pattern,16);
-    test_msm_metadata_case(runtime,stream,4097,5,17);
+    // Every balanced digit width, including the three-pass routes.
+    for (uint32_t c = 2; c <= 20; ++c)
+        test_msm_metadata_case(runtime,stream,2049,4,c);
+    // Exact 8192-record chunk boundaries.
+    for (size_t n : {8191,8192,8193})
+        test_msm_metadata_case(runtime,stream,n,3,16);
+    // Route-1 fast path with bounded partitions, then both forced fallback digits.
+    test_msm_metadata_case(runtime,stream,4097,6,16);
+    test_msm_metadata_case(runtime,stream,8192,7,16); // exactly the 8192 partition limit stays fast
+    test_msm_metadata_case(runtime,stream,8193,7,16);
+    test_msm_metadata_case(runtime,stream,65537,8,16);
+    test_msm_metadata_case(runtime,stream,65537,6,16);
     std::cout << "MSM_METADATA_NPU_PASS\n";
 }
 
@@ -1567,46 +1606,6 @@ detail::MsmPlan msm_plan(size_t count, uint32_t bits)
     require(detail::build_msm_plan(count,result,bits),"Ascend910B3 MSM platform initialization failed");
     return result;
 }
-struct MsmBudget {
-    uint64_t d2h = 0, h2d = 0, windows = 0, active = 0;
-    void add(const MsmBudget& other) {
-        d2h += other.d2h; h2d += other.h2d; windows += other.windows; active += other.active;
-    }
-};
-MsmBudget msm_budget(const MsmFixture& fixture, const detail::MsmPlan& plan)
-{
-    MsmBudget result{};
-    if (!fixture.count) return result;
-    const uint32_t c = plan.window_bits;
-    const uint32_t buckets = 1u<<c;
-    result.windows = (255+c-1)/c;
-    require(result.windows == plan.windows && buckets == plan.buckets,"MSM budget shape mismatch");
-    result.d2h = result.windows*8*(uint64_t(buckets)+1);
-    const uint64_t prefix_bytes = msm_round8(size_t(buckets)+1)*8;
-    for (uint32_t w = 0; w < result.windows; ++w) {
-        std::vector<uint64_t> lengths(buckets);
-        for (const auto& scalar : fixture.scalars) {
-            uint32_t digit = 0;
-            // Per-bit extraction is intentionally independent of the production
-            // word/shift implementation, including a partial top window.
-            for (uint32_t bit = 0; bit < c && w*c+bit < 255; ++bit) {
-                const uint32_t position = w*c+bit;
-                digit |= ((scalar.words[position/32]>>(position%32))&1u)<<bit;
-            }
-            ++lengths[digit];
-        }
-        uint64_t max_length = 0;
-        for (uint32_t b = 1; b < buckets; ++b) max_length = std::max(max_length,lengths[b]);
-        if (!max_length) continue;
-        ++result.active;
-        uint32_t levels = 0;
-        for (uint64_t tasks = (max_length+63)/64; tasks > 1; tasks = (tasks+63)/64) ++levels;
-        uint64_t task_count = 0;
-        for (uint32_t b = 1; b < buckets; ++b) task_count += (lengths[b]+63)/64;
-        result.h2d += prefix_bytes*(levels+1)+task_count*sizeof(uint32_t);
-    }
-    return result;
-}
 void msm_require_resources_zero(const audit::RuntimeCounts& counts, const std::string& label)
 {
     require(counts.other_copy_calls == 0 && counts.device_sync_calls == 0 &&
@@ -1634,43 +1633,31 @@ struct MsmInvocation {
 void msm_execute(Runtime& runtime, const std::vector<MsmInvocation>& invocations,
                  const std::string& label, const std::string& marker)
 {
-    MsmBudget budget{};
     uint64_t count = 0;
     std::vector<aclrtStream> streams;
     std::vector<math::G1Affine*> actual;
     for (const auto& call : invocations) {
-        const auto& plan = *call.plan;
-        budget.add(msm_budget(*call.fixture,plan));
         count += call.fixture->count;
         if (std::find(streams.begin(),streams.end(),call.stream) == streams.end()) streams.push_back(call.stream);
         actual.push_back(runtime.host<math::G1Affine>(1));
     }
     audit::RuntimeCounts compute{};
     for (const auto& call : invocations) {
-        const auto& plan = *call.plan;
-        std::array<audit::RuntimeCopyAllowance,2> allowances{};
-        if (plan.count) {
-            allowances[0] = {msm_region(call.scratch->payload,plan,detail::MsmRegion::RowPtr),
-                             call.host->payload,size_t(8*(uint64_t(plan.buckets)+1)),false};
-            allowances[1] = {msm_region(call.scratch->payload,plan,detail::MsmRegion::TaskPrefix),
-                             call.host->payload+plan.host_prefix_offset,
-                             size_t(plan.region_size[static_cast<uint32_t>(detail::MsmRegion::TaskPrefix)]),true};
-        }
-        // Each call has exactly its own two metadata endpoints, even in replay
-        // and two-stream batches. No setup or tail operations enter this window.
-        audit::begin_runtime_audit(allowances.data(),plan.count ? 2 : 0);
+        // Device-resident metadata: compute advertises no copy at all. Each call
+        // still owns its output, scratch, pinned scratch and borrowed inputs.
+        audit::begin_runtime_audit(nullptr,0);
         check(detail::run_msm(call.stream,reinterpret_cast<const math::G1Affine*>(call.bases->payload),
             reinterpret_cast<const Fr*>(call.scalars->payload),reinterpret_cast<math::G1Affine*>(call.out->payload),
             call.scratch->payload,call.scratch->bytes,call.host->payload,call.host->bytes,*call.plan),"run_msm");
         const auto one = audit::end_runtime_audit();
         msm_require_resources_zero(one,label+" compute");
+        require(one.d2h_calls == 0 && one.d2h_bytes == 0 && one.h2d_calls == 0 &&
+                one.h2d_bytes == 0 && one.stream_sync_calls == 0,
+                label+" compute performed a metadata transfer or stream synchronization");
         compute.d2h_calls += one.d2h_calls; compute.d2h_bytes += one.d2h_bytes;
         compute.h2d_calls += one.h2d_calls; compute.h2d_bytes += one.h2d_bytes;
         compute.stream_sync_calls += one.stream_sync_calls;
     }
-    require(compute.d2h_calls == budget.windows && compute.d2h_bytes == budget.d2h &&
-            compute.h2d_calls == budget.active && compute.h2d_bytes == budget.h2d &&
-            compute.stream_sync_calls == budget.windows,label+" metadata budget mismatch");
     audit::begin_runtime_audit();
     for (size_t i = 0; i < invocations.size(); ++i)
         runtime.copy_down(invocations[i].stream,actual[i],
@@ -1699,8 +1686,8 @@ void msm_execute(Runtime& runtime, const std::vector<MsmInvocation>& invocations
     }
     std::cout << marker << " case=" << label << " count=" << count
               << " window_bits=" << invocations.front().plan->window_bits
-              << " metadata_d2h=" << budget.d2h << " metadata_h2d=" << budget.h2d
-              << " metadata_sync=" << budget.windows
+              << " compute_h2d=" << compute.h2d_calls << " compute_d2h=" << compute.d2h_calls
+              << " compute_sync=" << compute.stream_sync_calls
               << " unexpected_copy=0 compute_device_alloc=0 compute_host_alloc=0 compute_free=0"
               << " final_d2h=" << 96*invocations.size() << " final_sync=" << streams.size() << '\n';
 }
@@ -1896,6 +1883,14 @@ template<class Reject> void msm_corrupt_plans(const detail::MsmPlan& plan, Rejec
     changed = plan; ++changed.windows; reject(changed);
     changed = plan; ++changed.buckets; reject(changed);
     changed = plan; ++changed.radix_passes; reject(changed);
+    changed = plan; ++changed.radix_route; reject(changed);
+    changed = plan; ++changed.radix_max_bits; reject(changed);
+    changed = plan; ++changed.radix_bins; reject(changed);
+    changed = plan; ++changed.radix_high_bits; reject(changed);
+    changed = plan; ++changed.radix_low_bits; reject(changed);
+    for (unsigned i = 0; i < 3; ++i) {
+        changed = plan; ++changed.radix_pass_bits[i]; reject(changed);
+    }
     changed = plan; ++changed.chunks; reject(changed);
     changed = plan; ++changed.merge_levels; reject(changed);
     changed = plan; ++changed.row_blocks; reject(changed);
@@ -1967,8 +1962,8 @@ void test_msm_prepared_queries()
         require(!detail::make_msm_plan(n,platform,20,plan),"prepared overflowing count accepted");
     }
     for (const auto& expected : std::array<std::array<uint64_t,5>,2>{{
-             {{uint64_t(1)<<20,16,100663296,80073280,2949440}},
-             {{uint64_t(1)<<25,20,3221225472,1777340480,56623488}}}}) {
+             {{uint64_t(1)<<20,16,100663296,82246976,2949440}},
+             {{uint64_t(1)<<25,20,3221225472,1795601216,56623488}}}}) {
         detail::MsmPlan plan{};
         require(detail::make_msm_plan(expected[0],platform,expected[1],plan),
                 "prepared full-size capacity plan failed");
@@ -2043,27 +2038,19 @@ struct MsmPreparedCall {
 
 void msm_prepared_compute(const detail::PreparedSrsView& view, const MsmPreparedCall& call)
 {
-    const auto& plan = *call.plan;
-    const auto budget = msm_budget(*call.fixture,plan);
-    std::array<audit::RuntimeCopyAllowance,2> allowances{};
-    if (plan.count) {
-        allowances[0] = {msm_region(call.scratch->payload,plan,detail::MsmRegion::RowPtr),
-                         call.host->payload,size_t(8*(uint64_t(plan.buckets)+1)),false};
-        allowances[1] = {msm_region(call.scratch->payload,plan,detail::MsmRegion::TaskPrefix),
-                         call.host->payload+plan.host_prefix_offset,
-                         size_t(plan.region_size[static_cast<uint32_t>(detail::MsmRegion::TaskPrefix)]),true};
-    }
-    audit::begin_runtime_audit(allowances.data(),plan.count ? 2 : 0);
+    // The whole metadata path is device resident: an empty allowance list is a
+    // strict gate, so any H2D/D2H inside compute fails the audit.
+    audit::begin_runtime_audit(nullptr,0);
     const auto status = detail::run_msm_prepared(call.stream,view,
         reinterpret_cast<const Fr*>(call.scalars->payload),call.fixture->count,
         reinterpret_cast<math::G1Affine*>(call.out->payload),call.scratch->payload,
-        call.scratch->bytes,call.host->payload,call.host->bytes,plan);
+        call.scratch->bytes,call.host->payload,call.host->bytes,*call.plan);
     const auto counts = audit::end_runtime_audit();
     check(status,"run_msm_prepared");
     msm_require_resources_zero(counts,"prepared compute");
-    require(counts.d2h_calls == budget.windows && counts.d2h_bytes == budget.d2h &&
-            counts.h2d_calls == budget.active && counts.h2d_bytes == budget.h2d &&
-            counts.stream_sync_calls == budget.windows,"prepared exact metadata budget mismatch");
+    require(counts.d2h_calls == 0 && counts.d2h_bytes == 0 && counts.h2d_calls == 0 &&
+            counts.h2d_bytes == 0 && counts.stream_sync_calls == 0,
+            "prepared compute performed a metadata transfer or stream synchronization");
 }
 
 void msm_prepared_finish(Runtime& runtime, const MsmPreparedCall& call)

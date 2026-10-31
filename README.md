@@ -264,8 +264,12 @@ regression pass with this organization; per-kernel performance was not profiled.
 
 The native MSM implementation follows pinned
 [cuZK sparse/balanced Pippenger](https://github.com/Tao-Lu-123/cuZK/blob/88e3295cada379abe06240df23ec6c9fc0f648b2/depends/libff-cuda/scalar_multiplication/multiexp.cu),
-adapted to DAV_2201 without CUDA ticket atomics: stable integer radix grouping,
-CSR bucket rows, bounded 64-point tasks and fan-in-64 bucket-partial reduction.
+adapted to DAV_2201 without CUDA ticket atomics: route-aware stable integer
+radix grouping on device (one 1-8-bit pass for c<=8, a gated 9-16-bit
+fast/fallback pair, three least-significant 1-8-bit passes for c=17-20),
+device-produced CSR bucket rows and task schedule, bounded 64-point tasks and
+fan-in-64 bucket-partial reduction. Digit width is metadata only; the point and
+field arithmetic below is unchanged.
 Level-zero tasks are stably grouped by length across SIMD lanes, but retain
 their original point order and partial-output positions. Weighted segments fit
 the available AIV lanes with a minimum span of16; their final tree uses fan-in4
@@ -328,12 +332,12 @@ showed a corrupted scratch copy; explicit mask/repeat addressing passed the
 same case and full regression. No general SDK limitation is inferred.
 Bucket materialization copies Montgomery 192-byte tuples and synthesizes
 empty-bucket identities; it does not perform Montgomery conversions or field
-arithmetic. Its UB tile is 64 records, with public prefix metadata controlling
-DMA addresses.
+arithmetic. Its UB tile is 64 records, with device-produced `ScheduleMeta`
+and `TaskPrefix` bytes controlling DMA addresses.
 
 The field arena is 88512 bytes. Eleven extra G1 field banks, a 9216-byte point
 buffer and 3072-byte metadata buffer bring explicit UB usage to 168384 bytes.
-`msm_required_ub_bytes=176576` includes the 8192-byte SDK reservation; plans below
+`msm_required_ub_bytes=190400` includes the 8192-byte SDK reservation; plans below
 that queried capacity are rejected before launch. Scalar reads cover public
 indices/weights and derived Boolean control aggregates, never coordinate words
 or Fq arithmetic. The same-point branch is data-dependent, not constant-time.
@@ -352,7 +356,9 @@ This is stage attribution, not a warmed comparable timing sample.
 The following complete-MSM measurements use identical inputs within each size,
 distinct subgroup bases and full-width canonical random Fr scalars. Input
 generation, allocation, file reads and initial upload are excluded; all device
-stages, CPU metadata handoffs, final96-byte D2H and completion are included.
+stages, any CPU metadata handoffs the measured implementation performed,
+final96-byte D2H and completion are included. Rows measured after the R30
+device-metadata change perform no online CPU metadata handoff.
 Every warmup and target exactly matched the independent arkworks0.6 result.
 
 | Points | Implementation | Warmups | Timed samples | Reported statistic | Seconds |
@@ -366,31 +372,39 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Signed cancellation checkpoint | 1 | 3 | median | 1.768330 |
 | 2^20 | Unscaled point addition checkpoint, `97e663f` | 1 | 3 | median | 1.667716 |
 | 2^20 | Current packed64 point stages, automatic16-bit window | 1 | 3 | median | 1.475164 |
+| 2^20 | Device radix/CSR/schedule, prepared, automatic16-bit window (`R30`) | 1 | 3 | median | 1.363333293 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
 | 2^25 | Signed cancellation and wider-window checkpoint | 1 | 3 | median | 42.170683 |
 | 2^25 | Unscaled point addition checkpoint, `97e663f` | 1 | 3 | median | 39.730811 |
 | 2^25 | Current packed64 point stages, automatic19-bit window | 1 | 3 | median | 34.338448 |
+| 2^25 | Device radix/CSR/schedule, prepared, explicit20-bit window (`R30`) | 1 | 3 | median | 29.804091049 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
 The current native implementation supports2–20-bit windows. Removing the old
 16-bit ceiling lets the unchanged cuZK heuristic select19 bits at`2^25`,
-reducing the number of windows from16 to14. With packed64 point stages,
-complete warmed MSM is25.56% faster than the matched CPU reference at this size,
-and7.22% faster at`2^20`.
+reducing the number of windows from16 to14. With packed64 point stages and
+device-side metadata, complete warmed prepared MSM is30.87% faster than the
+matched 16-thread CPU reference at`2^25` (29.804091049s vs43.114322s) and
+13.80% faster at`2^20` (1.363333293s vs1.581598s). The`2^25` figure uses the
+explicit20-bit window; the automatic19-bit window was not re-measured for this
+metadata change.
 Both sizes passed one warmup and three exact targets with strict resource
 audits. Full host capacity/rejection checks and native field, G1, MSM, replay
-and two-stream regressions passed, including high bucket bits, a fifth radix
-pass and explicit17/20-bit MSM cases. New point cases isolate equality votes
-in lanes47/48/63, a next-tile tail, and127/128/129 input boundaries.
+and two-stream regressions passed, including high bucket bits, the three-pass
+route-2 grouping and explicit17/20-bit MSM cases. New point cases isolate
+equality votes in lanes47/48/63, a next-tile tail, and127/128/129 input
+boundaries.
 An earlier48-lane private-arithmetic probe passed960 pairs/164160 exact checks
 covering REDC, aliases, live masks, `0/p`, inversion and canonical serialization.
 The packed64 integer-bridge probe separately covers all4096 digit values,
 permuted lane/row patterns, source/coordinate guards, I32 return-mask reuse and
 real HBM interleave-index restoration; all655360 output bytes match its CPU oracle.
 Only the old pre-cache NPU figures are1+1 diagnostic checkpoints.
-CPU10x and`2^25<1s` remain unmet.
+CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet; the
+prepared`2^20` candidate is still slower than the user-reported 8-thread ~1.0s
+CPU approximation, which this run did not measure.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
 integrated. Source, raw records, input/binary identities and rejected candidates
 remain under `target/msm-hotspot/`; those generated artifacts are not
@@ -430,14 +444,18 @@ oracle dependency is added to the normal smoke command above.
 The CPU tool performs a separate reference call, one warmup and three targets.
 It excludes preparation/serialization and includes arkworks' internal MSM
 allocations. Native compute permits no allocations or unexpected explicit
-copies. The current `2^20` run transfers8388736B D2H and12440440B H2D metadata
-with16 internal syncs; device/pinned scratch is180736576/2949440B, including
-the base cache and stable task order. No numerical intermediate is transferred
-to the host. At`2^25`, the current19-bit plan transfers58720368B D2H and
-163712580B H2D metadata with14 syncs; device/pinned scratch is
-4597747968/29360512B. The larger window trades metadata/scratch capacity for
-less point accumulation. Final96B D2H and one completion wait are separate.
-Sorting and CSR are unchanged; point-coordinate arithmetic is Vector throughout.
+copies. The prepared `2^20` candidate (c=16) issues zero compute H2D, zero
+compute D2H and zero stream synchronizations inside `run_msm_prepared`; only the
+separate final96-byte D2H and one completion wait remain. Its queried one-shot
+workspace is182910272B (prepared scratch82246976B plus the immutable
+100663296B base cache), and pinned host workspace is2949440B, which stays
+reserved and untouched online. At`2^25` with the explicit20-bit window the
+workspace is5016826688B (prepared scratch1795601216B plus the3221225472B
+cache) and pinned host workspace is56623488B. With the automatic19-bit window
+the plan predicts4614747136B workspace and29360512B pinned scratch; that
+configuration was not measured. No numerical intermediate returns to the host.
+The radix grouping, CSR production and task scheduling are device-side;
+point-coordinate arithmetic is Vector throughout.
 
 
 
@@ -458,7 +476,9 @@ This internal C++ API borrows HBM inputs (`96*N` bytes of canonical Affine bases
 scratch. `msm_plan.h` is ACL-free and computes exact host/device capacities.
 Device scratch includes `96*N` bytes for the packed Montgomery base cache;
 allocate the queried plan capacity rather than retaining an older byte count.
-Pinned scratch also includes the bounded task-order metadata; no point or field
+Pinned scratch remains part of the borrowed contract and is size-checked, but
+the device-metadata path never writes or reads it online; task prefixes and the
+length-balanced order are produced in device scratch. No point or field
 values are added to numerical host transfers.
 `N <= UINT32_MAX`; explicit windows are2–20 bits, with0 selecting the cuZK-style
 automatic heuristic capped at20. Platform requirements are at least one AIV
@@ -491,31 +511,36 @@ one-shot capacity (odd counts retain 32 bytes of final padding). For `N=0` these
 three capacities are zero, but output still requires 96 valid bytes; cold
 preparation still completes its stream before publishing the empty view.
 
-Unlike the Fr launchers, `run_msm` performs CPU metadata scheduling. For each
-of `W=ceil(255/c)` windows it downloads exactly `8*(2^c+1)` bytes of CSR row
-pointers and synchronizes the caller's stream. The existing one upload per active
-window contains actual-level task prefixes followed by one uint32 original task
-index per level-zero task. The CPU derives this length-balancing order from the
-CSR rows; point/scalar and sorted-record arrays stay on device. Points, buckets
-and partial points never return to the CPU.
-No host/device allocation or free occurs inside `run_msm`. The measured million-
-point case (`c=16`, `W=16`) transfers8388736B D2H and12440440B H2D metadata with
-16 synchronizations. The new order contributes4050808B H2D across all windows;
-there is no new copy call or numerical host transfer. Allocate queried pinned
-and device capacities rather than reusing the previous smaller scratch sizes.
-
-`ACL_SUCCESS` means internal metadata handoffs succeeded and the finish kernel
-was enqueued, **not** that the final point is ready. Keep inputs, output and
-both scratch allocations alive until stream completion, including after a
-failure with earlier work outstanding. Do not share either scratch buffer
-between concurrent calls. Invalid plans, alignment, sizes or overlapping ranges
-return `ACL_ERROR_INVALID_PARAM` before enqueue; invalid downloaded CSR returns
-`ACL_ERROR_INTERNAL_ERROR`; ACL copy/sync errors propagate unchanged.
+`run_msm` performs no online CPU metadata scheduling. For each of
+`W=ceil(255/c)` windows the device radix group writes sorted records and a
+`RadixControl` word (final record parity, bounded-fallback flag, maximum coarse
+partition); the device schedule then writes `ScheduleMeta` (per-level task counts
+and the task-order offset) plus the stable length-balanced `TaskPrefix`/order into
+device scratch. Every consumer reads those counts and the parity on device and
+uses fixed grids, so there is no per-window D2H, no caller-stream synchronization
+and no H2D inside the compute path. An empty window keeps the exact Montgomery
+identity and later stages idle on the device count. Points, buckets and partial
+points never return to the CPU. No host/device allocation or free occurs inside
+`run_msm`. The measured prepared `2^20` call (`c=16`) issues zero compute
+copies, zero compute stream synchronizations and zero compute allocations; only
+the final96-byte download and one completion wait occur. Allocate the queried
+pinned and device capacities rather than reusing the previous smaller scratch
+sizes.
+`ACL_SUCCESS` means every stage was enqueued successfully, **not** that the final
+point is ready. Keep inputs, output and both scratch allocations alive until
+stream completion, including after a failure with earlier work outstanding. Do
+not share either scratch buffer between concurrent calls. Invalid plans,
+alignment, sizes or overlapping ranges return `ACL_ERROR_INVALID_PARAM` before
+enqueue; the compute path no longer downloads or validates a CSR, so the old
+`ACL_ERROR_INTERNAL_ERROR` metadata path is gone, and ACL errors raised by the
+caller's own setup propagate unchanged.
 For `N=0`, inputs and both scratch pointers may be null with zero capacity:
 the finish kernel writes identity without metadata transfers or internal sync.
 
-Production kernels compile separately in `msm_sort.asc`, `msm_rows.asc`,
-`msm_accumulate.asc` and `msm_reduce.asc`; orchestration remains ordinary C++.
+Production kernels compile separately in `msm_sort.asc`, `msm_schedule.asc`,
+`msm_rows.asc`, `msm_accumulate.asc` and `msm_reduce.asc`; orchestration remains
+ordinary C++. `msm_schedule.asc` produces the device CSR schedule metadata and
+contains no point or field arithmetic.
 MSM fixtures use independent Python affine arithmetic with known generator
 coefficients, distinct large-case bases and small-case direct-MSM cross-checks.
 
@@ -537,10 +562,12 @@ target/ascend910b3-native-math/native_math_smoke \
 
 The default smoke adds metadata diagnostics, complete MSM cases, scratch replay,
 independent-stream storage, preflight rejection and guard/input-immutability
-checks. `uniform-65536` is explicit-only. `MSM_CUZK_RESIDENT_PASS` reports exact
-metadata bytes and synchronization counts; its audit permits only the two
-metadata address ranges and requires zero other explicit copies and zero
-compute allocations/frees. Final output download is separately audited as
+checks. `uniform-65536` is explicit-only. `MSM_CUZK_RESIDENT_PASS` reports zero
+compute metadata copies, zero compute H2D/D2H bytes and zero compute stream
+synchronizations; its audit permits no compute copy range and requires zero
+other explicit copies and zero compute allocations/frees. Diagnostic metadata
+readbacks belong to the test and stay outside the audited compute window. Final
+output download is separately audited as
 96 bytes and one stream sync. `MSM_METADATA_NPU_PASS` and `MSM_NPU_PASS` augment,
 not replace, the existing field/G1 markers; host acceptance adds `MSM_HOST_PASS`.
 
@@ -558,9 +585,10 @@ so only lane47 encounters equal points before inverse cancellation; the
 mixed-exceptions-65 fixture exercises nonunit-Z equal/opposite additions.
 The original scalar G1 tests and protocol ABI remain unchanged.
 On the checked 910B3, the queried platform has
-40 AIV cores and 196352 UB bytes. The large single case uses 8005888 bytes of
-device scratch and 262400 bytes of pinned host scratch; its measured explicit
-metadata budget is 1310880 bytes D2H, 1377600 bytes H2D and 20 stream syncs.
+40 AIV cores and 196352 UB bytes. The milestone-gate fixture's device scratch,
+pinned host scratch and its zero online metadata-transfer counts are read from
+that run's `NPU_INPUTS_READY` line and result JSON; the pre-R30 transfer budget
+is not restated here because the device-metadata layout has different regions.
 
 **Pre-Vector profiling limitation with the checked CANN 9.1.0 runtime.**
 The seven metric groups and sample-based data for `uniform-4097`,

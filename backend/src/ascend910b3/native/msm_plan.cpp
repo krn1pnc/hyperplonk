@@ -36,10 +36,17 @@ bool make_msm_plan(size_t count, const MsmPlatform& platform, uint32_t bits,
     }
     p.window_bits = bits;
     if (!count) { out = p; return true; }
+    const MsmRadixPassPlan digits = make_msm_radix_pass_plan(bits);
     p.windows = (255 + bits - 1) / bits;
     p.buckets = uint32_t{1} << bits;
-    p.radix_passes = (bits + 3) / 4;
-    p.chunks = static_cast<uint32_t>(ceil_div(count,2048));
+    p.radix_route = digits.route;
+    p.radix_passes = digits.passes;
+    for (uint32_t i = 0; i < msm_radix_max_passes; ++i) p.radix_pass_bits[i] = digits.pass_bits[i];
+    p.radix_max_bits = digits.max_bits;
+    p.radix_bins = digits.bins;
+    p.radix_high_bits = digits.high_bits;
+    p.radix_low_bits = digits.low_bits;
+    p.chunks = static_cast<uint32_t>(ceil_div(count, msm_radix_chunk_records));
     p.merge_levels = levels(ceil_div(count,64));
     p.row_blocks = static_cast<uint32_t>(ceil_div(uint64_t(p.buckets)+1,256));
     // Fit one packed-coordinate point tile per available AIV, without making
@@ -51,7 +58,9 @@ bool make_msm_plan(size_t count, const MsmPlatform& platform, uint32_t bits,
     // The weighted tail has much less parallel work than bucket partials.
     p.weighted_levels = levels(p.weighted_segments,4);
     uint64_t padded_rows = 0, fragment_bound = 0, temp = 0, prefix_bytes = 0;
-    if (!round_up(count,8,p.dense_records) || !mul(112,p.chunks,temp) ||
+    // Each digit gains at most seven 8-record padding records per chunk.
+    if (!round_up(count,8,p.dense_records) ||
+        !mul(uint64_t{7} * p.radix_bins, p.chunks, temp) ||
         !add(count,temp,fragment_bound) || !round_up(fragment_bound,8,p.fragment_records) ||
         !round_up(uint64_t(p.buckets)+1,8,padded_rows) || !mul(padded_rows,8,temp)) return false;
     p.host_prefix_offset = temp;
@@ -76,14 +85,16 @@ bool make_msm_plan(size_t count, const MsmPlatform& platform, uint32_t bits,
     if (!region(MsmRegion::RecordsA,p.dense_records,8) ||
         !region(MsmRegion::RecordsB,p.dense_records,8) ||
         !region(MsmRegion::RadixFragments,p.fragment_records,8) ||
-        !region(MsmRegion::RadixHistogram,p.chunks,64) ||
-        !region(MsmRegion::RadixDescriptors,p.chunks,64*16) ||
-        !region(MsmRegion::RadixDigitTotals,16,64) ||
+        !region(MsmRegion::RadixHistogram,p.chunks,p.radix_bins*4ull) ||
+        !region(MsmRegion::RadixDescriptors,p.chunks,p.radix_bins*32ull) ||
+        !region(MsmRegion::RadixDigitTotals,p.radix_bins,64) ||
+        !region(MsmRegion::RadixControl,1,msm_radix_control_bytes) ||
         !region(MsmRegion::RowStarts,uint64_t(p.buckets)+1,64) ||
         !region(MsmRegion::RowLocal,padded_rows,8) ||
         !region(MsmRegion::RowPtr,padded_rows,8) ||
         !region(MsmRegion::RowBlockMin,p.row_blocks,64) ||
         !region(MsmRegion::RowBlockCarry,p.row_blocks,64) ||
+        !region(MsmRegion::ScheduleMeta,1,msm_schedule_layout(p.row_blocks).bytes) ||
         !region(MsmRegion::TaskPrefix,prefix_bytes,1) ||
         !region(MsmRegion::Tasks,p.partial_capacity[0],64) ||
         !region(MsmRegion::PartialA,p.partial_capacity[0],192) ||
@@ -105,7 +116,12 @@ bool validate_msm_plan(const MsmPlan& a) noexcept {
         a.window_bits != b.window_bits || a.windows != b.windows || a.buckets != b.buckets ||
         a.radix_passes != b.radix_passes || a.chunks != b.chunks || a.merge_levels != b.merge_levels ||
         a.row_blocks != b.row_blocks || a.weighted_segments != b.weighted_segments ||
-        a.weighted_levels != b.weighted_levels) return false;
+        a.weighted_levels != b.weighted_levels ||
+        a.radix_route != b.radix_route || a.radix_max_bits != b.radix_max_bits ||
+        a.radix_bins != b.radix_bins || a.radix_high_bits != b.radix_high_bits ||
+        a.radix_low_bits != b.radix_low_bits) return false;
+    for (unsigned i=0;i<msm_radix_max_passes;++i)
+        if (a.radix_pass_bits[i]!=b.radix_pass_bits[i]) return false;
     for (unsigned i=0;i<2;++i) if (a.partial_capacity[i]!=b.partial_capacity[i]) return false;
     for (unsigned i=0;i<msm_region_count;++i)
         if (a.region_offset[i]!=b.region_offset[i] || a.region_size[i]!=b.region_size[i]) return false;

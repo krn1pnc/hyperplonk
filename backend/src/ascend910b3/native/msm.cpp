@@ -78,42 +78,28 @@ aclError run_msm(aclrtStream stream,const G1Affine* bases,const Fr* scalars,
 namespace {
 // The only post-preparation compute implementation. Cache is independent of
 // scratch, so prepared callers never form the old final-region cache address.
+// Every dynamic count, ordering offset and record parity is produced and
+// consumed on device: no H2D, D2H or host synchronization happens online. The
+// pinned host workspace stays allocated and validated but is never touched here.
 aclError compute_msm(aclrtStream stream,const void* cache,const Fr* scalars,
                      G1Affine* out,void* workspace,void* pinned_host_workspace,
                      const MsmPlan& p) {
+    (void)pinned_host_workspace;
     if (!p.count) {
         launch_msm_finish(stream,nullptr,out,p); return ACL_SUCCESS;
     }
-    auto* rows=static_cast<uint64_t*>(pinned_host_workspace);
-    auto* prefix=reinterpret_cast<uint64_t*>(static_cast<uint8_t*>(pinned_host_workspace)+p.host_prefix_offset);
-    const size_t row_bytes=8*(static_cast<size_t>(p.buckets)+1);
     for (uint32_t w=0;w<p.windows;++w) {
         launch_msm_extract(stream,scalars,workspace,p,w);
-        for (uint32_t pass=0;pass<p.radix_passes;++pass)
-            launch_msm_radix_pass(stream,workspace,p,pass);
+        launch_msm_radix_group(stream,workspace,p);
         launch_msm_rows(stream,workspace,p);
-        aclError status=aclrtMemcpyAsync(rows,row_bytes,region(workspace,p,MsmRegion::RowPtr),
-                                         row_bytes,ACL_MEMCPY_DEVICE_TO_HOST,stream);
-        if (status!=ACL_SUCCESS) return status;
-        status=aclrtSynchronizeStream(stream);
-        if (status!=ACL_SUCCESS) return status;
-        MsmSchedule schedule{};
-        if (!make_msm_schedule(p,rows,prefix,schedule)) return ACL_ERROR_INTERNAL_ERROR;
-        const bool empty=schedule.task_count[0]==0;
-        if (!empty) {
-            const size_t bytes=static_cast<size_t>(schedule.order_offset+sizeof(uint32_t)*schedule.task_count[0]);
-            status=aclrtMemcpyAsync(region(workspace,p,MsmRegion::TaskPrefix),
-                                    p.region_size[static_cast<unsigned>(MsmRegion::TaskPrefix)],
-                                    prefix,bytes,ACL_MEMCPY_HOST_TO_DEVICE,stream);
-            if (status!=ACL_SUCCESS) return status;
-            launch_msm_tasks(stream,workspace,p,0,schedule.task_count[0]);
-            launch_msm_partial_sums(stream,cache,workspace,p,schedule.task_count[0],schedule.order_offset);
-            for (uint32_t level=1;level<=schedule.merge_levels;++level) {
-                launch_msm_tasks(stream,workspace,p,level,schedule.task_count[level]);
-                launch_msm_partial_merge(stream,workspace,p,level,schedule.task_count[level]);
-            }
+        launch_msm_schedule(stream,workspace,p);
+        launch_msm_tasks(stream,workspace,p,0);
+        launch_msm_partial_sums(stream,cache,workspace,p);
+        for (uint32_t level=1;level<=p.merge_levels;++level) {
+            launch_msm_tasks(stream,workspace,p,level);
+            launch_msm_partial_merge(stream,workspace,p,level);
         }
-        launch_msm_window_reduce(stream,workspace,p,w,schedule.merge_levels,empty);
+        launch_msm_window_reduce(stream,workspace,p,w);
     }
     launch_msm_finish(stream,workspace,out,p);
     return ACL_SUCCESS;

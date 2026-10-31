@@ -418,7 +418,12 @@ bool same_msm_plan(const hp::detail::MsmPlan& a, const hp::detail::MsmPlan& b) {
         || a.window_bits != b.window_bits || a.windows != b.windows || a.buckets != b.buckets
         || a.radix_passes != b.radix_passes || a.chunks != b.chunks || a.merge_levels != b.merge_levels
         || a.row_blocks != b.row_blocks || a.weighted_segments != b.weighted_segments
-        || a.weighted_levels != b.weighted_levels) return false;
+        || a.weighted_levels != b.weighted_levels
+        || a.radix_route != b.radix_route || a.radix_max_bits != b.radix_max_bits
+        || a.radix_bins != b.radix_bins || a.radix_high_bits != b.radix_high_bits
+        || a.radix_low_bits != b.radix_low_bits) return false;
+    for (unsigned i = 0; i < 3; ++i)
+        if (a.radix_pass_bits[i] != b.radix_pass_bits[i]) return false;
     for (unsigned i = 0; i < 2; ++i)
         if (a.partial_capacity[i] != b.partial_capacity[i]) return false;
     for (unsigned i = 0; i < hp::detail::msm_region_count; ++i)
@@ -436,6 +441,15 @@ void msm_host_suite() {
         while (n > 1) { n = ceil_div(n, 64); ++result; }
         return result;
     };
+    const auto at = [](MsmRegion region) { return static_cast<unsigned>(region); };
+    // Frozen balanced digit plan: ceil(c/8) levels, q+1 digits for i<r else q.
+    const auto digit_plan = [&](uint32_t c, uint32_t* out, uint32_t& count, uint32_t& max_bits) {
+        count = static_cast<uint32_t>(ceil_div(c, 8));
+        const uint32_t q = c / count, r = c % count;
+        for (uint32_t i = 0; i < msm_radix_max_passes; ++i)
+            out[i] = i < count ? q + (i < r ? 1u : 0u) : 0u;
+        max_bits = q + (r ? 1u : 0u);
+    };
     const std::array<uint64_t, 9> sizes{0,1,64,65,2048,2049,65537,UINT32_MAX,4097};
     for (const uint64_t n : sizes) for (const uint32_t requested : {0u,2u,3u,4u,12u,16u,17u,19u,20u}) {
         MsmPlan p{};
@@ -449,31 +463,59 @@ void msm_host_suite() {
                     && !p.windows && !p.buckets && !p.chunks && !p.merge_levels
                     && !p.row_blocks && !p.radix_passes && !p.weighted_segments && !p.weighted_levels
                     && !p.dense_records && !p.fragment_records
-                    && !p.partial_capacity[0] && !p.partial_capacity[1], "MSM empty plan shape");
+                    && !p.partial_capacity[0] && !p.partial_capacity[1]
+                    && !p.radix_route && !p.radix_max_bits && !p.radix_bins
+                    && !p.radix_high_bits && !p.radix_low_bits
+                    && !p.radix_pass_bits[0] && !p.radix_pass_bits[1] && !p.radix_pass_bits[2],
+                    "MSM empty plan shape");
             for (unsigned i = 0; i < msm_region_count; ++i)
                 require(!p.region_size[i] && !p.region_offset[i], "MSM empty region");
             continue;
         }
-        const uint64_t b = uint64_t{1} << c, chunks = ceil_div(n, 2048);
+        const uint64_t b = uint64_t{1} << c, chunks = ceil_div(n, msm_radix_chunk_records);
+        uint32_t digits[3]{}, passes = 0, max_bits = 0;
+        digit_plan(c, digits, passes, max_bits);
+        const uint64_t bins = uint64_t{1} << max_bits;
+        const uint32_t route = c <= 8 ? 0u : (c <= 16 ? 1u : 2u);
         const uint64_t t = 8 * round8(b + 1);
         const uint64_t m0 = ceil_div(n, 64) + b, m1 = ceil_div(n, 4096) + b;
         const uint32_t l = levels(ceil_div(n, 64));
         const bool weighted_tree = p.weighted_segments > 1;
         const uint64_t prefix_capacity = ceil_div(t * (l + 1) + 4 * m0, 64) * 64;
-        require(p.windows == ceil_div(255, c) && p.buckets == b && p.radix_passes == ceil_div(c, 4)
+        require(p.windows == ceil_div(255, c) && p.buckets == b && p.radix_passes == passes
                 && p.chunks == chunks && p.merge_levels == l && p.row_blocks == ceil_div(b + 1, 256)
                 && p.weighted_segments >= 1 && p.weighted_segments < b
                 && bool(p.weighted_levels) == weighted_tree,
                 "MSM plan derived shape");
-        require(p.dense_records == round8(n) && p.fragment_records == round8(n + 112 * chunks)
+        require(p.radix_route == route && p.radix_max_bits == max_bits && p.radix_bins == bins
+                && p.radix_low_bits == digits[0] && p.radix_high_bits == (passes > 1 ? digits[1] : 0)
+                && p.radix_pass_bits[0] == digits[0] && p.radix_pass_bits[1] == digits[1]
+                && p.radix_pass_bits[2] == digits[2], "MSM radix route/digit plan");
+        require(p.dense_records == round8(n) && p.fragment_records == round8(n + 7 * bins * chunks)
                 && p.partial_capacity[0] == m0 && p.partial_capacity[1] == ((l || weighted_tree) ? m1 : 0),
                 "MSM plan record and partial capacities");
-        const std::array<uint64_t, msm_region_count> bytes{
-            8 * round8(n), 8 * round8(n), 8 * round8(n + 112 * chunks),
-            64 * chunks, 64 * 16 * chunks, 64 * 16, 64 * (b + 1), t, t,
-            64 * ceil_div(b + 1, 256), 64 * ceil_div(b + 1, 256), prefix_capacity,
-            64 * m0, 192 * m0, 192 * ((l || weighted_tree) ? m1 : 0), 192 * b, 192 * ceil_div(255, c),
-            96 * n};
+        std::array<uint64_t, msm_region_count> bytes{};
+        bytes[at(MsmRegion::RecordsA)] = 8 * round8(n);
+        bytes[at(MsmRegion::RecordsB)] = 8 * round8(n);
+        bytes[at(MsmRegion::RadixFragments)] = 8 * round8(n + 7 * bins * chunks);
+        bytes[at(MsmRegion::RadixHistogram)] = 4 * bins * chunks;
+        bytes[at(MsmRegion::RadixDescriptors)] = 32 * bins * chunks;
+        bytes[at(MsmRegion::RadixDigitTotals)] = 64 * bins;
+        bytes[at(MsmRegion::RadixControl)] = msm_radix_control_bytes;
+        bytes[at(MsmRegion::RowStarts)] = 64 * (b + 1);
+        bytes[at(MsmRegion::RowLocal)] = t;
+        bytes[at(MsmRegion::RowPtr)] = t;
+        bytes[at(MsmRegion::RowBlockMin)] = 64 * ceil_div(b + 1, 256);
+        bytes[at(MsmRegion::RowBlockCarry)] = 64 * ceil_div(b + 1, 256);
+        bytes[at(MsmRegion::ScheduleMeta)] = ceil_div(msm_schedule_meta_header_bytes
+            + uint64_t(msm_schedule_meta_tile_bytes) * ceil_div(b + 1, 256), 64) * 64;
+        bytes[at(MsmRegion::TaskPrefix)] = prefix_capacity;
+        bytes[at(MsmRegion::Tasks)] = 64 * m0;
+        bytes[at(MsmRegion::PartialA)] = 192 * m0;
+        bytes[at(MsmRegion::PartialB)] = 192 * ((l || weighted_tree) ? m1 : 0);
+        bytes[at(MsmRegion::Buckets)] = 192 * b;
+        bytes[at(MsmRegion::Windows)] = 192 * ceil_div(255, c);
+        bytes[at(MsmRegion::MontgomeryBases)] = 96 * n;
         uint64_t end = 0;
         for (unsigned i = 0; i < bytes.size(); ++i) {
             require(p.region_size[i] == bytes[i], "MSM region capacity");
@@ -495,6 +537,106 @@ void msm_host_suite() {
                 && p.workspace_bytes <= static_cast<uint64_t>(SIZE_MAX)
                 && p.host_prefix_offset == t && p.host_workspace_bytes == t + prefix_capacity,
                 "MSM total host/device workspace");
+    }
+    if (SIZE_MAX > UINT32_MAX) {
+        for (uint32_t c = 2; c <= 20; ++c) {
+            MsmPlan p{};
+            require(make_msm_plan(static_cast<size_t>(UINT32_MAX), platform, c, p),
+                    "MSM UINT32_MAX metadata plan rejected");
+            require(validate_msm_plan(p), "MSM UINT32_MAX metadata plan invalid");
+        }
+    }
+    {
+        // Frozen hot numbers: c=16, N=2^20. Region geometry stays formula-derived
+        // (written sizes, alignment, disjointness, full workspace) rather than a
+        // second literal layout table.
+        MsmPlan hot{};
+        require(make_msm_plan(size_t{1} << 20, platform, 16, hot), "MSM hot plan rejected");
+        require(hot.dense_records == 1048576 && hot.fragment_records == 1277952
+                && hot.chunks == 128 && hot.merge_levels == 3 && hot.row_blocks == 257
+                && hot.radix_route == 1 && hot.radix_bins == 256
+                && hot.radix_pass_bits[0] == 8 && hot.radix_pass_bits[1] == 8
+                && hot.partial_capacity[0] == 81920 && hot.partial_capacity[1] == 65792
+                && hot.host_prefix_offset == 524352 && hot.host_workspace_bytes == 2949440
+                && hot.workspace_bytes == 182910272, "MSM frozen hot plan numbers");
+    }
+    {
+        // Frozen all-c upper bounds at N=2^20 (bytes).
+        struct Upper {
+            uint32_t c, route, bins, chunks;
+            uint64_t fragments, histogram, descriptors, schedule, prefix, workspace, scratch;
+        };
+        const std::array<Upper,19> upper{{
+            {2,0,4,128,8417280,2048,16384,1728,65856,130215296,29552000},
+            {3,0,8,128,8445952,4096,32768,1728,66112,130257600,29594304},
+            {4,0,16,128,8503296,8192,65536,1728,66368,130354304,29691008},
+            {5,0,32,128,8617984,16384,131072,1728,66944,130553344,29890048},
+            {6,0,64,128,8847360,32768,262144,1728,68096,130954880,30291584},
+            {7,0,128,128,9306112,65536,524288,1728,70400,131759872,31096576},
+            {8,0,256,128,10223616,131072,1048576,2368,75008,133371968,32708672},
+            {9,1,32,128,8617984,16384,131072,3008,84224,130913536,30250240},
+            {10,1,32,128,8617984,16384,131072,4224,102656,131301504,30638208},
+            {11,1,64,128,8847360,32768,262144,6656,139520,132457088,31793792},
+            {12,1,64,128,8847360,32768,262144,11584,213248,134010944,33347648},
+            {13,1,128,128,9306112,65536,524288,21440,360704,137876800,37213504},
+            {14,1,128,128,9306112,65536,524288,41152,655616,144093568,43430272},
+            {15,1,256,128,10223616,131072,1048576,80576,1245440,158042624,57379328},
+            {16,1,256,128,10223616,131072,1048576,159424,2425088,182910272,82246976},
+            {17,2,64,128,8847360,32768,262144,317120,4784384,230372480,129709184},
+            {18,2,64,128,8847360,32768,262144,632512,9502976,329843840,229180544},
+            {19,2,128,128,9306112,65536,524288,1263296,18940160,529544128,428880832},
+            {20,2,128,128,9306112,65536,524288,2524864,37814528,927429376,826766080}}};
+        for (const auto& row : upper) {
+            MsmPlan p{};
+            require(make_msm_plan(size_t{1} << 20, platform, row.c, p), "MSM all-c upper plan rejected");
+            require(p.radix_route == row.route && p.radix_bins == row.bins && p.chunks == row.chunks
+                    && 8 * p.fragment_records == row.fragments && p.workspace_bytes == row.workspace
+                    && p.region_offset[at(MsmRegion::MontgomeryBases)] == row.scratch
+                    && p.region_size[at(MsmRegion::RadixHistogram)] == row.histogram
+                    && p.region_size[at(MsmRegion::RadixDescriptors)] == row.descriptors
+                    && p.region_size[at(MsmRegion::ScheduleMeta)] == row.schedule
+                    && p.region_size[at(MsmRegion::TaskPrefix)] == row.prefix,
+                    "MSM all-c upper bounds mismatch");
+        }
+    }
+    {
+        // Frozen UINT32_MAX metadata-only bounds: pure arithmetic, never allocated.
+        struct Bound { uint32_t c; uint64_t workspace, scratch, host; };
+        const std::array<Bound,6> bounds{{
+            {2,533238674880ull,120921814528ull,268435968ull},
+            {8,545393961088ull,133077100736ull,268451264ull},
+            {9,534589617472ull,122272757120ull,268466624ull},
+            {16,545444543872ull,133127683520ull,272368064ull},
+            {17,536234292416ull,123917432064ull,276300224ull},
+            {20,540032283456ull,127715423104ull,331350464ull}}};
+        for (const auto& row : bounds) {
+            MsmPlan p{};
+            require(make_msm_plan(static_cast<size_t>(UINT32_MAX), platform, row.c, p),
+                    "MSM UINT32_MAX bound plan rejected");
+            require(p.workspace_bytes == row.workspace && p.host_workspace_bytes == row.host
+                    && p.region_offset[at(MsmRegion::MontgomeryBases)] == row.scratch,
+                    "MSM UINT32_MAX metadata bound mismatch");
+        }
+    }
+    {
+        MsmPlan base{};
+        require(make_msm_plan(65537, platform, 16, base), "MSM validator base plan rejected");
+        require(validate_msm_plan(base), "MSM valid plan rejected by validator");
+        const auto rejected = [&](const MsmPlan& bad, const char* what) {
+            require(!validate_msm_plan(bad), std::string("MSM corrupted plan accepted: ") + what);
+        };
+        auto changed = base; ++changed.radix_route; rejected(changed, "radix_route");
+        changed = base; ++changed.radix_max_bits; rejected(changed, "radix_max_bits");
+        changed = base; ++changed.radix_bins; rejected(changed, "radix_bins");
+        changed = base; ++changed.radix_high_bits; rejected(changed, "radix_high_bits");
+        changed = base; ++changed.radix_low_bits; rejected(changed, "radix_low_bits");
+        for (unsigned i = 0; i < 3; ++i) {
+            changed = base; ++changed.radix_pass_bits[i]; rejected(changed, "radix_pass_bits");
+        }
+        changed = base; ++changed.region_size[at(MsmRegion::RadixControl)];
+        rejected(changed, "RadixControl size");
+        changed = base; ++changed.region_offset[at(MsmRegion::ScheduleMeta)];
+        rejected(changed, "ScheduleMeta offset");
     }
     MsmPlan sentinel{};
     require(make_msm_plan(2049, platform, 12, sentinel), "MSM sentinel plan");

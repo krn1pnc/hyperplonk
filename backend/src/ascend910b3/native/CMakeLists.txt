@@ -28,7 +28,7 @@ endforeach()
 
 add_library(hyperplonk_ascend910b3_math STATIC
     math_kernels.asc field_kernels.asc math_tiling.cpp msm.cpp msm_plan.cpp
-    msm_sort.asc msm_rows.asc msm_accumulate.asc msm_reduce.asc)
+    msm_sort.asc msm_rows.asc msm_accumulate.asc msm_reduce.asc msm_schedule.asc)
 target_include_directories(hyperplonk_ascend910b3_math PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}" ${CANN_INCLUDE_DIRS})
 target_link_libraries(hyperplonk_ascend910b3_math PUBLIC
@@ -55,7 +55,9 @@ add_executable(native_math_smoke
     tests/runtime_audit.cpp)
 target_link_libraries(native_math_smoke PRIVATE Threads::Threads)
 add_executable(msm_benchmark tests/msm_benchmark.cpp tests/runtime_audit.cpp)
-foreach(runner IN ITEMS native_math_smoke msm_benchmark)
+# Metadata gate: grouping + CSR + schedule equality before any MSM work.
+add_executable(msm_metadata_check tests/msm_metadata_check.cpp tests/runtime_audit.cpp)
+foreach(runner IN ITEMS native_math_smoke msm_benchmark msm_metadata_check)
     target_link_libraries(${runner} PRIVATE hyperplonk_ascend910b3_math)
     target_link_options(${runner} PRIVATE
         "-Wl,--wrap=aclrtMemcpy"
