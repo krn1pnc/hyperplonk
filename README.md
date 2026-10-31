@@ -282,6 +282,12 @@ fast/fallback pair, three least-significant 1-8-bit passes for c=17-20),
 device-produced CSR bucket rows and task schedule, bounded 64-point tasks and
 fan-in-64 bucket-partial reduction. Digit width is metadata only; the point and
 field arithmetic below is unchanged.
+Inside a digit level the descriptor prefix scan splits its digits into
+independent bands of8: one AIV owns a band, keeps that band's per-chunk order
+exact, and moves whole32-byte descriptor rows and64-byte total lines with the
+same aligned2D block copies. Band boundaries fall on those line sizes, so the
+written bytes are identical to the former single-pass scan; the public API,
+arithmetic, scratch and UB sizes do not change.
 Level-zero tasks are stably grouped by length across SIMD lanes, but retain
 their original point order and partial-output positions. Weighted segments fit
 the available AIV lanes with a minimum span of16; their final tree uses fan-in4
@@ -387,6 +393,7 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Current packed64 point stages, automatic16-bit window | 1 | 3 | median | 1.475164 |
 | 2^20 | Device radix/CSR/schedule, prepared, automatic16-bit window (`R30`) | 1 | 3 | median | 1.363333293 |
 | 2^20 | Symmetric square, device radix/CSR/schedule, prepared, automatic16-bit window (`R31`) | 1 | 3 | median | 1.340093202 |
+| 2^20 | Independent digit-band prefix (`R39`), prepared, automatic16-bit window | 1 | 3 | median | 1.307588938 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
@@ -395,6 +402,7 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^25 | Current packed64 point stages, automatic19-bit window | 1 | 3 | median | 34.338448 |
 | 2^25 | Device radix/CSR/schedule, prepared, explicit20-bit window (`R30`) | 1 | 3 | median | 29.804091049 |
 | 2^25 | Symmetric square, device radix/CSR/schedule, prepared, explicit20-bit window (`R31`) | 1 | 3 | median | 29.337902454 |
+| 2^25 | Independent digit-band prefix (`R39`), prepared, explicit20-bit window | 1 | 3 | median | 28.428664641 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
 The current native implementation supports2–20-bit windows. Removing the old
@@ -406,27 +414,42 @@ matched 16-thread CPU reference at`2^25` (29.804091049s vs43.114322s) and
 explicit20-bit window; the automatic19-bit window was not re-measured for this
 metadata change. With the R31 symmetric square, the same warmed prepared scopes
 are31.95% faster than the16-thread CPU reference at`2^25` (29.337902454s
-vs43.114322s) and15.27% faster at`2^20` (1.340093202s vs1.581598s).
+vs43.114322s) and15.27% faster at`2^20` (1.340093202s vs1.581598s). With the
+R39 digit-band prefix those same prepared scopes are1.307588938s and
+28.428664641s,2.43% and3.10% below the R31 medians; the16-thread CPU reference
+was not re-measured for R39.
 Both sizes passed one warmup and three exact targets with strict resource
 audits. Full host capacity/rejection checks and native field, G1, MSM, replay
 and two-stream regressions passed, including high bucket bits, the three-pass
 route-2 grouping and explicit17/20-bit MSM cases. New point cases isolate
 equality votes in lanes47/48/63, a next-tile tail, and127/128/129 input
 boundaries.
+With the R39 digit-band prefix both sizes passed one warmup, three timed samples
+and three reuse calls: all seven outputs per size match the provided exact
+96-byte oracle, every online compute audit reports zero copies, zero allocations
+and zero synchronizations, and the timing scope still ends at one final96-byte
+D2H plus one stream-completion wait. The full cache guard byte-compares the
+whole100663296-byte `2^20` and3221225472-byte `2^25` caches with intact guards.
+R39 metadata passed all103 existing cases in11.137s and the native full suite in
+72.491s; the host test binary is byte-identical to the already-accepted main
+host ELF, so that evidence was reused instead of rebuilt or rerun.
 An earlier48-lane private-arithmetic probe passed960 pairs/164160 exact checks
 covering REDC, aliases, live masks, `0/p`, inversion and canonical serialization.
 The packed64 integer-bridge probe separately covers all4096 digit values,
 permuted lane/row patterns, source/coordinate guards, I32 return-mask reuse and
 real HBM interleave-index restoration; all655360 output bytes match its CPU oracle.
 Only the old pre-cache NPU figures are1+1 diagnostic checkpoints.
-CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet: the R31
-prepared medians are1.340093202s at`2^20` and29.337902454s at`2^25`, so the
-prepared`2^20` candidate is still slower than the user-reported 8-thread ~1.0s
-CPU approximation, which this run did not measure.
+CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet: the current
+R39 prepared medians are1.307588938s at`2^20` and28.428664641s at`2^25` (the
+R31 figures were1.340093202s and29.337902454s), so the prepared`2^20` candidate
+is still slower than the user-reported 8-thread ~1.0s CPU approximation, which
+was not re-measured here.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
 integrated. Source, raw records, input/binary identities and rejected candidates
-remain under `target/msm-hotspot/`; those generated artifacts are not
-tracked. Reproduce inputs and warmed CPU/NPU comparisons with:
+remain under `target/msm-hotspot/`, including the R39 runs under
+`target/msm-hotspot/round39-radix-prefix/`; those generated artifacts are local
+to this workspace, not shared, and not tracked. Reproduce inputs and warmed
+CPU/NPU comparisons with:
 
 ```bash
 cargo run --release --locked \
