@@ -18,6 +18,7 @@ template<uint32_t Lanes, bool Packed> class G1VectorEngine;
 // only public digits, exponent bits, layout indices, and tiles, never field values.
 template<class Field, uint32_t Lanes = 48, bool Compact = false> class FieldVector {
     template<uint32_t, bool> friend class G1VectorEngine;
+    friend struct SquareProbeAccess;
     using Params = FieldVectorParams<typename Field::Parameters>;
     using I32 = AscendC::LocalTensor<int32_t>;
     using U32 = AscendC::LocalTensor<uint32_t>;
@@ -120,10 +121,14 @@ public:
                     sub_mod(bank<2>(), bank<1>(), bank<0>());
                     break;
                 case 3:
-                case 4:
                     load_r2();
                     montgomery(bank<4>(), bank<0>(), bank<3>());
-                    montgomery(bank<2>(), bank<4>(), op == 3 ? bank<1>() : bank<0>());
+                    montgomery(bank<2>(), bank<4>(), bank<1>());
+                    break;
+                case 4:
+                    load_r2();
+                    montgomery_square(bank<4>(), bank<0>());
+                    montgomery(bank<2>(), bank<4>(), bank<3>());
                     break;
                 case 5: inverse(bank<2>(), bank<0>()); break;
                 }
@@ -198,14 +203,16 @@ private:
     }
     // Each digit row occupies row_stride 32-byte blocks. Explicit masks/repeats
     // also broadcast the same lane coefficient row with src1RepStride zero.
-    __aicore__ inline void multiply_rows(I32 dst, I32 a, I32 b, bool broadcast) {
+    __aicore__ inline void multiply_rows(I32 dst, I32 a, I32 b, bool broadcast,
+                                        uint8_t repeats = uint8_t(digits)) {
         const AscendC::BinaryRepeatParams strides{
             1, 1, 1, row_stride, row_stride, static_cast<uint8_t>(broadcast ? 0 : row_stride)};
-        AscendC::Mul(dst, a, b, uint64_t(lanes), uint8_t(digits), strides);
+        AscendC::Mul(dst, a, b, uint64_t(lanes), repeats, strides);
         vector_barrier();
     }
-    __aicore__ inline void add_rows(I32 dst, I32 a, I32 b) {
-        AscendC::Add(dst, a, b, uint64_t(lanes), uint8_t(digits),
+    __aicore__ inline void add_rows(I32 dst, I32 a, I32 b,
+                                   uint8_t repeats = uint8_t(digits)) {
+        AscendC::Add(dst, a, b, uint64_t(lanes), repeats,
                      AscendC::BinaryRepeatParams{1, 1, 1, row_stride, row_stride, row_stride});
         vector_barrier();
     }
@@ -598,11 +605,9 @@ private:
     // radix digit; the final U16 And also clears the negative product's high
     // halfword. The unmasked specialization is used only for the proven prefix.
     template<bool unmasked>
-    __aicore__ inline void montgomery_iteration(I32 a, I32 b, uint32_t i) {
+    __aicore__ inline void montgomery_cancel_column(uint32_t i) {
         auto product = bank<6>();
         auto active = digit(acc(), i);
-        multiply_rows(product, a, digit(b, i), true);
-        add_rows(active, active, product);
         if constexpr (unmasked) {
             muls(tmp(4), active, signed_n0prime);
         } else {
@@ -615,21 +620,17 @@ private:
         shift_right(tmp(2), active, radix_bits);
         add(digit(active, 1), digit(active, 1), tmp(2));
     }
+    template<bool unmasked>
+    __aicore__ inline void montgomery_iteration(I32 a, I32 b, uint32_t i) {
+        auto product = bank<6>();
+        auto active = digit(acc(), i);
+        multiply_rows(product, a, digit(b, i), true);
+        add_rows(active, active, product);
+        montgomery_cancel_column<unmasked>(i);
+    }
 
-    // Normalized a,b<2p; inputs are disjoint from acc and engine bank6.
-    // dst may alias a/b; canonical dst cannot be bank6 (difference scratch).
-    // Engine bank7 remains immutable. Both policies share the product/carry
-    // algorithm and preserve tmp6..15.
     template<bool canonical>
-    HP_FIELD_VECTOR_HEAVY __aicore__ inline void montgomery_impl(I32 dst, I32 a, I32 b) {
-        AscendC::Duplicate(acc(), int32_t(0), 65 * lanes);
-        vector_barrier();
-        // Radix12 bounds each coefficient by 2*n*4096*4095:
-        // Fq1073479680, Fr738017280. Carry only the eliminated coefficient.
-        for (uint32_t i = 0; i < signed_cancellation_prefix; ++i)
-            montgomery_iteration<true>(a, b, i);
-        for (uint32_t i = signed_cancellation_prefix; i < digits; ++i)
-            montgomery_iteration<false>(a, b, i);
+    __aicore__ inline void montgomery_finish(I32 dst) {
         auto result = digit(acc(), digits);
         for (uint32_t j = 0; j < digits; ++j) {
             shift_right(tmp(2), digit(result, j), radix_bits);
@@ -648,11 +649,66 @@ private:
             vector_barrier();
         }
     }
+
+    // Normalized a,b<2p; inputs are disjoint from acc and engine bank6.
+    // dst may alias a/b; canonical dst cannot be bank6 (difference scratch).
+    // Engine bank7 remains immutable. Both policies share the product/carry
+    // algorithm and preserve tmp6..15.
+    template<bool canonical>
+    HP_FIELD_VECTOR_HEAVY __aicore__ inline void montgomery_impl(I32 dst, I32 a, I32 b) {
+        AscendC::Duplicate(acc(), int32_t(0), 65 * lanes);
+        vector_barrier();
+        // Radix12 bounds each coefficient by 2*n*4096*4095:
+        // Fq1073479680, Fr738017280. Carry only the eliminated coefficient.
+        for (uint32_t i = 0; i < signed_cancellation_prefix; ++i)
+            montgomery_iteration<true>(a, b, i);
+        for (uint32_t i = signed_cancellation_prefix; i < digits; ++i)
+            montgomery_iteration<false>(a, b, i);
+        montgomery_finish<canonical>(dst);
+    }
     __aicore__ inline void montgomery(I32 dst, I32 a, I32 b) {
         montgomery_impl<true>(dst, a, b);
     }
     __aicore__ inline void montgomery_redundant(I32 dst, I32 a, I32 b) {
         montgomery_impl<false>(dst, a, b);
+    }
+
+    // Normalized a<2p, disjoint from acc/bank6; exact dst==a is supported.
+    // Canonical dst cannot be bank6. Only acc, bank6 and tmp0..5 are scratch;
+    // all a reads precede finish, preserving tmp6..15 and immutable tables.
+    template<bool canonical>
+    HP_FIELD_VECTOR_HEAVY __aicore__ inline void montgomery_square_impl(I32 dst, I32 a) {
+        // Diagonals assign every even row; initialize only odds and guard.
+        // Fr acc rows45..64 are unused and need not be cleared.
+        AscendC::Duplicate(digit(acc(), 1), int32_t(0), uint64_t(lanes),
+                           uint8_t(digits), uint16_t(1), pair_stride);
+        vector_barrier();
+        fill(digit(acc(), 2 * digits), 0);
+        AscendC::Mul(acc(), a, a, uint64_t(lanes), uint8_t(digits),
+                     AscendC::BinaryRepeatParams{1, 1, 1, pair_stride,
+                                                row_stride, row_stride});
+        vector_barrier();
+        for (uint32_t i = 0; i < digits - 1; ++i) {
+            // 2*a_i<=8190, so each product <=33538050 fits int32.
+            add(tmp(4), digit(a, i), digit(a, i));
+            const uint8_t repeats = uint8_t(digits - i - 1);
+            multiply_rows(bank<6>(), digit(a, i + 1), tmp(4), true, repeats);
+            auto active = digit(acc(), 2 * i + 1);
+            add_rows(active, active, bank<6>(), repeats);
+        }
+        // The preconvolution has the same low column as ordinary multiplication.
+        // Its coefficient bound is 2*n*4096*4095, including cancellation/carry.
+        for (uint32_t i = 0; i < signed_cancellation_prefix; ++i)
+            montgomery_cancel_column<true>(i);
+        for (uint32_t i = signed_cancellation_prefix; i < digits; ++i)
+            montgomery_cancel_column<false>(i);
+        montgomery_finish<canonical>(dst);
+    }
+    __aicore__ inline void montgomery_square(I32 dst, I32 a) {
+        montgomery_square_impl<true>(dst, a);
+    }
+    __aicore__ inline void montgomery_square_redundant(I32 dst, I32 a) {
+        montgomery_square_impl<false>(dst, a);
     }
 
     // p-2 is public. Compute its bits from the original u32 parameters, so
@@ -681,7 +737,7 @@ private:
         for (uint32_t w = words; w-- > 0;) {
             const uint32_t exponent = exponent_word(w);
             for (uint32_t bit = 32; bit-- > 0;) {
-                montgomery(bank<5>(), bank<5>(), bank<5>());
+                montgomery_square(bank<5>(), bank<5>());
                 if ((exponent >> bit) & 1U)
                     montgomery(bank<5>(), bank<5>(), bank<4>());
             }

@@ -57,7 +57,10 @@ target_link_libraries(native_math_smoke PRIVATE Threads::Threads)
 add_executable(msm_benchmark tests/msm_benchmark.cpp tests/runtime_audit.cpp)
 # Metadata gate: grouping + CSR + schedule equality before any MSM work.
 add_executable(msm_metadata_check tests/msm_metadata_check.cpp tests/runtime_audit.cpp)
-foreach(runner IN ITEMS native_math_smoke msm_benchmark msm_metadata_check)
+# Test-only square probe: candidate headers against the same archive and auditing.
+add_executable(square_probe tests/square_probe.cpp tests/square_probe.asc tests/runtime_audit.cpp)
+target_link_libraries(square_probe PRIVATE Threads::Threads)
+foreach(runner IN ITEMS native_math_smoke msm_benchmark msm_metadata_check square_probe)
     target_link_libraries(${runner} PRIVATE hyperplonk_ascend910b3_math)
     target_link_options(${runner} PRIVATE
         "-Wl,--wrap=aclrtMemcpy"

@@ -18,6 +18,7 @@ namespace hyperplonk::ascend910b3 {
 // coordinates contain exact normalized radix-12 digits; arithmetic stays I32.
 template<uint32_t Lanes = 48, bool Packed = false>
 class G1VectorEngine {
+    friend struct SquareProbeAccess;
     using Engine = FieldVector<Fq, Lanes, Packed>;
     using Coordinate = std::conditional_t<Packed, int16_t, int32_t>;
     using C = AscendC::LocalTensor<Coordinate>;
@@ -440,11 +441,11 @@ private:
     __aicore__ inline void square(C dst, C a) {
         if constexpr (Packed) {
             cast_rows(fq_.template bank<0>(), a, uint8_t(digits));
-            fq_.montgomery_redundant(fq_.template bank<2>(),
-                                     fq_.template bank<0>(), fq_.template bank<0>());
+            fq_.montgomery_square_redundant(fq_.template bank<2>(),
+                                            fq_.template bank<0>());
             cast_rows(dst, fq_.template bank<2>(), uint8_t(digits));
         } else {
-            mul(dst, a, a);
+            fq_.montgomery_square_redundant(dst, a);
         }
     }
 

@@ -50,9 +50,14 @@ The Fr Cube operations borrow TensorZKP's
 not its BabyBear field or CUDA implementation.
 
 Internal C++ batch function templates provide Fr/Fq add, subtract, negate,
-multiply, square, inverse and complete wide reduction. One `FieldVector<Field>`
-engine uses exact int32 Vector arithmetic across 48 independent elements,
-radix-2^12 digits (Fr22/Fq32), and UB-only deferred-carry CIOS Montgomery multiplication.
+multiply, square, inverse and complete wide reduction. One generic
+`FieldVector<Field>` square template serves both Fr and Fq: it forms only the
+triangular half of the digit-row products, then reuses the existing Montgomery
+cancellation column and normalization finish. It adds no UB, bank, workspace,
+copy or public alias, and leaves ordinary multiplication unchanged. One
+`FieldVector<Field>` engine uses exact int32 Vector arithmetic across 48
+independent elements, radix-2^12 digits (Fr22/Fq32), and UB-only deferred-carry
+CIOS Montgomery multiplication.
 Modular add/subtract transiently pack pairs of digits into radix-2^24 carry
 words (Fr11/Fq16), then unpack into the same public radix12 banks. This shared
 integer-only path halves carry rounds without enlarging UB or changing
@@ -66,7 +71,6 @@ still NotImplemented: Rust interfaces, C ABI and the 97-byte packet are unchange
 ```bash
 source "$ASCEND_HOME_PATH/set_env.sh"
 cmake -S backend/src/ascend910b3/native -B target/ascend910b3-native-math \
-  -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_PREFIX_PATH="$ASCEND_HOME_PATH/aarch64-linux/lib64/cmake"
 cmake --build target/ascend910b3-native-math --parallel 2
 python3 backend/src/ascend910b3/native/tests/generate_golden.py \
@@ -249,11 +253,19 @@ in `math_kernels.h`; test G1 launch declarations remain in `smoke_kernels.h`.
 Neither boundary adds a protocol ABI. Host-check edits do not recompile kernels;
 shared header changes still rebuild their consumers.
 
+The test-only `square_probe` executable runs 440 exact private square launches
+(Fr/Fq, 48/64 lanes, canonical/redundant, aliasing and boundary counts) on
+device0 and takes two arguments, `FIXTURES OUTPUT`, where `OUTPUT` is a regular
+JSON file path; passing a directory fails. Its bounded fixtures come from the
+optional `tests/square_probe_reference.py OUTPUT` generator, which was not run
+for this change; the existing exact fixtures were reused byte-identically.
+
 For the legacy device G1 smoke kernels, `G1Jacobian::operator+=` retains a
 non-inlined call boundary to prevent heavy Fq/Barrett expressions from expanding
 repeatedly into nested bucket loops and triggering expensive LLVM LICM. This
 does not describe production MSM, which uses the Vector G1 stages below.
-All ASC kernels retain Release `-O3`; no tests or residency audits are skipped.
+The measured builds set no `CMAKE_BUILD_TYPE` (the default empty configuration);
+no optimization flags, tests or residency audits were changed.
 
 Measured with CANN 9.1.0, DAV_2201 and four build jobs: a fresh native build took
 85.14 seconds, host-harness-only rebuild 2.77 seconds, chain-only rebuild
@@ -284,7 +296,8 @@ including digit zero; bucket zero is excluded from point accumulation.
 Production point stages use `g1_vector.h`: 64 lanes process independent
 partial-sum tasks, merge tasks or weighted segments inside each AIV. The shared
 Fr/Fq engine batches digit-row products with repeat strides and defers carry
-propagation until the eliminated Montgomery coefficient and final carry sweep.
+propagation until the eliminated Montgomery coefficient and final carry sweep;
+the same generic square template serves the packed and full G1 engines.
 Partial sums use exact mixed-affine addition for freshly loaded affine bases.
 Generic and mixed additions retain every exceptional case; an exact tile-wide
 vote skips doubling only when no lane needs the equal-point result.
@@ -373,6 +386,7 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Unscaled point addition checkpoint, `97e663f` | 1 | 3 | median | 1.667716 |
 | 2^20 | Current packed64 point stages, automatic16-bit window | 1 | 3 | median | 1.475164 |
 | 2^20 | Device radix/CSR/schedule, prepared, automatic16-bit window (`R30`) | 1 | 3 | median | 1.363333293 |
+| 2^20 | Symmetric square, device radix/CSR/schedule, prepared, automatic16-bit window (`R31`) | 1 | 3 | median | 1.340093202 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
@@ -380,6 +394,7 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^25 | Unscaled point addition checkpoint, `97e663f` | 1 | 3 | median | 39.730811 |
 | 2^25 | Current packed64 point stages, automatic19-bit window | 1 | 3 | median | 34.338448 |
 | 2^25 | Device radix/CSR/schedule, prepared, explicit20-bit window (`R30`) | 1 | 3 | median | 29.804091049 |
+| 2^25 | Symmetric square, device radix/CSR/schedule, prepared, explicit20-bit window (`R31`) | 1 | 3 | median | 29.337902454 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
 The current native implementation supports2–20-bit windows. Removing the old
@@ -389,7 +404,9 @@ device-side metadata, complete warmed prepared MSM is30.87% faster than the
 matched 16-thread CPU reference at`2^25` (29.804091049s vs43.114322s) and
 13.80% faster at`2^20` (1.363333293s vs1.581598s). The`2^25` figure uses the
 explicit20-bit window; the automatic19-bit window was not re-measured for this
-metadata change.
+metadata change. With the R31 symmetric square, the same warmed prepared scopes
+are31.95% faster than the16-thread CPU reference at`2^25` (29.337902454s
+vs43.114322s) and15.27% faster at`2^20` (1.340093202s vs1.581598s).
 Both sizes passed one warmup and three exact targets with strict resource
 audits. Full host capacity/rejection checks and native field, G1, MSM, replay
 and two-stream regressions passed, including high bucket bits, the three-pass
@@ -402,7 +419,8 @@ The packed64 integer-bridge probe separately covers all4096 digit values,
 permuted lane/row patterns, source/coordinate guards, I32 return-mask reuse and
 real HBM interleave-index restoration; all655360 output bytes match its CPU oracle.
 Only the old pre-cache NPU figures are1+1 diagnostic checkpoints.
-CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet; the
+CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet: the R31
+prepared medians are1.340093202s at`2^20` and29.337902454s at`2^25`, so the
 prepared`2^20` candidate is still slower than the user-reported 8-thread ~1.0s
 CPU approximation, which this run did not measure.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
