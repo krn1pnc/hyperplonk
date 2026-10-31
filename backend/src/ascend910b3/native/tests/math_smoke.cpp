@@ -1313,10 +1313,6 @@ uint8_t* msm_region(uint8_t* workspace, const detail::MsmPlan& plan, detail::Msm
 }
 uint64_t msm_u64(const uint8_t* p) { uint64_t x; std::memcpy(&x,p,8); return x; }
 uint32_t msm_u32(const uint8_t* p) { uint32_t x; std::memcpy(&x,p,4); return x; }
-void msm_zero_padding(const uint8_t* p, size_t first, size_t end, const std::string& label)
-{
-    for (size_t i = first; i < end; ++i) require(p[i] == 0,label+" nonzero padding");
-}
 
 // Complete 64-byte boundary spans, retaining original Runtime allocation bases.
 struct MsmGuard {
@@ -1361,23 +1357,168 @@ bool msm_same_record(const MsmRecord& a, const MsmRecord& b)
 {
     return a.bucket == b.bucket && a.index == b.index;
 }
-void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsigned pattern,
-                            uint32_t window_bits)
+// Exact host normalization of a possibly redundant Fq residue: the kernels may
+// keep a coordinate < 2p, so subtract the modulus until it is canonical. This is
+// the same algorithm as FieldElement's private subtract_modulus; nothing here
+// relaxes the equality oracle.
+bool fq_canonical(const math::Fq& value)
+{
+    for (unsigned i = math::Fq::word_count; i-- > 0;) {
+        if (value.words[i] != math::Fq::Parameters::modulus[i])
+            return value.words[i] < math::Fq::Parameters::modulus[i];
+    }
+    return false;
+}
+void fq_subtract_modulus(math::Fq& value)
+{
+    uint64_t borrow = 0;
+    for (unsigned i = 0; i < math::Fq::word_count; ++i) {
+        const uint64_t rhs = uint64_t(math::Fq::Parameters::modulus[i]) + borrow;
+        const uint64_t lhs = value.words[i];
+        value.words[i] = uint32_t(lhs - rhs);
+        borrow = lhs < rhs;
+    }
+}
+// One-time CPU golden table: P_i = (i+1)G for i < 4096, in canonical form (the
+// independent oracle) and in PositiveAffineMontgomeryV1 form (what the prepared
+// cache holds). Built with ONE field inversion: 4096 Jacobian additions, prefix
+// products of the Jacobian Z, one inverse of the product, one backward sweep to
+// recover every z_i^-1, then x*z_i^-2 and y*z_i^-3. Immutable and thread-safe;
+// it caches no NPU or algorithm data, so the oracle stays independent.
+struct WavePointTable {
+    std::vector<math::G1Affine> canonical;
+    std::vector<math::G1Affine> montgomery;
+    math::Fq r{};
+    math::Fq r_inverse{};
+};
+const WavePointTable& wave_point_table()
+{
+    static const WavePointTable table = [] {
+        using Clock = std::chrono::steady_clock;
+        const auto start = Clock::now();
+        std::cerr << "MSM_WAVE_TABLE_BEGIN points=4096" << std::endl;
+        constexpr size_t count = 4096;
+        WavePointTable out;
+        out.canonical.resize(count);
+        out.montgomery.resize(count);
+        std::vector<math::G1Jacobian> jacobian(count);
+        const math::G1Jacobian generator = math::G1Affine::generator().to_jacobian();
+        math::G1Jacobian running{};
+        for (size_t i = 0; i < count; ++i) {
+            running += generator;
+            require(!running.is_identity(), "wave point table produced the identity");
+            jacobian[i] = running;
+        }
+        std::vector<math::Fq> prefix(count), inverse_z(count);
+        math::Fq product = math::Fq::one();
+        for (size_t i = 0; i < count; ++i) {
+            prefix[i] = product;
+            product = product * jacobian[i].z;
+        }
+        math::Fq inverse_product{};
+        require(product.inverse(inverse_product), "wave point table Z product is singular");
+        for (size_t i = count; i-- > 0;) {
+            inverse_z[i] = inverse_product * prefix[i];
+            inverse_product = inverse_product * jacobian[i].z;
+        }
+        std::memcpy(out.r.words,detail::msm_montgomery_one_words.values,sizeof(out.r));
+        require(out.r.inverse(out.r_inverse), "Montgomery R is singular");
+        for (size_t i = 0; i < count; ++i) {
+            const math::Fq zz = inverse_z[i].square();
+            const math::Fq zzz = zz * inverse_z[i];
+            const math::G1Affine affine{jacobian[i].x * zz, jacobian[i].y * zzz};
+            require(!affine.is_identity(), "wave point table affine is the identity");
+            out.canonical[i] = affine;
+            out.montgomery[i] = {affine.x * out.r, affine.y * out.r};
+        }
+        const double seconds = std::chrono::duration<double>(Clock::now() - start).count();
+        std::cerr << "MSM_WAVE_TABLE_END points=4096 seconds=" << seconds << std::endl;
+        return out;
+    }();
+    return table;
+}
+// Independent balanced-bucket-tree arithmetic: n_l = ceil(n0 / 2^l),
+// m_l = floor(n_l / 2), cap = ceil(n0 / 2). No device value feeds this model.
+uint64_t msm_wave_nodes(uint64_t n0, uint32_t level)
+{
+    const uint64_t step = uint64_t{1} << level;
+    return (n0 + step - 1) >> level;
+}
+uint64_t msm_wave_ops(uint64_t n0, uint32_t level) { return msm_wave_nodes(n0,level) >> 1; }
+uint64_t msm_wave_cap(uint64_t n0) { return (n0 + 1) >> 1; }
+uint32_t msm_wave_depth(uint64_t n0)
+{
+    uint32_t depth = 0;
+    while (n0 > 1) { n0 = (n0 + 1) >> 1; ++depth; }
+    return depth;
+}
+// Wave diagnostic: the production metadata path (extract -> radix -> rows ->
+// schedule -> capture) followed by one fuse_windows=1 wave (a legal tail bundle
+// shape over the plan-sized arena), then an independent check of the captured
+// slot header, the device-published tree geometry and the finalized per-window
+// bucket tuples.
+void test_msm_wave_case(Runtime& runtime, aclrtStream stream, size_t n, unsigned pattern,
+                        uint32_t window_bits)
 {
     const auto mark = runtime.storage_mark();
     detail::MsmPlan plan{};
-    require(detail::build_msm_plan(n,plan,window_bits),"metadata MSM platform initialization failed");
+    require(detail::build_msm_plan(n,plan,window_bits),"wave MSM platform initialization failed");
+    const std::string label = "MSM wave N="+std::to_string(n)+" pattern="+std::to_string(pattern)
+        +" c="+std::to_string(plan.window_bits)+" route="+std::to_string(plan.radix_route);
+    std::cerr << "MSM_WAVE_CASE_BEGIN " << label << std::endl;
+    // One-time CPU golden table; the first case builds it, outside every audit.
+    const WavePointTable& points = wave_point_table();
     MsmGuard scratch(runtime,stream,plan.workspace_bytes);
+    uint8_t* const arena = msm_region(scratch.payload,plan,detail::MsmRegion::WaveArena);
+    uint8_t* const slot_meta = msm_region(scratch.payload,plan,detail::MsmRegion::WaveSlotMeta);
+    // One captured slot is a legal tail bundle: the arena is allocated for
+    // plan.wave_windows and a narrower bundle reuses the same regions.
+    const uint32_t fuse_windows = 1;
+    const detail::WaveShape shape = detail::msm_wave_shape(plan,fuse_windows);
+    const detail::WaveBounds bounds = detail::msm_wave_bounds(plan,fuse_windows);
+    const detail::WaveRegions regions = detail::wave_regions(bounds);
+    require(bounds.total != 0 && bounds.total <= plan.wave_arena_bytes,
+            label+" wave arena capacity");
+    const uint32_t wave_cores = std::min(plan.platform.aiv_cores,detail::msm_wave_core_slots);
+    // Tight step-major prefix capacity of this tail bundle: P_SLOTS is
+    // min(A_ub, chunk) 128 B slots, not the old chain-major rectangle, so a
+    // pair-free window (A_ub == 0) carries no prefix storage at all while the
+    // wave still completes with zero chains.
+    const uint64_t wave_chunk = uint64_t(wave_cores)*detail::msm_wave_lanes
+        *detail::msm_wave_l_max;
+    const uint64_t wave_ops = uint64_t(n)*fuse_windows/2;
+    const uint64_t wave_prefix_bytes =
+        ((std::min(wave_ops,wave_chunk)*128 + 511)/512)*512;
+    require(bounds.prefixes == wave_prefix_bytes,label+" wave prefix capacity");
+    require(wave_ops ? wave_prefix_bytes != 0 : wave_prefix_bytes == 0,
+            label+" wave prefix slots follow the pair count");
+    // One 512 B plan-stage summary record per usable AIV block, appended after
+    // diag: the summary region is the last one and advances only the total.
+    require(bounds.plan_summaries == uint64_t(wave_cores)*512,
+            label+" wave plan summary capacity");
+    require(regions.diag + bounds.diag == regions.plan_summaries
+            && regions.plan_summaries + bounds.plan_summaries == bounds.total,
+            label+" wave plan summary layout");
+    require(uint64_t(fuse_windows)*detail::msm_wave_slot_meta_bytes <=
+                plan.region_size[static_cast<uint32_t>(detail::MsmRegion::WaveSlotMeta)],
+            label+" wave slot-meta capacity");
     constexpr uint32_t partition_records = detail::msm_radix_partition_records;
     const uint32_t mask = (uint32_t{1} << plan.window_bits) - 1;
     const uint32_t low_bits = plan.radix_pass_bits[0];
     const uint64_t low_bins = uint64_t{1} << low_bits;
+    // Prepared-cache image from the one-time table: PositiveAffineMontgomeryV1
+    // stores each coordinate as x*R mod p, and the canonical points stay the
+    // oracle. Same P_i, same cache_count = min(n, 4096) as before.
+    const size_t cache_count = std::min<size_t>(n,4096);
+    MsmGuard cache(runtime,stream,cache_count*sizeof(math::G1Affine),points.montgomery.data());
     // Records are fabricated here, independent of candidate scalar extraction.
+    // Every point_id indexes the cache image, so the affine phase consumes real
+    // points and the finalized buckets have an exact independent oracle.
     std::vector<MsmRecord> expected(n);
     for (size_t i = 0; i < n; ++i) {
         uint32_t key = 0;
         switch (pattern) {
-        case 0: key = 0; break; // bucket-0-only window: the CSR has no task at all
+        case 0: key = 0; break; // bucket-0-only window: no reduction bucket has work
         case 1: key = mask; break;
         case 2: key = (uint32_t(i % 3) * 0x101u) & mask; break;
         case 3: key = uint32_t(i % 23) & mask; break;
@@ -1391,7 +1532,7 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
         case 8: key = ((uint32_t{1} << low_bits) | (uint32_t(i) & (uint32_t(low_bins) - 1))) & mask; break;
         default: throw std::runtime_error("unknown metadata pattern");
         }
-        expected[i] = {key & mask,i%3 == 0 ? UINT32_MAX-1 : uint32_t((1u<<24)+i)};
+        expected[i] = {key & mask,uint32_t(i % cache_count)};
     }
     uint32_t model_max_partition = 0;
     if (plan.radix_route == 1) {
@@ -1403,33 +1544,54 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
     std::copy(expected.begin(),expected.end(),input.begin());
     runtime.upload(stream,reinterpret_cast<MsmRecord*>(msm_region(scratch.payload,plan,
                    detail::MsmRegion::RecordsA)),input.data(),input.size());
-    const std::string label = "MSM metadata N="+std::to_string(n)+" pattern="+std::to_string(pattern)
-        +" c="+std::to_string(plan.window_bits)+" route="+std::to_string(plan.radix_route);
-    // Device grouping, CSR and schedule: no host transfer, synchronization or allocation.
+    // Device grouping, CSR, schedule, capture and the whole 26-level wave: no
+    // host transfer, synchronization or allocation in the compute path.
     audit::begin_runtime_audit(nullptr,0);
     detail::launch_msm_radix_group(stream,scratch.payload,plan);
     detail::launch_msm_rows(stream,scratch.payload,plan);
     detail::launch_msm_schedule(stream,scratch.payload,plan);
-    const auto metadata_stage = audit::end_runtime_audit();
-    require_no_runtime_transfers(metadata_stage);
-    require(metadata_stage.unexpected_copy_calls == 0,label+" metadata stage undeclared copy");
+    detail::launch_msm_wave_capture(stream,scratch.payload,arena,plan,bounds,0);
+    detail::launch_msm_wave_plan(stream,arena,plan,bounds,fuse_windows);
+    const uint32_t subwaves = detail::msm_wave_subwave_bound(shape);
+    for (uint32_t level = 0; level < detail::msm_wave_level_slots; ++level) {
+        detail::launch_msm_wave_build(stream,arena,plan,bounds,fuse_windows,level);
+        for (uint32_t sub = 0; sub < subwaves; ++sub)
+            detail::launch_msm_wave_affine(stream,cache.payload,arena,plan,bounds,
+                                           fuse_windows,level,sub);
+        detail::launch_msm_wave_carry(stream,cache.payload,arena,plan,bounds,fuse_windows,level);
+    }
+    detail::launch_msm_wave_finalize(stream,cache.payload,arena,plan,bounds,fuse_windows);
+    const auto wave_stage = audit::end_runtime_audit();
+    require_no_runtime_transfers(wave_stage);
+    require(wave_stage.unexpected_copy_calls == 0,label+" wave stage undeclared copy");
     auto* control = runtime.download(stream,msm_region(scratch.payload,plan,
         detail::MsmRegion::RadixControl),64);
-    check(aclrtSynchronizeStream(stream),"metadata control readback synchronize");
-    const uint32_t parity = msm_u32(control), fallback = msm_u32(control+4);
-    const uint32_t max_partition = msm_u32(control+8);
-    const auto sorted_region = parity ? detail::MsmRegion::RecordsB : detail::MsmRegion::RecordsA;
-    auto* dense = runtime.download(stream,reinterpret_cast<const MsmRecord*>(
-        msm_region(scratch.payload,plan,sorted_region)),msm_round8(n));
-    auto* rows = runtime.download(stream,reinterpret_cast<const uint64_t*>(msm_region(
-        scratch.payload,plan,detail::MsmRegion::RowPtr)),msm_round8(plan.buckets+1));
+    auto* captured_records = runtime.download(stream,reinterpret_cast<const MsmRecord*>(
+        arena+regions.records),n);
+    auto* captured_rows = runtime.download(stream,reinterpret_cast<const uint64_t*>(
+        arena+regions.rows),size_t(plan.buckets)+1);
+    // The capture copies exactly (buckets+1) CSR entries, so the plan-side row
+    // padding is read from RowPtr itself and checked below.
+    const size_t stride = msm_round8(plan.buckets+1);
+    auto* row_padding = stride > size_t(plan.buckets)+1
+        ? runtime.download(stream,reinterpret_cast<const uint64_t*>(
+              msm_region(scratch.payload,plan,detail::MsmRegion::RowPtr))+plan.buckets+1,
+              stride-(size_t(plan.buckets)+1))
+        : nullptr;
+    auto* control_bytes = runtime.download(stream,arena+regions.control,
+        size_t(detail::msm_wave_control_bytes));
+    auto* diag_bytes = runtime.download(stream,arena+regions.diag,
+        size_t(detail::msm_wave_diag_bytes));
+    auto* slot = runtime.download(stream,slot_meta,size_t(detail::msm_wave_slot_meta_bytes));
     auto* schedule_bytes = runtime.download(stream,msm_region(scratch.payload,plan,
         detail::MsmRegion::ScheduleMeta),size_t(plan.region_size[static_cast<uint32_t>(
             detail::MsmRegion::ScheduleMeta)]));
     auto* device_prefix = runtime.download(stream,msm_region(scratch.payload,plan,
         detail::MsmRegion::TaskPrefix),size_t(plan.region_size[static_cast<uint32_t>(
             detail::MsmRegion::TaskPrefix)]));
-    check(aclrtSynchronizeStream(stream),(label+" metadata readback synchronize").c_str());
+    check(aclrtSynchronizeStream(stream),(label+" wave readback synchronize").c_str());
+    const uint32_t parity = msm_u32(control), fallback = msm_u32(control+4);
+    const uint32_t max_partition = msm_u32(control+8);
     require(parity <= 1,label+" final parity range");
     const uint32_t expected_parity = plan.radix_route == 1 ? (fallback ? 0u : 1u) : 1u;
     require(parity == expected_parity,label+" final parity route");
@@ -1439,21 +1601,59 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
     } else {
         require(fallback == 0,label+" fallback flag on routes 0/2");
     }
-    std::stable_sort(expected.begin(),expected.end(),
+    // The capture copies exactly `count` records, so the 8-record padding tail
+    // of the parity-selected plan region is read here and keeps its sentinel.
+    if (msm_round8(n) > n) {
+        const auto sorted_region =
+            parity ? detail::MsmRegion::RecordsB : detail::MsmRegion::RecordsA;
+        auto* dense_tail = runtime.download(stream,reinterpret_cast<const MsmRecord*>(
+            msm_region(scratch.payload,plan,sorted_region))+n,msm_round8(n)-n);
+        check(aclrtSynchronizeStream(stream),(label+" dense tail readback").c_str());
+        for (size_t i = 0; i < msm_round8(n)-n; ++i)
+            require(dense_tail[i].bucket == 0 && dense_tail[i].index == UINT32_MAX,
+                    label+" dense tail");
+    }
+    // Independent per-bucket model from the same records and points.
+    std::vector<MsmRecord> sorted = expected;
+    std::stable_sort(sorted.begin(),sorted.end(),
         [](const MsmRecord& a,const MsmRecord& b){ return a.bucket < b.bucket; });
+    struct BucketModel { uint32_t bucket; uint64_t count; math::G1Jacobian sum; };
+    std::vector<BucketModel> bucket_model;
+    for (size_t i = 0; i < n;) {
+        size_t j = i;
+        math::G1Jacobian sum{};
+        while (j < n && sorted[j].bucket == sorted[i].bucket) {
+            sum += points.canonical[sorted[j].index].to_jacobian();
+            ++j;
+        }
+        bucket_model.push_back({sorted[i].bucket,uint64_t(j-i),sum});
+        i = j;
+    }
+    uint64_t model_node_count = 0, model_processed = 0;
+    uint32_t model_depth = 0;
+    std::array<uint64_t,detail::msm_wave_level_slots> model_ops{};
+    for (const auto& entry : bucket_model) {
+        if (!entry.bucket) continue;
+        model_node_count += msm_wave_cap(entry.count);
+        model_depth = std::max(model_depth,msm_wave_depth(entry.count));
+        for (uint32_t level = 0; level < detail::msm_wave_level_slots; ++level) {
+            const uint64_t ops = msm_wave_ops(entry.count,level);
+            model_ops[level] += ops;
+            model_processed += ops;
+        }
+    }
+    // Capture: this window's sorted records and CSR, copied before a later
+    // window could overwrite the plan regions.
     for (size_t i = 0; i < n; ++i)
-        require(msm_same_record(dense[i],expected[i]),label+" stable sorted records");
-    for (size_t i = n; i < msm_round8(n); ++i)
-        require(dense[i].bucket == 0 && dense[i].index == UINT32_MAX,label+" dense tail");
+        require(msm_same_record(captured_records[i],sorted[i]),label+" captured sorted records");
     std::vector<uint64_t> model_rows(plan.buckets+1);
     for (uint32_t b = 0; b <= plan.buckets; ++b) {
-        model_rows[b] = std::lower_bound(expected.begin(),expected.end(),b,
-            [](const MsmRecord& record,uint32_t key) { return record.bucket < key; })-expected.begin();
-        require(rows[b] == model_rows[b],label+" CSR lower_bound");
+        model_rows[b] = std::lower_bound(sorted.begin(),sorted.end(),b,
+            [](const MsmRecord& record,uint32_t key) { return record.bucket < key; })-sorted.begin();
+        require(captured_rows[b] == model_rows[b],label+" captured CSR lower_bound");
     }
-    const size_t stride = msm_round8(plan.buckets+1);
-    for (size_t i = plan.buckets+1; i < stride; ++i)
-        require(rows[i] == n,label+" CSR tail padding");
+    for (size_t i = 0; row_padding && i < stride-(size_t(plan.buckets)+1); ++i)
+        require(row_padding[i] == n,label+" CSR tail padding");
     std::vector<uint64_t> prefix(
         plan.region_size[static_cast<uint32_t>(detail::MsmRegion::TaskPrefix)]/sizeof(uint64_t),
         UINT64_MAX);
@@ -1494,75 +1694,169 @@ void test_msm_metadata_case(Runtime& runtime, aclrtStream stream, size_t n, unsi
     const size_t prefix_words = prefix.size()*sizeof(uint64_t);
     for (size_t i = written_bytes; i < prefix_words; ++i)
         require(cpu_prefix_bytes[i] == UINT8_MAX,label+" oracle wrote inactive schedule storage");
-    if (max_tasks) {
-        // Device counts drive expansion without any host metadata upload.
-        // Tasks is shared scratch: consume each level before the next overwrites it.
-        for (uint32_t level = 0; level <= model_levels; ++level) {
-            const uint64_t tasks_on_device = schedule.task_count[level];
-            if (!tasks_on_device) continue;
-            audit::begin_runtime_audit(nullptr,0);
-            detail::launch_msm_tasks(stream,scratch.payload,plan,level);
-            const auto expansion = audit::end_runtime_audit();
-            require_no_runtime_transfers(expansion);
-            require(expansion.unexpected_copy_calls == 0,label+" task expansion undeclared copy");
-            auto* tasks = runtime.download(stream,msm_region(scratch.payload,plan,
-                detail::MsmRegion::Tasks),size_t(tasks_on_device)*64);
-            check(aclrtSynchronizeStream(stream),"MSM tasks diagnostic synchronize");
-            const auto& q = model_prefix[level];
-            const auto& previous = level ? model_prefix[level-1] : model_rows;
-            for (uint32_t b = 1; b < plan.buckets; ++b)
-                for (uint64_t t = q[b]; t < q[b+1]; ++t) {
-                    const uint64_t begin = previous[b]+64*(t-q[b]);
-                    const uint32_t length = uint32_t(std::min<uint64_t>(64,previous[b+1]-begin));
-                    const auto* descriptor = tasks+t*64;
-                    require(msm_u64(descriptor) == begin && msm_u32(descriptor+8) == length &&
-                            msm_u32(descriptor+12) == b,label+" expanded task descriptor");
-                    msm_zero_padding(descriptor,16,64,label+" task descriptor");
-                }
+    // The captured 64-byte slot header must be this window's own ScheduleMeta
+    // header: capture copies it before a later window can overwrite the region.
+    for (unsigned level = 0; level < 6; ++level)
+        require(msm_u64(slot+8*level) == schedule.task_count[level],label+" slot task count");
+    require(msm_u32(slot+48) == schedule.merge_levels,label+" slot merge levels");
+    require(msm_u64(slot+56) == schedule.order_offset,label+" slot order offset");
+    // Wave control/diag against the independent tree model.
+    detail::WaveControl wave{};
+    std::memcpy(&wave,control_bytes,sizeof(wave));
+    detail::WaveDiag diag{};
+    std::memcpy(&diag,diag_bytes,sizeof(diag));
+    require(wave.magic == detail::msm_wave_control_magic,label+" wave control magic");
+    require(wave.count == n && wave.window_bits == plan.window_bits && wave.windows == plan.windows
+            && wave.buckets == plan.buckets && wave.fuse_windows == fuse_windows
+            && wave.l_max == detail::msm_wave_l_max
+            && wave.chain_granularity == detail::msm_wave_chain_granularity,
+            label+" wave control shape");
+    require(wave.status == 0 && wave.status_detail == 0,label+" wave device self-gate");
+    require(wave.parity[0] == parity,label+" captured window parity");
+    require(wave.window_records[0] == n,label+" captured window records");
+    uint32_t diag_errors = 0;
+    uint64_t finalized_blocks = 0, compare_leftovers = 0;
+    for (uint32_t block = 0; block < detail::msm_wave_core_slots; ++block) {
+        diag_errors |= diag.error_per_block[block];
+        finalized_blocks += diag.finalized_per_block[block];
+        // The production wave has no compare arm: the retained compare slots must
+        // stay untouched instead of holding stale prototype data.
+        compare_leftovers += diag.checked_per_block[block];
+        compare_leftovers += diag.mismatch_per_block[block];
+        compare_leftovers += diag.first_mismatch_per_block[block];
+    }
+    require(diag_errors == 0,label+" wave diag error bits");
+    require(compare_leftovers == 0,label+" wave compare slots untouched");
+    require(wave.node_count == model_node_count,label+" wave node count");
+    require(wave.depth_max == model_depth,label+" wave depth");
+    require(wave.processed_ops == model_processed,label+" wave processed ops");
+    require(wave.finalized_buckets == plan.buckets-1,label+" wave finalized buckets");
+    require(finalized_blocks == uint64_t(plan.buckets-1),label+" wave finalized block total");
+    require(diag.node_count_per_window[0] == model_node_count,label+" wave per-window node count");
+    const uint64_t lanes_total = uint64_t(wave_cores)*detail::msm_wave_lanes;
+    // Chain reference from the actual input shape: sub-wave 0 of a level has
+    // ops_s = min(A_l, chunk) ops and runs
+    // chains = min(ceil(ops_s/granularity), block lanes, ops_s) chains. The
+    // granularity comes from the canonical input shape, so no default is
+    // assumed by this oracle.
+    require(shape.chain_granularity != 0,label+" wave input chain granularity");
+    for (uint32_t level = 0; level < detail::msm_wave_level_slots; ++level) {
+        require(wave.ops[level] == model_ops[level],label+" wave level ops");
+        require(diag.processed_ops_per_level[level] == model_ops[level],
+                label+" wave diag level ops");
+        require(diag.subwaves_per_level[level] <= subwaves,label+" wave sub-wave bound");
+        require(diag.blocks_used_per_level[level] <= plan.platform.aiv_cores,
+                label+" wave block bound");
+        const uint64_t ops_s = std::min<uint64_t>(model_ops[level],wave_chunk);
+        const uint64_t chains_from_granularity =
+            (ops_s + shape.chain_granularity - 1) / shape.chain_granularity;
+        const uint64_t model_chains = std::min<uint64_t>(
+            std::min<uint64_t>(chains_from_granularity,lanes_total),ops_s);
+        require(diag.chains_per_level[level] == model_chains,label+" wave chain count");
+        if (model_ops[level])
+            require(diag.subwaves_per_level[level] >= 1,label+" wave missing sub-wave");
+    }
+    // Finalized buckets: every probed tuple equals the independent sum of the
+    // window's points, with the canonical (0,R,0) for empty/cancelling buckets.
+    std::vector<uint32_t> probes{0};
+    std::vector<uint32_t> nonempty;
+    for (const auto& entry : bucket_model) if (entry.bucket) nonempty.push_back(entry.bucket);
+    if (nonempty.size() <= 64) probes.insert(probes.end(),nonempty.begin(),nonempty.end());
+    else for (const size_t k : {size_t{0},size_t{1},size_t{2},size_t{3},nonempty.size()/2,
+                                nonempty.size()-2,nonempty.size()-1})
+        probes.push_back(nonempty[k]);
+    for (const uint32_t b : {1u,uint32_t(plan.buckets/2),uint32_t(plan.buckets-1)})
+        probes.push_back(b);
+    std::sort(probes.begin(),probes.end());
+    probes.erase(std::unique(probes.begin(),probes.end()),probes.end());
+    std::vector<uint8_t*> probe_tuples;
+    for (const uint32_t b : probes)
+        probe_tuples.push_back(runtime.download(stream,
+            arena+regions.out_b+uint64_t(b)*192,size_t(192)));
+    check(aclrtSynchronizeStream(stream),(label+" wave bucket readback synchronize").c_str());
+    // Decode the device tuple back to canonical coordinates: the wave stores
+    // x*R, y*R and z = R. The frozen contract keeps packed residues below 2p, so
+    // exactly ONE conditional subtraction is legal; anything larger must fail
+    // instead of being silently reduced. Then multiply by the table's R^-1 and
+    // compare with the canonical point model.
+    const auto decode_montgomery = [&](const uint32_t* words) {
+        math::Fq value{};
+        std::memcpy(value.words,words,sizeof(value));
+        if (!fq_canonical(value)) fq_subtract_modulus(value);
+        require(fq_canonical(value),label+" Montgomery coordinate not below 2p");
+        return value * points.r_inverse;
+    };
+    for (size_t i = 0; i < probes.size(); ++i) {
+        // Bucket 0 is the frozen zero-coefficient tuple: the wave never reduces
+        // it, so it stays canonical identity even when it holds records.
+        math::G1Jacobian sum{};
+        if (probes[i])
+            for (const auto& entry : bucket_model)
+                if (entry.bucket == probes[i]) sum = entry.sum;
+        const math::G1Affine affine =
+            sum.is_identity() ? math::G1Affine::identity() : sum.to_affine();
+        const auto* words = reinterpret_cast<const uint32_t*>(probe_tuples[i]);
+        if (affine.is_identity()) {
+            for (unsigned w = 0; w < math::Fq::word_count; ++w) {
+                require(words[w] == 0 && words[24+w] == 0 && words[36+w] == 0,
+                        label+" identity tuple x/z/padding");
+                require(words[12+w] == detail::msm_montgomery_one_words[w],
+                        label+" identity tuple y");
+            }
+            continue;
         }
-    } else {
-        // Device-gated empty window: identity only, no host empty flag and no point work.
+        require(decode_montgomery(words) == affine.x,label+" finalized bucket x");
+        require(decode_montgomery(words+12) == affine.y,label+" finalized bucket y");
+        for (unsigned w = 0; w < math::Fq::word_count; ++w) {
+            require(words[24+w] == detail::msm_montgomery_one_words[w],
+                    label+" finalized tuple z");
+            require(words[36+w] == 0,label+" finalized tuple padding");
+        }
+    }
+    if (!model_node_count) {
+        // Production empty-window path: the per-window weighted reduce and the
+        // Windows slot keep the canonical zero-coefficient tuple.
         std::array<uint32_t,48> identity{};
-        for (unsigned word = 0; word < math::Bls12381FqParams::word_count; ++word)
-            identity[12+word] = detail::msm_montgomery_one_words[word];
+        auto* words = identity.data();
+        for (unsigned w = 0; w < math::Bls12381FqParams::word_count; ++w)
+            words[12+w] = detail::msm_montgomery_one_words[w];
+        uint8_t* destination = msm_region(scratch.payload,plan,detail::MsmRegion::Windows);
         audit::begin_runtime_audit(nullptr,0);
-        const auto cache = msm_region(scratch.payload,plan,detail::MsmRegion::MontgomeryBases);
-        detail::launch_msm_partial_sums(stream,cache,scratch.payload,plan);
-        for (uint32_t level = 0; level <= schedule.merge_levels; ++level)
-            detail::launch_msm_tasks(stream,scratch.payload,plan,level);
-        for (uint32_t level = 1; level <= schedule.merge_levels; ++level)
-            detail::launch_msm_partial_merge(stream,scratch.payload,plan,level);
-        detail::launch_msm_window_reduce(stream,scratch.payload,plan,0);
+        detail::launch_msm_window_reduce(stream,scratch.payload,plan,
+            arena+regions.out_b,destination,slot_meta);
         const auto empty = audit::end_runtime_audit();
         require_no_runtime_transfers(empty);
         require(empty.unexpected_copy_calls == 0,label+" empty window undeclared copy");
-        auto* window = runtime.download(stream,msm_region(scratch.payload,plan,
-            detail::MsmRegion::Windows),192);
+        auto* window = runtime.download(stream,destination,size_t(192));
         check(aclrtSynchronizeStream(stream),(label+" empty window readback").c_str());
-        require(std::memcmp(window,identity.data(),192) == 0,label+" empty identity window");
+        require(std::memcmp(window,identity.data(),sizeof(identity)) == 0,
+                label+" empty identity window");
     }
+    cache.download(runtime,stream);
     scratch.download(runtime,stream);
-    check(aclrtSynchronizeStream(stream),"MSM metadata guard synchronize");
+    check(aclrtSynchronizeStream(stream),(label+" wave guard synchronize").c_str());
+    cache.verify(true,label+" immutable cache");
     scratch.verify(false,label);
     runtime.release_storage(mark);
+    std::cerr << "MSM_WAVE_CASE_END " << label << std::endl;
 }
 void test_msm_metadata(Runtime& runtime, aclrtStream stream)
 {
     for (size_t n : {1,7,8,9,63,64,65,2047,2048,2049,4097})
         for (unsigned pattern = 0; pattern < 5; ++pattern)
-            test_msm_metadata_case(runtime,stream,n,pattern,16);
+            test_msm_wave_case(runtime,stream,n,pattern,16);
     // Every balanced digit width, including the three-pass routes.
     for (uint32_t c = 2; c <= 20; ++c)
-        test_msm_metadata_case(runtime,stream,2049,4,c);
+        test_msm_wave_case(runtime,stream,2049,4,c);
     // Exact 8192-record chunk boundaries.
     for (size_t n : {8191,8192,8193})
-        test_msm_metadata_case(runtime,stream,n,3,16);
+        test_msm_wave_case(runtime,stream,n,3,16);
     // Route-1 fast path with bounded partitions, then both forced fallback digits.
-    test_msm_metadata_case(runtime,stream,4097,6,16);
-    test_msm_metadata_case(runtime,stream,8192,7,16); // exactly the 8192 partition limit stays fast
-    test_msm_metadata_case(runtime,stream,8193,7,16);
-    test_msm_metadata_case(runtime,stream,65537,8,16);
-    test_msm_metadata_case(runtime,stream,65537,6,16);
+    test_msm_wave_case(runtime,stream,4097,6,16);
+    test_msm_wave_case(runtime,stream,8192,7,16); // exactly the 8192 partition limit stays fast
+    test_msm_wave_case(runtime,stream,8193,7,16);
+    test_msm_wave_case(runtime,stream,65537,8,16);
+    test_msm_wave_case(runtime,stream,65537,6,16);
     std::cout << "MSM_METADATA_NPU_PASS\n";
 }
 
@@ -1794,10 +2088,10 @@ void test_msm_preflight(Runtime& runtime, aclrtStream stream, const std::filesys
     changed = plan; ++changed.merge_levels; reject_plan(changed);
     changed = plan; ++changed.row_blocks; reject_plan(changed);
     changed = plan; ++changed.weighted_segments; reject_plan(changed);
-    changed = plan; ++changed.weighted_levels; reject_plan(changed);
-    for (unsigned i = 0; i < 2; ++i) {
-        changed = plan; ++changed.partial_capacity[i]; reject_plan(changed);
-    }
+    changed = plan; ++changed.weighted_segment_length; reject_plan(changed);
+    changed = plan; ++changed.task_capacity; reject_plan(changed);
+    changed = plan; ++changed.wave_windows; reject_plan(changed);
+    changed = plan; ++changed.wave_arena_bytes; reject_plan(changed);
     for (unsigned i = 0; i < detail::msm_region_count; ++i) {
         changed = plan; ++changed.region_offset[i]; reject_plan(changed);
         changed = plan; ++changed.region_size[i]; reject_plan(changed);
@@ -1895,10 +2189,10 @@ template<class Reject> void msm_corrupt_plans(const detail::MsmPlan& plan, Rejec
     changed = plan; ++changed.merge_levels; reject(changed);
     changed = plan; ++changed.row_blocks; reject(changed);
     changed = plan; ++changed.weighted_segments; reject(changed);
-    changed = plan; ++changed.weighted_levels; reject(changed);
-    for (unsigned i = 0; i < 2; ++i) {
-        changed = plan; ++changed.partial_capacity[i]; reject(changed);
-    }
+    changed = plan; ++changed.weighted_segment_length; reject(changed);
+    changed = plan; ++changed.task_capacity; reject(changed);
+    changed = plan; ++changed.wave_windows; reject(changed);
+    changed = plan; ++changed.wave_arena_bytes; reject(changed);
     for (unsigned i = 0; i < detail::msm_region_count; ++i) {
         changed = plan; ++changed.region_offset[i]; reject(changed);
         changed = plan; ++changed.region_size[i]; reject(changed);
@@ -1914,7 +2208,7 @@ detail::MsmPreparedSizes msm_prepared_sizes(const detail::MsmPlan& plan)
 
 void test_msm_prepared_queries()
 {
-    const detail::MsmPlatform platform{40,196352};
+    const detail::MsmPlatform platform{40,detail::msm_required_ub_bytes};
     constexpr size_t boundaries[] = {0,1,2,47,48,63,64,65,2047,2048,2049,UINT32_MAX};
     for (size_t n : boundaries) {
         for (uint32_t bits = 0; bits <= 20; ++bits) {
@@ -1962,8 +2256,8 @@ void test_msm_prepared_queries()
         require(!detail::make_msm_plan(n,platform,20,plan),"prepared overflowing count accepted");
     }
     for (const auto& expected : std::array<std::array<uint64_t,5>,2>{{
-             {{uint64_t(1)<<20,16,100663296,82246976,2949440}},
-             {{uint64_t(1)<<25,20,3221225472,1795601216,56623488}}}}) {
+             {{uint64_t(1)<<20,16,100663296,2838501888,2949440}},
+             {{uint64_t(1)<<25,20,3221225472,9545747584,56623488}}}}) {
         detail::MsmPlan plan{};
         require(detail::make_msm_plan(expected[0],platform,expected[1],plan),
                 "prepared full-size capacity plan failed");

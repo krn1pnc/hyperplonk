@@ -1,4 +1,5 @@
 #include "msm_internal.h"
+#include "msm_wave.h"
 #include "tiling/platform/platform_ascendc.h"
 
 namespace hyperplonk::ascend910b3::detail {
@@ -81,6 +82,12 @@ namespace {
 // Every dynamic count, ordering offset and record parity is produced and
 // consumed on device: no H2D, D2H or host synchronization happens online. The
 // pinned host workspace stays allocated and validated but is never touched here.
+//
+// Windows are processed in bundles of plan.wave_windows: each bundle captures
+// its windows' metadata (including the 64-byte ScheduleMeta header into
+// WaveSlotMeta BEFORE the next window overwrites it), runs one 26-level wave,
+// then reduces every captured window from its own arena slot. A tail bundle
+// uses the same allocated arena with its actual width.
 aclError compute_msm(aclrtStream stream,const void* cache,const Fr* scalars,
                      G1Affine* out,void* workspace,void* pinned_host_workspace,
                      const MsmPlan& p) {
@@ -88,18 +95,50 @@ aclError compute_msm(aclrtStream stream,const void* cache,const Fr* scalars,
     if (!p.count) {
         launch_msm_finish(stream,nullptr,out,p); return ACL_SUCCESS;
     }
-    for (uint32_t w=0;w<p.windows;++w) {
-        launch_msm_extract(stream,scalars,workspace,p,w);
-        launch_msm_radix_group(stream,workspace,p);
-        launch_msm_rows(stream,workspace,p);
-        launch_msm_schedule(stream,workspace,p);
-        launch_msm_tasks(stream,workspace,p,0);
-        launch_msm_partial_sums(stream,cache,workspace,p);
-        for (uint32_t level=1;level<=p.merge_levels;++level) {
-            launch_msm_tasks(stream,workspace,p,level);
-            launch_msm_partial_merge(stream,workspace,p,level);
+    if (!p.wave_windows || p.wave_windows > p.windows) return ACL_ERROR_INVALID_PARAM;
+    const uint32_t width = p.wave_windows;
+    uint8_t* base = static_cast<uint8_t*>(workspace);
+    uint8_t* arena = base + p.region_offset[static_cast<uint32_t>(MsmRegion::WaveArena)];
+    uint8_t* slot_meta = base + p.region_offset[static_cast<uint32_t>(MsmRegion::WaveSlotMeta)];
+    uint8_t* window_slots = base + p.region_offset[static_cast<uint32_t>(MsmRegion::Windows)];
+    const uint64_t arena_bytes = p.region_size[static_cast<uint32_t>(MsmRegion::WaveArena)];
+    const uint64_t slot_bytes = p.region_size[static_cast<uint32_t>(MsmRegion::WaveSlotMeta)];
+    // Pure host geometry preflight: no allocation, transfer or synchronization.
+    for (uint32_t first = 0; first < p.windows; first += width) {
+        const uint32_t n = p.windows - first < width ? p.windows - first : width;
+        const WaveShape shape = msm_wave_shape(p,n);
+        const WaveBounds bounds = wave_scratch_bounds(shape);
+        if (!bounds.total || bounds.total > arena_bytes ||
+            uint64_t(n) * msm_wave_slot_meta_bytes > slot_bytes ||
+            !msm_wave_subwave_bound(shape))
+            return ACL_ERROR_INVALID_PARAM;
+    }
+    for (uint32_t first = 0; first < p.windows; first += width) {
+        const uint32_t n = p.windows - first < width ? p.windows - first : width;
+        const WaveShape shape = msm_wave_shape(p,n);
+        const WaveBounds bounds = wave_scratch_bounds(shape);
+        const WaveRegions regions = wave_regions(bounds);
+        const uint32_t subwaves = msm_wave_subwave_bound(shape);
+        for (uint32_t u = 0; u < n; ++u) {
+            launch_msm_extract(stream,scalars,workspace,p,first+u);
+            launch_msm_radix_group(stream,workspace,p);
+            launch_msm_rows(stream,workspace,p);
+            launch_msm_schedule(stream,workspace,p);
+            launch_msm_wave_capture(stream,workspace,arena,p,bounds,u);
         }
-        launch_msm_window_reduce(stream,workspace,p,w);
+        launch_msm_wave_plan(stream,arena,p,bounds,n);
+        for (uint32_t level = 0; level < msm_wave_level_slots; ++level) {
+            launch_msm_wave_build(stream,arena,p,bounds,n,level);
+            for (uint32_t sub = 0; sub < subwaves; ++sub)
+                launch_msm_wave_affine(stream,cache,arena,p,bounds,n,level,sub);
+            launch_msm_wave_carry(stream,cache,arena,p,bounds,n,level);
+        }
+        launch_msm_wave_finalize(stream,cache,arena,p,bounds,n);
+        for (uint32_t u = 0; u < n; ++u)
+            launch_msm_window_reduce(stream,workspace,p,
+                arena + regions.out_b + uint64_t(u)*p.buckets*192,
+                window_slots + uint64_t(first+u)*192,
+                slot_meta + uint64_t(u)*msm_wave_slot_meta_bytes);
     }
     launch_msm_finish(stream,workspace,out,p);
     return ACL_SUCCESS;

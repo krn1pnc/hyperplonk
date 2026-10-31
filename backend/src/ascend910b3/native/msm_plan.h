@@ -3,9 +3,10 @@
 #include <cstdint>
 
 namespace hyperplonk::ascend910b3::detail {
-// Vector field arena88512B + G1 banks/IO/tables93696B + SDK8192B reserve.
-// Includes the cached packed24 2p table (3072B); 5952B remains on 196352B UB.
-inline constexpr uint64_t msm_required_ub_bytes = 190400;
+// Wave controller budget on 196352B UB: FieldVector<Fq,64,false> arena
+// 118016B + private 65536B staging on the same pipe + the 8192B SDK planning
+// reserve, i.e. 191744B inclusive of the reserve; 4608B stay unaddressed.
+inline constexpr uint64_t msm_required_ub_bytes = 191744;
 inline constexpr uint32_t msm_point_lanes = 64;
 
 // Frozen 8-bit digit geometry of the target-private MSM metadata path. All
@@ -30,13 +31,22 @@ static_assert(msm_schedule_meta_tile_bytes == 616, "frozen ScheduleMeta tile str
 
 struct MsmPlatform { uint32_t aiv_cores = 0; uint64_t ub_bytes = 0; };
 // Region order is the frozen allocation order; offsets follow the enum order.
+// The weighted tail uses two fixed compact buffers (one point tile per usable
+// AIV, ceil(/4) for the tree), the fused-wave arena is one private MsmRegion
+// whose twelve sub-region offsets come from wave_regions() in msm_wave.h, and
+// WaveSlotMeta keeps one captured 64-byte ScheduleMeta header per fused slot.
+// MontgomeryBases stays last so the prepared-scratch boundary is unchanged.
 enum class MsmRegion : uint32_t {
     RecordsA, RecordsB, RadixFragments, RadixHistogram, RadixDescriptors,
     RadixDigitTotals, RadixControl, RowStarts, RowLocal, RowPtr, RowBlockMin,
-    RowBlockCarry, ScheduleMeta, TaskPrefix, Tasks, PartialA, PartialB, Buckets,
-    Windows, MontgomeryBases, Count
+    RowBlockCarry, ScheduleMeta, TaskPrefix, WeightedA, WeightedB, Windows,
+    WaveArena, WaveSlotMeta, MontgomeryBases, Count
 };
 inline constexpr uint32_t msm_region_count = static_cast<uint32_t>(MsmRegion::Count);
+// Compact weighted-tree capacities: one 192-byte point tile per usable AIV
+// (msm_wave_core_slots = 40, so 2560 tuples) and ceil(/4) for the tree level.
+inline constexpr uint32_t msm_weighted_fan_in = 4;
+inline constexpr uint32_t msm_weighted_capacity = msm_point_lanes * 40;
 
 // Balanced 1..8-bit LSD digit plan: ceil(c/8) levels, q+1 bits for the first
 // c%levels levels. Route 1 (9..16 bits) uses high/low decision metadata.
@@ -101,11 +111,17 @@ struct MsmPlan {
     MsmPlatform platform{};
     uint64_t count = 0, workspace_bytes = 0, dense_records = 0, fragment_records = 0;
     uint64_t host_workspace_bytes = 0, host_prefix_offset = 0;
-    uint64_t partial_capacity[2]{};
+    // Order-entry capacity of TaskPrefix (level-0 tasks plus one padding entry
+    // per bucket); sizes the host order array and bounds make_msm_schedule.
+    uint64_t task_capacity = 0;
+    // Private fused-wave arena: bytes of the canonical twelve-region bundle for
+    // wave_windows windows (0 for an empty plan) and the chosen bundle width.
+    uint64_t wave_arena_bytes = 0;
     uint64_t region_offset[msm_region_count]{}, region_size[msm_region_count]{};
     uint32_t window_bits = 0, windows = 0, buckets = 0, radix_passes = 0;
     uint32_t chunks = 0, merge_levels = 0, row_blocks = 0;
-    uint32_t weighted_segments = 0, weighted_levels = 0;
+    uint32_t weighted_segments = 0, weighted_segment_length = 0;
+    uint32_t wave_windows = 0;
     uint32_t radix_route = 0, radix_pass_bits[msm_radix_max_passes]{};
     uint32_t radix_max_bits = 0, radix_bins = 0, radix_high_bits = 0, radix_low_bits = 0;
 };

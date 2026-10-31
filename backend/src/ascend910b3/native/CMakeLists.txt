@@ -28,7 +28,8 @@ endforeach()
 
 add_library(hyperplonk_ascend910b3_math STATIC
     math_kernels.asc field_kernels.asc math_tiling.cpp msm.cpp msm_plan.cpp
-    msm_sort.asc msm_rows.asc msm_accumulate.asc msm_reduce.asc msm_schedule.asc)
+    msm_sort.asc msm_rows.asc msm_accumulate.asc msm_reduce.asc msm_schedule.asc
+    msm_wave.asc)
 target_include_directories(hyperplonk_ascend910b3_math PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}" ${CANN_INCLUDE_DIRS})
 target_link_libraries(hyperplonk_ascend910b3_math PUBLIC

@@ -18,6 +18,7 @@ template<uint32_t Lanes, bool Packed> class G1VectorEngine;
 // only public digits, exponent bits, layout indices, and tiles, never field values.
 template<class Field, uint32_t Lanes = 48, bool Compact = false> class FieldVector {
     template<uint32_t, bool> friend class G1VectorEngine;
+    template<uint32_t> friend class G1WaveAffine;
     friend struct SquareProbeAccess;
     using Params = FieldVectorParams<typename Field::Parameters>;
     using I32 = AscendC::LocalTensor<int32_t>;

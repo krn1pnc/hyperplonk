@@ -38,6 +38,12 @@ public:
     }
     __aicore__ inline void release(AscendC::LocalTensor<uint8_t> local) { input_.FreeTensor(local); }
     __aicore__ inline AscendC::LocalTensor<uint8_t> alloc_output() { return output_.AllocTensor<uint8_t>(); }
+    // An output tensor must return to its own DEPTH=1 queue.  Freeing it through
+    // release() set a V_MTE2 flag that the next alloc_output() waits as MTE3_V,
+    // so the two queues never matched and the kernel stalled forever.
+    __aicore__ inline void release_output(AscendC::LocalTensor<uint8_t> local) {
+        output_.FreeTensor(local);
+    }
     __aicore__ inline void write(AscendC::LocalTensor<uint8_t> local, GM_ADDR destination, uint32_t bytes) {
         output_.EnQue(local); local = output_.DeQue<uint8_t>();
         auto e = pipe_.FetchEventID(AscendC::HardEvent::S_MTE3);

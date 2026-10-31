@@ -1,9 +1,11 @@
 #include "field.h"
 #include "g1.h"
 #include "msm_plan.h"
+#include "msm_wave.h"
 
 #include <algorithm>
 #include <array>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -410,30 +412,16 @@ void g1_suite(const std::filesystem::path& fixtures) {
     std::cout << "G1_HOST_PASS\n";
 }
 
+// A rejected plan must leave the caller's object byte-identical, including any
+// padding the validator never inspects, so the contract is not narrowed to the
+// fields this suite happens to know about.
 bool same_msm_plan(const hp::detail::MsmPlan& a, const hp::detail::MsmPlan& b) {
-    if (a.platform.aiv_cores != b.platform.aiv_cores || a.platform.ub_bytes != b.platform.ub_bytes
-        || a.count != b.count || a.workspace_bytes != b.workspace_bytes
-        || a.dense_records != b.dense_records || a.fragment_records != b.fragment_records
-        || a.host_workspace_bytes != b.host_workspace_bytes || a.host_prefix_offset != b.host_prefix_offset
-        || a.window_bits != b.window_bits || a.windows != b.windows || a.buckets != b.buckets
-        || a.radix_passes != b.radix_passes || a.chunks != b.chunks || a.merge_levels != b.merge_levels
-        || a.row_blocks != b.row_blocks || a.weighted_segments != b.weighted_segments
-        || a.weighted_levels != b.weighted_levels
-        || a.radix_route != b.radix_route || a.radix_max_bits != b.radix_max_bits
-        || a.radix_bins != b.radix_bins || a.radix_high_bits != b.radix_high_bits
-        || a.radix_low_bits != b.radix_low_bits) return false;
-    for (unsigned i = 0; i < 3; ++i)
-        if (a.radix_pass_bits[i] != b.radix_pass_bits[i]) return false;
-    for (unsigned i = 0; i < 2; ++i)
-        if (a.partial_capacity[i] != b.partial_capacity[i]) return false;
-    for (unsigned i = 0; i < hp::detail::msm_region_count; ++i)
-        if (a.region_offset[i] != b.region_offset[i] || a.region_size[i] != b.region_size[i]) return false;
-    return true;
+    return std::memcmp(&a, &b, sizeof(hp::detail::MsmPlan)) == 0;
 }
 
 void msm_host_suite() {
     using namespace hp::detail;
-    const MsmPlatform platform{20, msm_required_ub_bytes};
+    const MsmPlatform platform{40, msm_required_ub_bytes};
     const auto ceil_div = [](uint64_t n, uint64_t d) { return n / d + (n % d != 0); };
     const auto round8 = [&](uint64_t n) { return ceil_div(n, 8) * 8; };
     const auto levels = [&](uint64_t n) {
@@ -450,6 +438,128 @@ void msm_host_suite() {
             out[i] = i < count ? q + (i < r ? 1u : 0u) : 0u;
         max_bits = q + (r ? 1u : 0u);
     };
+    const auto align512 = [&](uint64_t bytes) {
+        return ceil_div(bytes, msm_wave_region_alignment) * msm_wave_region_alignment;
+    };
+    // Independent per-bundle arena model: twelve production regions, every size
+    // ceil-aligned to 512 B, the total is the sum of those aligned sizes.
+    const auto wave_model = [&](uint64_t n, uint32_t c, uint32_t fuse_windows) {
+        WaveBounds bounds{};
+        const uint64_t buckets = uint64_t{1} << c;
+        const uint64_t w = fuse_windows;
+        const uint64_t a_ub = w * n / 2;
+        const uint64_t cores = platform.aiv_cores < msm_wave_core_slots
+            ? platform.aiv_cores : msm_wave_core_slots;
+        const uint64_t lanes = cores * msm_wave_lanes;   // one lane per op per step
+        // One-op chains: at most one active lane-step per op, so a sub-wave can
+        // only touch min(A_ub, block lanes * l_max) step-major slots, never the
+        // old chain-major rectangle.
+        const uint64_t p_steps = std::min<uint64_t>(a_ub, lanes * msm_wave_l_max);
+        const uint64_t node_slots = ceil_div(w * (n + buckets), 2) + 1;
+        bounds.records = align512(w * n * 8);
+        bounds.rows = align512(w * (buckets + 1) * 8);
+        bounds.base_offsets = bounds.rows;
+        bounds.op_src = align512(a_ub * 4);
+        bounds.op_dst = bounds.op_src;
+        bounds.prefixes = align512(p_steps * 128);
+        bounds.nodes_a = align512(node_slots * 96);
+        bounds.nodes_b = bounds.nodes_a;
+        bounds.out_b = align512(w * buckets * 192);
+        bounds.control = align512(msm_wave_control_bytes);
+        bounds.diag = align512(msm_wave_diag_bytes);
+        // One 512 B plan-stage summary record per usable AIV block, appended
+        // after diag; the summary field order is part of the frozen contract.
+        bounds.plan_summaries = align512(cores * 512);
+        bounds.total = bounds.records + bounds.rows + bounds.base_offsets + bounds.op_src
+            + bounds.op_dst + bounds.prefixes + bounds.nodes_a + bounds.nodes_b
+            + bounds.out_b + bounds.control + bounds.diag + bounds.plan_summaries;
+        return bounds;
+    };
+    // Largest bundle whose canonical arena fits the fixed private budget, never
+    // wider than the device window slots. A minimal W=1 arena that still exceeds
+    // the budget is kept and reported instead of rejecting the shape.
+    const auto bundle_width = [&](uint64_t n, uint32_t c, uint32_t windows) {
+        const uint32_t cap = std::min<uint32_t>(windows, msm_wave_window_slots);
+        for (uint32_t w = cap; w >= 1; --w)
+            if (wave_model(n, c, w).total <= msm_wave_budget_bytes) return w;
+        return uint32_t{1};
+    };
+    // Explicit one-op-chain mathematical case (one instance of the frozen
+    // geometry, not an asserted default): a sub-wave with ops_s ops runs
+    // chains = min(ops_s, block lanes) chains, so chain c owns
+    // count[c] = ops_s/chains + (c < ops_s%chains) ops and the only slot it
+    // writes is j*chains+c. Those (j,c) pairs are a bijection onto [0, ops_s),
+    // hence the largest store index is ops_s-1 and the region needs exactly
+    // min(A_ub, chunk) slots. Each step-j load reads the valid prefix of step
+    // j-1 and is bounded by the previous step's lane count. A_ub == 0 has no
+    // pair at all: zero slots and no index is ever formed.
+    const auto check_prefix_capacity = [&](uint64_t a_ub) {
+        const uint64_t cores = platform.aiv_cores < msm_wave_core_slots
+            ? platform.aiv_cores : msm_wave_core_slots;
+        const uint64_t chunk = cores * msm_wave_lanes * msm_wave_l_max;
+        const uint64_t p_slots = std::min(a_ub, chunk);
+        require(p_slots <= chunk, "prefix slots above the sub-wave chunk");
+        const uint64_t p_bytes = align512(p_slots * 128);
+        if (!a_ub) {
+            require(!p_slots && !p_bytes, "A_ub=0 must allocate no prefix slot");
+            return;
+        }
+        const uint64_t lanes_total = cores * msm_wave_lanes;
+        const uint64_t subwaves = ceil_div(a_ub, chunk);
+        require(subwaves >= 1 && (subwaves - 1) * chunk < a_ub && a_ub <= subwaves * chunk,
+                "prefix sub-wave partition");
+        for (uint64_t s = 0; s < subwaves; ++s) {
+            const uint64_t begin = s * chunk;
+            const uint64_t ops_s = std::min(a_ub - begin, chunk);
+            const uint64_t chains = std::min(ops_s, lanes_total);
+            require(chains >= 1 && chains <= ops_s, "prefix chain clamp");
+            const uint64_t base = ops_s / chains, rem = ops_s % chains;
+            require(base >= 1 && base <= ops_s && base * chains <= ops_s,
+                    "prefix chain length");
+            // Store coverage: slots are exactly [0, ops_s); the largest is the
+            // final op of the longest chain.
+            const uint64_t store_max = base * chains + (rem ? rem : 0) - 1;
+            require(store_max == ops_s - 1 && store_max < p_slots, "prefix store outside slots");
+            // Load bound: step j<=base reads at most nvalid(j) lanes of step
+            // j-1, whose written prefix ends at or below store_max.
+            const auto nvalid = [&](uint64_t j) {
+                return j < base ? chains : (j == base ? rem : uint64_t{0});
+            };
+            for (const uint64_t j : {uint64_t{1}, base > 1 ? base - 1 : uint64_t{1}, base}) {
+                if (!nvalid(j)) continue;
+                require(nvalid(j) <= nvalid(j - 1), "prefix load lanes grow between steps");
+                const uint64_t load_max = (j - 1) * chains + nvalid(j) - 1;
+                require(load_max < store_max + 1 && load_max < p_slots,
+                        "prefix load outside the written prefix");
+            }
+            // Behavioral enumeration of the cyclic index walk for small
+            // sub-waves: every visited (j,c) is unique and below p_slots.
+            if (ops_s <= 512) {
+                std::vector<uint8_t> seen(static_cast<size_t>(ops_s));
+                uint64_t visited = 0;
+                for (uint64_t c = 0; c < chains; ++c) {
+                    const uint64_t count = base + (c < rem ? 1 : 0);
+                    for (uint64_t j = 0; j < count; ++j) {
+                        const uint64_t index = j * chains + c;
+                        require(index < ops_s && !seen[static_cast<size_t>(index)],
+                                "prefix cyclic slot repeated or outside the sub-wave");
+                        seen[static_cast<size_t>(index)] = 1;
+                        ++visited;
+                    }
+                }
+                require(visited == ops_s, "prefix cyclic slots do not cover the sub-wave");
+            }
+        }
+    };
+    // Explicit low/high A_ub coverage, including the empty A_ub=0 pair count and
+    // an A_ub above one chunk that forces several sub-waves. No shape default:
+    // every value is an argument of this model.
+    for (const uint64_t a_ub : {uint64_t{0},uint64_t{1},uint64_t{2},uint64_t{3},
+                                uint64_t{63},uint64_t{64},uint64_t{65},uint64_t{4095},
+                                uint64_t{4096},uint64_t{4097},uint64_t{5242879},
+                                uint64_t{5242880},uint64_t{5242881},
+                                uint64_t{UINT32_MAX} / 2 * 32})
+        check_prefix_capacity(a_ub);
     const std::array<uint64_t, 9> sizes{0,1,64,65,2048,2049,65537,UINT32_MAX,4097};
     for (const uint64_t n : sizes) for (const uint32_t requested : {0u,2u,3u,4u,12u,16u,17u,19u,20u}) {
         MsmPlan p{};
@@ -461,9 +571,9 @@ void msm_host_suite() {
         if (!n) {
             require(!p.workspace_bytes && !p.host_workspace_bytes && !p.host_prefix_offset
                     && !p.windows && !p.buckets && !p.chunks && !p.merge_levels
-                    && !p.row_blocks && !p.radix_passes && !p.weighted_segments && !p.weighted_levels
-                    && !p.dense_records && !p.fragment_records
-                    && !p.partial_capacity[0] && !p.partial_capacity[1]
+                    && !p.row_blocks && !p.radix_passes && !p.weighted_segments
+                    && !p.weighted_segment_length && !p.wave_windows && !p.wave_arena_bytes
+                    && !p.dense_records && !p.fragment_records && !p.task_capacity
                     && !p.radix_route && !p.radix_max_bits && !p.radix_bins
                     && !p.radix_high_bits && !p.radix_low_bits
                     && !p.radix_pass_bits[0] && !p.radix_pass_bits[1] && !p.radix_pass_bits[2],
@@ -478,22 +588,55 @@ void msm_host_suite() {
         const uint64_t bins = uint64_t{1} << max_bits;
         const uint32_t route = c <= 8 ? 0u : (c <= 16 ? 1u : 2u);
         const uint64_t t = 8 * round8(b + 1);
-        const uint64_t m0 = ceil_div(n, 64) + b, m1 = ceil_div(n, 4096) + b;
+        const uint64_t task_capacity = ceil_div(n, 64) + b;
         const uint32_t l = levels(ceil_div(n, 64));
-        const bool weighted_tree = p.weighted_segments > 1;
-        const uint64_t prefix_capacity = ceil_div(t * (l + 1) + 4 * m0, 64) * 64;
+        // The compact weighted tree is capped at msm_weighted_capacity point
+        // tuples, so its segment geometry uses a clamped effective core count.
+        const uint32_t weighted_cores = std::min<uint32_t>(
+            platform.aiv_cores, msm_weighted_capacity / msm_point_lanes);
+        const uint64_t ideal_segment =
+            ceil_div(b - 1, uint64_t(weighted_cores) * msm_point_lanes);
+        const uint32_t segment_length =
+            ideal_segment < 16 ? 16 : static_cast<uint32_t>(ideal_segment);
+        const uint64_t prefix_capacity = ceil_div(t * (l + 1) + 4 * task_capacity, 64) * 64;
+        const uint32_t wave_windows = bundle_width(n, c, p.windows);
+        const WaveBounds wave = wave_model(n, c, wave_windows);
         require(p.windows == ceil_div(255, c) && p.buckets == b && p.radix_passes == passes
                 && p.chunks == chunks && p.merge_levels == l && p.row_blocks == ceil_div(b + 1, 256)
                 && p.weighted_segments >= 1 && p.weighted_segments < b
-                && bool(p.weighted_levels) == weighted_tree,
+                && p.weighted_segment_length == segment_length
+                && p.weighted_segments == ceil_div(b - 1, segment_length),
                 "MSM plan derived shape");
         require(p.radix_route == route && p.radix_max_bits == max_bits && p.radix_bins == bins
                 && p.radix_low_bits == digits[0] && p.radix_high_bits == (passes > 1 ? digits[1] : 0)
                 && p.radix_pass_bits[0] == digits[0] && p.radix_pass_bits[1] == digits[1]
                 && p.radix_pass_bits[2] == digits[2], "MSM radix route/digit plan");
         require(p.dense_records == round8(n) && p.fragment_records == round8(n + 7 * bins * chunks)
-                && p.partial_capacity[0] == m0 && p.partial_capacity[1] == ((l || weighted_tree) ? m1 : 0),
-                "MSM plan record and partial capacities");
+                && p.task_capacity == task_capacity,
+                "MSM plan record and task capacities");
+        // The bundle width is the largest legal W whose canonical arena fits the
+        // private budget, and the plan stores exactly that arena.
+        require(p.wave_windows == wave_windows && p.wave_arena_bytes == wave.total,
+                "MSM wave bundle width and arena");
+        // Arena order is the frozen WaveBounds order: the new plan_summaries
+        // region is the single last region, so it advances the total only.
+        const WaveRegions regions = wave_regions(wave);
+        require(regions.records == 0 && regions.rows == wave.records
+                && regions.base_offsets == wave.records + wave.rows
+                && regions.diag + wave.diag == regions.plan_summaries
+                && regions.plan_summaries + wave.plan_summaries == wave.total
+                && !(wave.total % msm_wave_region_alignment), "MSM wave region layout");
+        // A narrower tail bundle reuses the same regions with a smaller shape.
+        const WaveBounds tail = wave_model(n, c, 1);
+        require(tail.total <= p.wave_arena_bytes && tail.records <= wave.records
+                && tail.rows <= wave.rows && tail.base_offsets <= wave.base_offsets
+                && tail.op_src <= wave.op_src && tail.prefixes <= wave.prefixes
+                && tail.nodes_a <= wave.nodes_a && tail.out_b <= wave.out_b
+                && tail.control == wave.control && tail.diag == wave.diag
+                && tail.plan_summaries == wave.plan_summaries,
+                "MSM tail bundle fits the plan arena");
+        check_prefix_capacity(uint64_t(wave_windows) * n / 2);
+        check_prefix_capacity(n / 2);  // fuse_windows = 1 tail bundle
         std::array<uint64_t, msm_region_count> bytes{};
         bytes[at(MsmRegion::RecordsA)] = 8 * round8(n);
         bytes[at(MsmRegion::RecordsB)] = 8 * round8(n);
@@ -510,11 +653,14 @@ void msm_host_suite() {
         bytes[at(MsmRegion::ScheduleMeta)] = ceil_div(msm_schedule_meta_header_bytes
             + uint64_t(msm_schedule_meta_tile_bytes) * ceil_div(b + 1, 256), 64) * 64;
         bytes[at(MsmRegion::TaskPrefix)] = prefix_capacity;
-        bytes[at(MsmRegion::Tasks)] = 64 * m0;
-        bytes[at(MsmRegion::PartialA)] = 192 * m0;
-        bytes[at(MsmRegion::PartialB)] = 192 * ((l || weighted_tree) ? m1 : 0);
-        bytes[at(MsmRegion::Buckets)] = 192 * b;
+        // Compact weighted tree: one 192-byte point tile per usable AIV and a
+        // quarter of that for the next level, never the old per-bucket arrays.
+        bytes[at(MsmRegion::WeightedA)] = uint64_t(msm_weighted_capacity) * 192;
+        bytes[at(MsmRegion::WeightedB)] =
+            ceil_div(uint64_t(msm_weighted_capacity), msm_weighted_fan_in) * 192;
         bytes[at(MsmRegion::Windows)] = 192 * ceil_div(255, c);
+        bytes[at(MsmRegion::WaveArena)] = wave.total;
+        bytes[at(MsmRegion::WaveSlotMeta)] = uint64_t(msm_wave_slot_meta_bytes) * wave_windows;
         bytes[at(MsmRegion::MontgomeryBases)] = 96 * n;
         uint64_t end = 0;
         for (unsigned i = 0; i < bytes.size(); ++i) {
@@ -523,7 +669,10 @@ void msm_host_suite() {
                 require(!p.region_offset[i], "MSM zero region offset");
             } else {
                 const uint64_t start = p.region_offset[i];
-                require(!(start % 64) && start <= p.workspace_bytes
+                const uint64_t alignment =
+                    (i == at(MsmRegion::WaveArena) || i == at(MsmRegion::WaveSlotMeta))
+                        ? msm_wave_region_alignment : 64;
+                require(!(start % alignment) && start <= p.workspace_bytes
                         && bytes[i] <= p.workspace_bytes - start, "MSM region alignment/bounds");
                 for (unsigned j = 0; j < i; ++j)
                     if (bytes[j])
@@ -556,42 +705,46 @@ void msm_host_suite() {
                 && hot.chunks == 128 && hot.merge_levels == 3 && hot.row_blocks == 257
                 && hot.radix_route == 1 && hot.radix_bins == 256
                 && hot.radix_pass_bits[0] == 8 && hot.radix_pass_bits[1] == 8
-                && hot.partial_capacity[0] == 81920 && hot.partial_capacity[1] == 65792
+                && hot.task_capacity == 81920 && hot.wave_windows == 16
+                && hot.wave_arena_bytes == 2801825792
+                && hot.weighted_segments == 2521 && hot.weighted_segment_length == 26
                 && hot.host_prefix_offset == 524352 && hot.host_workspace_bytes == 2949440
-                && hot.workspace_bytes == 182910272, "MSM frozen hot plan numbers");
+                && hot.workspace_bytes == 2939165184, "MSM frozen hot plan numbers");
     }
     {
         // Frozen all-c upper bounds at N=2^20 (bytes).
         struct Upper {
-            uint32_t c, route, bins, chunks;
-            uint64_t fragments, histogram, descriptors, schedule, prefix, workspace, scratch;
+            uint32_t c, route, bins, chunks, wave_windows;
+            uint64_t fragments, histogram, descriptors, schedule, prefix, arena, workspace, scratch;
         };
         const std::array<Upper,19> upper{{
-            {2,0,4,128,8417280,2048,16384,1728,65856,130215296,29552000},
-            {3,0,8,128,8445952,4096,32768,1728,66112,130257600,29594304},
-            {4,0,16,128,8503296,8192,65536,1728,66368,130354304,29691008},
-            {5,0,32,128,8617984,16384,131072,1728,66944,130553344,29890048},
-            {6,0,64,128,8847360,32768,262144,1728,68096,130954880,30291584},
-            {7,0,128,128,9306112,65536,524288,1728,70400,131759872,31096576},
-            {8,0,256,128,10223616,131072,1048576,2368,75008,133371968,32708672},
-            {9,1,32,128,8617984,16384,131072,3008,84224,130913536,30250240},
-            {10,1,32,128,8617984,16384,131072,4224,102656,131301504,30638208},
-            {11,1,64,128,8847360,32768,262144,6656,139520,132457088,31793792},
-            {12,1,64,128,8847360,32768,262144,11584,213248,134010944,33347648},
-            {13,1,128,128,9306112,65536,524288,21440,360704,137876800,37213504},
-            {14,1,128,128,9306112,65536,524288,41152,655616,144093568,43430272},
-            {15,1,256,128,10223616,131072,1048576,80576,1245440,158042624,57379328},
-            {16,1,256,128,10223616,131072,1048576,159424,2425088,182910272,82246976},
-            {17,2,64,128,8847360,32768,262144,317120,4784384,230372480,129709184},
-            {18,2,64,128,8847360,32768,262144,632512,9502976,329843840,229180544},
-            {19,2,128,128,9306112,65536,524288,1263296,18940160,529544128,428880832},
-            {20,2,128,128,9306112,65536,524288,2524864,37814528,927429376,826766080}}};
+            {2,0,4,128,32,8417280,2048,16384,1728,65856,4295036928,4421622784,4320959488},
+            {3,0,8,128,32,8445952,4096,32768,1728,66112,4295075840,4421701632,4321038336},
+            {4,0,16,128,32,8503296,8192,65536,1728,66368,4295153664,4421871104,4321207808},
+            {5,0,32,128,32,8617984,16384,131072,1728,66944,4295309312,4422215168,4321551872},
+            {6,0,64,128,32,8847360,32768,262144,1728,68096,4295620608,4422907904,4322244608},
+            {7,0,128,128,32,9306112,65536,524288,1728,70400,4296243200,4424294400,4323631104},
+            {8,0,256,128,32,10223616,131072,1048576,2368,75008,4297488384,4427069952,4326406656},
+            {9,1,32,128,29,8617984,16384,131072,3008,84224,3959773184,4086732096,3986068800},
+            {10,1,32,128,26,8617984,16384,131072,4224,102656,3623614464,3750633600,3649970304},
+            {11,1,64,128,24,8847360,32768,262144,6656,139520,3403970560,3531489792,3430826496},
+            {12,1,64,128,22,8847360,32768,262144,11584,213248,3189929984,3317692288,3217028992},
+            {13,1,128,128,20,9306112,65536,524288,21440,360704,2985850880,3114857216,3014193920},
+            {14,1,128,128,19,9306112,65536,524288,41152,655616,2917431296,3047411392,2946748096},
+            {15,1,256,128,17,10223616,131072,1048576,80576,1245440,2765649920,2899093056,2798429760},
+            {16,1,256,128,16,10223616,131072,1048576,159424,2425088,2801825792,2939165184,2838501888},
+            {17,2,64,128,15,8847360,32768,262144,317120,4784384,2967500800,3110359488,3009696192},
+            {18,2,64,128,15,8847360,32768,262144,632512,9502976,3565189120,3723633088,3622969792},
+            {19,2,128,128,14,9306112,65536,524288,1263296,18940160,4487936000,4678307712,4577644416},
+            {20,2,128,128,13,9306112,65536,524288,2524864,37814528,6287292416,6540005184,6439341888}}};
         for (const auto& row : upper) {
             MsmPlan p{};
             require(make_msm_plan(size_t{1} << 20, platform, row.c, p), "MSM all-c upper plan rejected");
             require(p.radix_route == row.route && p.radix_bins == row.bins && p.chunks == row.chunks
                     && 8 * p.fragment_records == row.fragments && p.workspace_bytes == row.workspace
                     && p.region_offset[at(MsmRegion::MontgomeryBases)] == row.scratch
+                    && p.wave_windows == row.wave_windows
+                    && p.wave_arena_bytes == row.arena
                     && p.region_size[at(MsmRegion::RadixHistogram)] == row.histogram
                     && p.region_size[at(MsmRegion::RadixDescriptors)] == row.descriptors
                     && p.region_size[at(MsmRegion::ScheduleMeta)] == row.schedule
@@ -603,12 +756,12 @@ void msm_host_suite() {
         // Frozen UINT32_MAX metadata-only bounds: pure arithmetic, never allocated.
         struct Bound { uint32_t c; uint64_t workspace, scratch, host; };
         const std::array<Bound,6> bounds{{
-            {2,533238674880ull,120921814528ull,268435968ull},
-            {8,545393961088ull,133077100736ull,268451264ull},
-            {9,534589617472ull,122272757120ull,268466624ull},
-            {16,545444543872ull,133127683520ull,272368064ull},
-            {17,536234292416ull,123917432064ull,276300224ull},
-            {20,540032283456ull,127715423104ull,331350464ull}}};
+            {2,980385679360ull,568068819008ull,268435968ull},
+            {8,992540881408ull,580224021056ull,268451264ull},
+            {9,981736451584ull,569419591232ull,268466624ull},
+            {16,992569529856ull,580252669504ull,272368064ull},
+            {17,983337258496ull,571020398144ull,276300224ull},
+            {20,986826968064ull,574510107712ull,331350464ull}}};
         for (const auto& row : bounds) {
             MsmPlan p{};
             require(make_msm_plan(static_cast<size_t>(UINT32_MAX), platform, row.c, p),
@@ -637,11 +790,17 @@ void msm_host_suite() {
         rejected(changed, "RadixControl size");
         changed = base; ++changed.region_offset[at(MsmRegion::ScheduleMeta)];
         rejected(changed, "ScheduleMeta offset");
+        changed = base; ++changed.task_capacity; rejected(changed, "task_capacity");
+        changed = base; ++changed.wave_windows; rejected(changed, "wave_windows");
+        changed = base; ++changed.wave_arena_bytes; rejected(changed, "wave_arena_bytes");
+        changed = base; ++changed.weighted_segment_length;
+        rejected(changed, "weighted_segment_length");
     }
     MsmPlan sentinel{};
     require(make_msm_plan(2049, platform, 12, sentinel), "MSM sentinel plan");
     const auto reject_plan = [&](size_t n, MsmPlatform hw, uint32_t c) {
-        MsmPlan out = sentinel;
+        MsmPlan out;
+        std::memcpy(&out, &sentinel, sizeof(out));
         require(!make_msm_plan(n, hw, c, out) && same_msm_plan(out, sentinel),
                 "MSM invalid plan accepted or output changed");
     };

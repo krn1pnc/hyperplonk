@@ -267,61 +267,112 @@ does not describe production MSM, which uses the Vector G1 stages below.
 The measured builds set no `CMAKE_BUILD_TYPE` (the default empty configuration);
 no optimization flags, tests or residency audits were changed.
 
-Measured with CANN 9.1.0, DAV_2201 and four build jobs: a fresh native build took
-85.14 seconds, host-harness-only rebuild 2.77 seconds, chain-only rebuild
-41.98 seconds, and unchanged rebuild 0.08 seconds. These are build wall times
-(excluding configuration, fixture generation and tests), not kernel timings.
-The full host/NPU suite, all 16 G1 resident-chain cases and CPU backend
-regression pass with this organization; per-kernel performance was not profiled.
+Earlier build-wall measurements with CANN 9.1.0, DAV_2201 and four build jobs
+recorded a fresh native build of 85.14 seconds, host-harness-only rebuild 2.77
+seconds, chain-only rebuild 41.98 seconds, and unchanged rebuild 0.08 seconds.
+These are build wall times (excluding configuration, fixture generation and
+tests), not kernel timings; the full host/NPU suite, all 16 G1 resident-chain
+cases and CPU backend regression passed with that organization, and per-kernel
+performance was not profiled.
 
 The native MSM implementation follows pinned
 [cuZK sparse/balanced Pippenger](https://github.com/Tao-Lu-123/cuZK/blob/88e3295cada379abe06240df23ec6c9fc0f648b2/depends/libff-cuda/scalar_multiplication/multiexp.cu),
 adapted to DAV_2201 without CUDA ticket atomics: route-aware stable integer
 radix grouping on device (one 1-8-bit pass for c<=8, a gated 9-16-bit
 fast/fallback pair, three least-significant 1-8-bit passes for c=17-20),
-device-produced CSR bucket rows and task schedule, bounded 64-point tasks and
-fan-in-64 bucket-partial reduction. Digit width is metadata only; the point and
-field arithmetic below is unchanged.
+device-produced CSR bucket rows and task schedule, then one fused whole-wave
+affine bucket reduction per bundle of windows. Digit width is metadata only;
+the point and field arithmetic below is unchanged.
 Inside a digit level the descriptor prefix scan splits its digits into
 independent bands of8: one AIV owns a band, keeps that band's per-chunk order
 exact, and moves whole32-byte descriptor rows and64-byte total lines with the
 same aligned2D block copies. Band boundaries fall on those line sizes, so the
-written bytes are identical to the former single-pass scan; the public API,
-arithmetic, scratch and UB sizes do not change.
-Level-zero tasks are stably grouped by length across SIMD lanes, but retain
-their original point order and partial-output positions. Weighted segments fit
-the available AIV lanes with a minimum span of16; their final tree uses fan-in4
-to avoid serial work on a nearly empty SIMD tile.
-Every nonempty partial, merge and weighted-tree task seeds its accumulator from
-the first point instead of adding it to identity. Weighted segments similarly
-seed running/local sums while preserving per-lane descending order and tails.
-Weighted segments restore absolute bucket weights; only the final result is
-normalized. Each input scalar contributes one unsigned digit record per window,
-including digit zero; bucket zero is excluded from point accumulation.
+written bytes are identical to the former single-pass scan; the band-prefix
+change left the public API, arithmetic, scratch and UB sizes unchanged.
 
-Production point stages use `g1_vector.h`: 64 lanes process independent
-partial-sum tasks, merge tasks or weighted segments inside each AIV. The shared
-Fr/Fq engine batches digit-row products with repeat strides and defers carry
-propagation until the eliminated Montgomery coefficient and final carry sweep;
-the same generic square template serves the packed and full G1 engines.
-Partial sums use exact mixed-affine addition for freshly loaded affine bases.
-Generic and mixed additions retain every exceptional case; an exact tile-wide
-vote skips doubling only when no lane needs the equal-point result.
+A bundle of `W` consecutive windows now shares one device 26-level affine bucket
+tree (`msm_wave.asc`) instead of per-window partial, merge and weighted-tree
+stages for the bucket sum. For each window in the bundle the device radix group,
+row scan and schedule still run, and one capture kernel copies that window's
+selected records, RowPtr and its 64-byte `ScheduleMeta` header
+into the private arena before the next window overwrites them. One plan stage
+then publishes the per-(window,bucket) node caps and one summary per block, each
+level's build launch writes that level's op stream, levels 0..25 run affine and
+carry, and one finalize launch publishes each window's bucket tuples for the
+per-window weighted reduce.
+The reduction is exact and generic: level 0 chains the captured bucket points,
+higher levels combine the previous level's nodes, and equal-point,
+opposite-point and identity pairs keep their own exact results rather than a
+special-case formula. Every op starts its own one-op chain, so a level has at
+most 40*64 = 2560 chains and each block lane at most2048 ops, and a level
+sub-wave forms one cyclic step-major chain product per block and inverts it once
+with `inverse_montgomery`. Only that 128-byte step-major prefix is persisted: the
+backward pass re-reads the same immutable children and rebuilds the masks,
+denominator and numerator, so no per-op denominator, numerator or mask state is
+written to HBM. Identity, pass-through, opposite-point and padding lanes clamp
+`D` to one and `N` to zero in both directions, which keeps the prefix exact.
+The prefix region is sized to the exact cyclic bound
+`min(A_ub, aiv_cores*64*2048)` 128-byte slots rather than a chain-major
+rectangle, and only each step's valid leading lanes are transferred. The plan
+stage is two kernels on the same stream: stage 1 computes distributed local
+base-1 prefixes plus one 512-byte summary per block, and stage 2 folds those
+summaries into the global prefix, the per-window sentinel totals and the
+control/diagnostic tail. Both partition the entry space on 8-entry (64-byte)
+boundaries, so no two blocks share a line and no host reads are involved.
+The arena is one canonical twelve-region bundle (records, rows, base offsets,
+op source/destination, step-major prefixes, two node ping-pong buffers,
+per-window bucket tuples, control, diagnostics and per-block plan summaries),
+512-byte aligned, under a fixed 9 GiB algorithm budget. The plan picks the
+largest bundle width that fits: 16 of the 16 windows at`2^20`, and 2 at`2^25`,
+whose 13th window uses a one-window tail bundle over the same arena. A shape
+whose minimal one-window arena exceeds the budget keeps width1 and reports its
+real bytes, so the ordinary device-capacity preflight decides. Window widths,
+bucket count, the radix digit plan, the prepared-cache format, the Rust interfaces
+and the protocol C ABI stay as they were, and the wave header never reaches
+`msm.h` or the protocol bridge. The native C++ surface is *not* binary-compatible
+with older archives: `msm.h` pulls in the complete `MsmPlan` declaration (and
+the prepared entry points take a plan), that layout now carries the wave fields, and
+`msm_required_ub_bytes` is191744 instead of190400, so every native consumer must
+rebuild against the matching headers and archive. No special-input or
+SRS-relation path is added.
+Weighted segments fit the available AIV lanes with a minimum span of16; their
+final tree uses fan-in4 to avoid serial work on a nearly empty SIMD tile.
+Each weighted segment and tree task still seeds its accumulator from the first
+point instead of adding it to identity, preserves per-lane descending order and
+tails, and restores absolute bucket weights; only the final result is
+normalized. Its captured `ScheduleMeta` header now only gates an empty window.
+Each input scalar contributes one unsigned digit record per window, including
+digit zero; bucket zero is excluded from point accumulation.
+
+Production point stages use `g1_vector.h` for the per-window weighted reduce:
+64 lanes process independent weighted segments inside each AIV, while the wave
+controller is a private 64-lane `G1WaveAffine<64>` built directly on
+`FieldVector` primitives. The shared Fr/Fq engine batches digit-row products
+with repeat strides and defers carry propagation until the eliminated Montgomery
+coefficient and final carry sweep; the same generic square template serves the
+packed and full G1 engines.
+Every addition keeps its exceptional cases; an exact tile-wide vote skips the
+doubling candidate only when no lane needs the equal-point result.
 Private generic and mixed additions use `Z1*Z2*H` directly rather than the
 equivalent projectively scaled `(4X,8Y,2Z)` tuple. This removes four modular
 doublings per addition without changing equal/opposite/identity selections,
 the public value types, or packed HBM record formats.
 
 The same `G1VectorEngine<Lanes,Packed>` formulas now process64 points per AIV
-in base preparation, partial sums/merges and weighted reduction. Normalized
+in base preparation and the per-window weighted reduction. Normalized
 radix12 coordinate digits use exact I16 storage in UB; shared Fr/Fq arithmetic
 and controls remain I32. DAV2201 supports I32→I16 narrowing but not direct
 I16→I32 Cast: widening uses integer Gather, odd-lane shifts and U16 masking,
 with explicit I32 mask restoration. No floating-point conversion is used.
 The packed engine consumes186112B including the8192B SDK reserve. Final
 affine normalization retains the default48-lane full engine and inverse banks
-(190400B including reserve), which determines the unchanged global UB gate.
-Lane width and UB packing do not change192-byte HBM Jacobian records.
+(190400B including reserve) for the point stages. The global gate is the higher
+wave-controller figure `msm_required_ub_bytes=191744`: its production
+`FieldVector<Fq,64,false>` arena occupies118016B, its private staging65536B on
+the same pipe and the8192B SDK reserve, leaving4608B of the queried196352B UB
+unaddressed. One TPipe owns the block, because a second pool would start at UB
+offset0 and overlay the field arena. Lane width and UB packing do not change
+192-byte HBM Jacobian records.
 
 One NPU ingress kernel converts bases into a `96*N`-byte HBM workspace once per
 `run_msm` call, amortized across all windows. Private coordinates retain
@@ -335,10 +386,10 @@ retain their canonical policy. Ingress time is included in the measurements.
 An optional internal prepared-SRS path separates this ingress from repeated MSMs:
 `prepare_msm_srs` synchronously creates one immutable `96*N`-byte positive-base
 Montgomery cache; `run_msm_prepared` reuses it with arbitrary changing canonical
-Fr scalars. The unsigned window algorithm, coordinate arithmetic and existing
-`run_msm` behavior are unchanged. This is a native math interface only, not a
-HyperPlonk commitment/protocol implementation or a claim that CPU10x or
-`2^25<1s` has been achieved.
+Fr scalars. Separating ingress from repeated use leaves the unsigned window
+algorithm and coordinate arithmetic unchanged. This is a native math interface
+only, not a HyperPlonk commitment/protocol implementation or a claim that CPU10x
+or `2^25<1s` has been achieved.
 The shared CIOS loop uses signed cancellation factors only where constexpr
 coefficient bounds prove the I32 product cannot overflow: all22 Fr iterations
 and the first27 of32 Fq iterations. The remaining Fq iterations retain the
@@ -351,13 +402,16 @@ showed a corrupted scratch copy; explicit mask/repeat addressing passed the
 same case and full regression. No general SDK limitation is inferred.
 Bucket materialization copies Montgomery 192-byte tuples and synthesizes
 empty-bucket identities; it does not perform Montgomery conversions or field
-arithmetic. Its UB tile is 64 records, with device-produced `ScheduleMeta`
-and `TaskPrefix` bytes controlling DMA addresses.
+arithmetic. In the wave it is the finalize launch, which reads rows and base
+offsets on device, writes one tuple per (window,bucket) in 64-lane groups, and
+gives an empty or identity-accumulating bucket the canonical identity tuple;
+bucket zero is never read from the arena and is written as the identity.
 
-The field arena is 88512 bytes. Eleven extra G1 field banks, a 9216-byte point
-buffer and 3072-byte metadata buffer bring explicit UB usage to 168384 bytes.
-`msm_required_ub_bytes=190400` includes the 8192-byte SDK reservation; plans below
-that queried capacity are rejected before launch. Scalar reads cover public
+The point-stage field arena is 88512 bytes. Eleven extra G1 field banks, a
+9216-byte point buffer and 3072-byte metadata buffer bring that layout to
+168384 explicit UB bytes; the wave controller uses the private layout above.
+`msm_required_ub_bytes=191744` includes the 8192-byte SDK reservation, and plans
+below that queried capacity are rejected before launch. Scalar reads cover public
 indices/weights and derived Boolean control aggregates, never coordinate words
 or Fq arithmetic. The same-point branch is data-dependent, not constant-time.
 
@@ -370,7 +424,8 @@ binary, not profiles or timing samples of the current implementation.
 A subsequent single-call diagnostic of the Montgomery-resident version attributes
 69.782% of task time to partial sums, 14.926% to weighted segments and 7.961% to
 the weighted tree. The once-per-call base conversion accounts for 0.775%.
-This is stage attribution, not a warmed comparable timing sample.
+This is stage attribution, not a warmed comparable timing sample, and its
+partial-sum/merge stage names predate the fused whole-wave reduction.
 
 The following complete-MSM measurements use identical inputs within each size,
 distinct subgroup bases and full-width canonical random Fr scalars. Input
@@ -394,6 +449,7 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Device radix/CSR/schedule, prepared, automatic16-bit window (`R30`) | 1 | 3 | median | 1.363333293 |
 | 2^20 | Symmetric square, device radix/CSR/schedule, prepared, automatic16-bit window (`R31`) | 1 | 3 | median | 1.340093202 |
 | 2^20 | Independent digit-band prefix (`R39`), prepared, automatic16-bit window | 1 | 3 | median | 1.307588938 |
+| 2^20 | Whole-wave affine reduction (`R42`), prepared, automatic16-bit window, bundle16 of16 | 1 | 3 | median | 1.126259368 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
@@ -403,6 +459,7 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^25 | Device radix/CSR/schedule, prepared, explicit20-bit window (`R30`) | 1 | 3 | median | 29.804091049 |
 | 2^25 | Symmetric square, device radix/CSR/schedule, prepared, explicit20-bit window (`R31`) | 1 | 3 | median | 29.337902454 |
 | 2^25 | Independent digit-band prefix (`R39`), prepared, explicit20-bit window | 1 | 3 | median | 28.428664641 |
+| 2^25 | Whole-wave affine reduction (`R42`), prepared, explicit20-bit window, bundle2+tail1 of13 | 1 | 3 | median | 24.525876869 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
 The current native implementation supports2–20-bit windows. Removing the old
@@ -417,22 +474,30 @@ are31.95% faster than the16-thread CPU reference at`2^25` (29.337902454s
 vs43.114322s) and15.27% faster at`2^20` (1.340093202s vs1.581598s). With the
 R39 digit-band prefix those same prepared scopes are1.307588938s and
 28.428664641s,2.43% and3.10% below the R31 medians; the16-thread CPU reference
-was not re-measured for R39.
-Both sizes passed one warmup and three exact targets with strict resource
-audits. Full host capacity/rejection checks and native field, G1, MSM, replay
-and two-stream regressions passed, including high bucket bits, the three-pass
-route-2 grouping and explicit17/20-bit MSM cases. New point cases isolate
-equality votes in lanes47/48/63, a next-tile tail, and127/128/129 input
-boundaries.
-With the R39 digit-band prefix both sizes passed one warmup, three timed samples
-and three reuse calls: all seven outputs per size match the provided exact
-96-byte oracle, every online compute audit reports zero copies, zero allocations
-and zero synchronizations, and the timing scope still ends at one final96-byte
-D2H plus one stream-completion wait. The full cache guard byte-compares the
-whole100663296-byte `2^20` and3221225472-byte `2^25` caches with intact guards.
-R39 metadata passed all103 existing cases in11.137s and the native full suite in
-72.491s; the host test binary is byte-identical to the already-accepted main
-host ELF, so that evidence was reused instead of rebuilt or rerun.
+was not re-measured for R39. With the R42 whole-wave reduction the same prepared
+scopes are1.126259368s and24.525876869s,13.8675% and13.7284% below the R39
+medians at unchanged windows and timing scope; the16-thread CPU reference was
+not re-measured for R42 either, so no new CPU percentage is claimed. Between
+those two rows the digit-band radix grouping is the accepted R39 main source kept
+unchanged, so the delta comes from the fused wave reduction and its two-kernel
+plan. Both sizes passed one warmup and three exact targets with strict resource
+audits, and the candidate also passed the full host capacity/rejection checks,
+all103 metadata cases and the native suite of82 cases plus809 fixtures, covering
+native field, G1, MSM, replay and two-stream regressions, high bucket bits, the
+three-pass route-2 grouping and explicit17/20-bit MSM cases. Earlier packed64
+checkpoints added point cases isolating equality votes in lanes47/48/63, a
+next-tile tail, and127/128/129 input boundaries.
+Across those warmup, target and three reuse calls all seven outputs per size
+match the provided exact 96-byte reference point, every online compute audit
+reports zero copies, zero allocations and zero synchronizations, and the timing
+scope still ends at one final96-byte D2H plus one stream-completion wait. The
+full cache guard byte-compares the whole100663296-byte `2^20` and3221225472-byte
+`2^25` caches with intact 128-byte guards; that validation traffic sits outside
+the online audits and timing. The candidate's first bare build took309.567s, the
+host field/math suite87.155s, all103 metadata cases11.119s and the native full
+suite127.904s; these are wall times of this build, not kernel timings. The R39
+rows had passed the same one-warmup/three-target/three-reuse schedule with
+metadata at11.137s and the native suite at72.491s.
 An earlier48-lane private-arithmetic probe passed960 pairs/164160 exact checks
 covering REDC, aliases, live masks, `0/p`, inversion and canonical serialization.
 The packed64 integer-bridge probe separately covers all4096 digit values,
@@ -440,16 +505,21 @@ permuted lane/row patterns, source/coordinate guards, I32 return-mask reuse and
 real HBM interleave-index restoration; all655360 output bytes match its CPU oracle.
 Only the old pre-cache NPU figures are1+1 diagnostic checkpoints.
 CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet: the current
-R39 prepared medians are1.307588938s at`2^20` and28.428664641s at`2^25` (the
-R31 figures were1.340093202s and29.337902454s), so the prepared`2^20` candidate
+R42 prepared medians are1.126259368s at`2^20` and24.525876869s at`2^25` (the
+R39 figures were1.307588938s and28.428664641s), so the prepared`2^20` candidate
 is still slower than the user-reported 8-thread ~1.0s CPU approximation, which
 was not re-measured here.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
-integrated. Source, raw records, input/binary identities and rejected candidates
+integrated. Cube MSM remains a private prototype: its primitive cells have been
+measured and are slower than the Vector path, and it is not integrated into the
+MSM reduction, so no Cube MSM, integrated-Cube or hardware-floor claim is made.
+Source, raw records, input/binary identities and rejected candidates
 remain under `target/msm-hotspot/`, including the R39 runs under
-`target/msm-hotspot/round39-radix-prefix/`; those generated artifacts are local
-to this workspace, not shared, and not tracked. Reproduce inputs and warmed
-CPU/NPU comparisons with:
+`target/msm-hotspot/round39-radix-prefix/`, the R42 candidate source under
+`target/msm-hotspot/round42-wave-native/` and its raw run, build and identity
+records under `target/msm-hotspot/round42-wave-fused/`; those generated
+artifacts are local to this workspace, not shared, and not tracked. Reproduce
+inputs and warmed CPU/NPU comparisons with:
 
 ```bash
 cargo run --release --locked \
@@ -485,16 +555,23 @@ oracle dependency is added to the normal smoke command above.
 The CPU tool performs a separate reference call, one warmup and three targets.
 It excludes preparation/serialization and includes arkworks' internal MSM
 allocations. Native compute permits no allocations or unexpected explicit
-copies. The prepared `2^20` candidate (c=16) issues zero compute H2D, zero
-compute D2H and zero stream synchronizations inside `run_msm_prepared`; only the
-separate final96-byte D2H and one completion wait remain. Its queried one-shot
-workspace is182910272B (prepared scratch82246976B plus the immutable
+copies. The prepared `2^20` candidate (c=16, bundle16) issues zero compute H2D,
+zero compute D2H and zero stream synchronizations inside `run_msm_prepared`;
+only the separate final96-byte D2H and one completion wait remain. Its queried
+one-shot workspace is2939165184B (prepared scratch2838501888B plus the immutable
 100663296B base cache), and pinned host workspace is2949440B, which stays
-reserved and untouched online. At`2^25` with the explicit20-bit window the
-workspace is5016826688B (prepared scratch1795601216B plus the3221225472B
-cache) and pinned host workspace is56623488B. With the automatic19-bit window
-the plan predicts4614747136B workspace and29360512B pinned scratch; that
-configuration was not measured. No numerical intermediate returns to the host.
+reserved and untouched online. At`2^25` with the explicit20-bit window (bundle2
+plus a one-window tail) the workspace is12766973056B (prepared scratch
+9545747584B plus the3221225472B cache) and pinned host workspace is56623488B.
+The private fused-wave arena dominates those scratch sizes; the plan reports it
+as `wave_arena_bytes`/`wave_windows`. With the automatic19-bit window the plan
+predicts12381670528B workspace (scratch9160445056B, pinned29360512B, bundle2);
+that configuration was not measured. Benchmark-owned peak device allocation was
+3140492000B at`2^20` and19209424224B at`2^25`, including the `96*N`-byte
+canonical base input, and it fell to a resident3039828704B and15988198752B once
+that input was retired before the online calls; both figures include the
+benchmark's scalar pool and guards and exclude runtime overhead. No numerical
+intermediate returns to the host.
 The radix grouping, CSR production and task scheduling are device-side;
 point-coordinate arithmetic is Vector throughout.
 
@@ -515,15 +592,18 @@ aclError status = run_msm(stream, bases, scalars, out,
 This internal C++ API borrows HBM inputs (`96*N` bytes of canonical Affine bases,
 `32*N` bytes of canonical Fr scalars), a 96-byte device output, and caller-owned
 scratch. `msm_plan.h` is ACL-free and computes exact host/device capacities.
-Device scratch includes `96*N` bytes for the packed Montgomery base cache;
-allocate the queried plan capacity rather than retaining an older byte count.
+Device scratch still ends with `96*N` bytes for the packed Montgomery base cache,
+but is now dominated by the private fused-wave arena whose size depends on the
+chosen bundle width: `make_msm_plan` records that width as `wave_windows` and its
+bytes as `wave_arena_bytes`, and `validate_msm_plan` re-derives both. Allocate
+the queried plan capacity rather than retaining an older byte count.
 Pinned scratch remains part of the borrowed contract and is size-checked, but
 the device-metadata path never writes or reads it online; task prefixes and the
 length-balanced order are produced in device scratch. No point or field
 values are added to numerical host transfers.
 `N <= UINT32_MAX`; explicit windows are2–20 bits, with0 selecting the cuZK-style
 automatic heuristic capped at20. Platform requirements are at least one AIV
-and 190400 UB bytes, including the8192-byte SDK reservation (5952 bytes spare
+and 191744 UB bytes, including the8192-byte SDK reservation (4608 bytes spare
 on the queried196352-byte UB). Input/output addresses must be32-byte aligned, scratch addresses
 64-byte aligned. Allocate host scratch with `aclrtMallocHost`; if aligning an
 interior pointer, retain and free the original allocation. Output and scratch
@@ -552,21 +632,22 @@ one-shot capacity (odd counts retain 32 bytes of final padding). For `N=0` these
 three capacities are zero, but output still requires 96 valid bytes; cold
 preparation still completes its stream before publishing the empty view.
 
-`run_msm` performs no online CPU metadata scheduling. For each of
-`W=ceil(255/c)` windows the device radix group writes sorted records and a
+`run_msm` performs no online CPU metadata scheduling. For each of the
+`ceil(255/c)` windows the device radix group writes sorted records and a
 `RadixControl` word (final record parity, bounded-fallback flag, maximum coarse
 partition); the device schedule then writes `ScheduleMeta` (per-level task counts
 and the task-order offset) plus the stable length-balanced `TaskPrefix`/order into
-device scratch. Every consumer reads those counts and the parity on device and
-uses fixed grids, so there is no per-window D2H, no caller-stream synchronization
-and no H2D inside the compute path. An empty window keeps the exact Montgomery
-identity and later stages idle on the device count. Points, buckets and partial
-points never return to the CPU. No host/device allocation or free occurs inside
-`run_msm`. The measured prepared `2^20` call (`c=16`) issues zero compute
-copies, zero compute stream synchronizations and zero compute allocations; only
-the final96-byte download and one completion wait occur. Allocate the queried
-pinned and device capacities rather than reusing the previous smaller scratch
-sizes.
+device scratch. The wave plan derives the per-(window,bucket) caps on device and
+each level build derives that level's op stream from the rows and caps, and every
+consumer uses fixed grids, so there is no per-window D2H, no caller-stream
+synchronization and no H2D inside the compute path. An empty window keeps the
+exact Montgomery identity and later stages idle on the device count. Points,
+buckets and partial points never return to the CPU. No host/device allocation or
+free occurs inside `run_msm`. The measured prepared `2^20` call (`c=16`) issues
+zero compute copies, zero compute stream synchronizations and zero compute
+allocations; only the final96-byte download and one completion wait occur.
+Allocate the queried pinned and device capacities rather than reusing the
+previous smaller scratch sizes.
 `ACL_SUCCESS` means every stage was enqueued successfully, **not** that the final
 point is ready. Keep inputs, output and both scratch allocations alive until
 stream completion, including after a failure with earlier work outstanding. Do
@@ -579,9 +660,14 @@ For `N=0`, inputs and both scratch pointers may be null with zero capacity:
 the finish kernel writes identity without metadata transfers or internal sync.
 
 Production kernels compile separately in `msm_sort.asc`, `msm_schedule.asc`,
-`msm_rows.asc`, `msm_accumulate.asc` and `msm_reduce.asc`; orchestration remains
-ordinary C++. `msm_schedule.asc` produces the device CSR schedule metadata and
-contains no point or field arithmetic.
+`msm_rows.asc`, `msm_accumulate.asc`, `msm_reduce.asc` and `msm_wave.asc`;
+orchestration remains ordinary C++. `msm_schedule.asc` produces the device CSR
+schedule metadata and contains no point or field arithmetic;
+`msm_accumulate.asc` holds the base-cache ingress, `msm_reduce.asc` the
+per-window weighted reduce and the final finish, and `msm_wave.asc` the private
+wave controller with its six launchers and the 26-level tree. That geometry, the
+single arena allocator and the control/diagnostic blocks live in `msm_wave.h`,
+which is internal and never included by `msm.h` or the protocol bridge.
 MSM fixtures use independent Python affine arithmetic with known generator
 coefficients, distinct large-case bases and small-case direct-MSM cross-checks.
 
