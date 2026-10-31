@@ -340,7 +340,12 @@ final tree uses fan-in4 to avoid serial work on a nearly empty SIMD tile.
 Each weighted segment and tree task still seeds its accumulator from the first
 point instead of adding it to identity, preserves per-lane descending order and
 tails, and restores absolute bucket weights; only the final result is
-normalized. Its captured `ScheduleMeta` header now only gates an empty window.
+normalized. Within a segment only the add of a fresh bucket point into the
+running partial takes the affine mixed entry: those buckets are finite with
+`Z=MontOne` and a skipped lane is the normalized identity, so the rhs needs no
+`Z²` rescaling, while the running partial and the weighted tree still use the
+general Jacobian addition. Its captured `ScheduleMeta` header now only gates an
+empty window.
 Each input scalar contributes one unsigned digit record per window, including
 digit zero; bucket zero is excluded from point accumulation.
 
@@ -449,7 +454,8 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Device radix/CSR/schedule, prepared, automatic16-bit window (`R30`) | 1 | 3 | median | 1.363333293 |
 | 2^20 | Symmetric square, device radix/CSR/schedule, prepared, automatic16-bit window (`R31`) | 1 | 3 | median | 1.340093202 |
 | 2^20 | Independent digit-band prefix (`R39`), prepared, automatic16-bit window | 1 | 3 | median | 1.307588938 |
-| 2^20 | Whole-wave affine reduction (`R42`), prepared, automatic16-bit window, bundle16 of16 | 1 | 3 | median | 1.126259368 |
+| 2^20 | Whole-wave affine reduction (`R42`, previous), prepared, automatic16-bit window, bundle16 of16 | 1 | 3 | median | 1.126259368 |
+| 2^20 | Mixed affine weighted add (`R43`), prepared, automatic16-bit window, bundle16 of16 | 1 | 3 | median | 1.108570778 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
@@ -459,7 +465,8 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^25 | Device radix/CSR/schedule, prepared, explicit20-bit window (`R30`) | 1 | 3 | median | 29.804091049 |
 | 2^25 | Symmetric square, device radix/CSR/schedule, prepared, explicit20-bit window (`R31`) | 1 | 3 | median | 29.337902454 |
 | 2^25 | Independent digit-band prefix (`R39`), prepared, explicit20-bit window | 1 | 3 | median | 28.428664641 |
-| 2^25 | Whole-wave affine reduction (`R42`), prepared, explicit20-bit window, bundle2+tail1 of13 | 1 | 3 | median | 24.525876869 |
+| 2^25 | Whole-wave affine reduction (`R42`, previous), prepared, explicit20-bit window, bundle2+tail1 of13 | 1 | 3 | median | 24.525876869 |
+| 2^25 | Mixed affine weighted add (`R43`), prepared, explicit20-bit window, bundle2+tail1 of13 | 1 | 3 | median | 24.288640197 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
 The current native implementation supports2–20-bit windows. Removing the old
@@ -479,10 +486,14 @@ scopes are1.126259368s and24.525876869s,13.8675% and13.7284% below the R39
 medians at unchanged windows and timing scope; the16-thread CPU reference was
 not re-measured for R42 either, so no new CPU percentage is claimed. Between
 those two rows the digit-band radix grouping is the accepted R39 main source kept
-unchanged, so the delta comes from the fused wave reduction and its two-kernel
-plan. Both sizes passed one warmup and three exact targets with strict resource
-audits, and the candidate also passed the full host capacity/rejection checks,
-all103 metadata cases and the native suite of82 cases plus809 fixtures, covering
+unchanged, so that delta came from the fused wave reduction and its two-kernel
+plan. With the R43 mixed affine weighted add the same prepared scopes are
+1.108570778s and24.288640197s,1.5706% and0.9673% below the R42 medians at
+unchanged windows and timing scope; only the fresh bucket operand of the
+per-window weighted reduce changes, and the16-thread CPU reference was not
+re-measured for R43 either. Both sizes passed one warmup and three exact targets
+with strict resource audits, and the R43 candidate passed the native suite of82
+cases plus809 fixtures, covering
 native field, G1, MSM, replay and two-stream regressions, high bucket bits, the
 three-pass route-2 grouping and explicit17/20-bit MSM cases. Earlier packed64
 checkpoints added point cases isolating equality votes in lanes47/48/63, a
@@ -493,11 +504,19 @@ reports zero copies, zero allocations and zero synchronizations, and the timing
 scope still ends at one final96-byte D2H plus one stream-completion wait. The
 full cache guard byte-compares the whole100663296-byte `2^20` and3221225472-byte
 `2^25` caches with intact 128-byte guards; that validation traffic sits outside
-the online audits and timing. The candidate's first bare build took309.567s, the
-host field/math suite87.155s, all103 metadata cases11.119s and the native full
-suite127.904s; these are wall times of this build, not kernel timings. The R39
-rows had passed the same one-warmup/three-target/three-reuse schedule with
-metadata at11.137s and the native suite at72.491s.
+the online audits and timing. The R42 candidate's first bare build took309.567s,
+the host field/math suite87.155s, all103 metadata cases11.119s and the native
+full suite127.904s; these are wall times of this build, not kernel timings. The
+R43 candidate rebuilt only the `msm_reduce.asc` object (57.211s) and replaced
+that single member in a copy of the R42 archive; its native suite took125.865s.
+The candidate reused the R42 host and metadata objects; those cases do not
+execute the changed weighted reduce. The production relink subsequently passed
+all103 metadata cases in11.131s, the complete82-case/809-fixture native suite
+in124.766s and a seven-call prepared smoke in5.005s. The pure host field/math
+and capacity/rejection suite was not re-run because its executable is
+byte-identical to the accepted R42 build. The R39 rows had passed the same
+one-warmup/three-target/three-reuse schedule with metadata at11.137s and the
+native suite at72.491s.
 An earlier48-lane private-arithmetic probe passed960 pairs/164160 exact checks
 covering REDC, aliases, live masks, `0/p`, inversion and canonical serialization.
 The packed64 integer-bridge probe separately covers all4096 digit values,
@@ -505,10 +524,9 @@ permuted lane/row patterns, source/coordinate guards, I32 return-mask reuse and
 real HBM interleave-index restoration; all655360 output bytes match its CPU oracle.
 Only the old pre-cache NPU figures are1+1 diagnostic checkpoints.
 CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet: the current
-R42 prepared medians are1.126259368s at`2^20` and24.525876869s at`2^25` (the
-R39 figures were1.307588938s and28.428664641s), so the prepared`2^20` candidate
-is still slower than the user-reported 8-thread ~1.0s CPU approximation, which
-was not re-measured here.
+R43 prepared medians shave less than2% off the R42 rows, so the prepared`2^20`
+candidate is still slower than the user-reported 8-thread ~1.0s CPU
+approximation, which was not re-measured here.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
 integrated. Cube MSM remains a private prototype: its primitive cells have been
 measured and are slower than the Vector path, and it is not integrated into the
@@ -517,9 +535,11 @@ Source, raw records, input/binary identities and rejected candidates
 remain under `target/msm-hotspot/`, including the R39 runs under
 `target/msm-hotspot/round39-radix-prefix/`, the R42 candidate source under
 `target/msm-hotspot/round42-wave-native/` and its raw run, build and identity
-records under `target/msm-hotspot/round42-wave-fused/`; those generated
-artifacts are local to this workspace, not shared, and not tracked. Reproduce
-inputs and warmed CPU/NPU comparisons with:
+records under `target/msm-hotspot/round42-wave-fused/`, the R43 candidate source
+under `target/msm-hotspot/round43-weighted-mixed-native/` and its raw run, build
+and identity records under `target/msm-hotspot/round43-weighted-mixed/`; those
+generated artifacts are local to this workspace, not shared, and not tracked.
+Reproduce inputs and warmed CPU/NPU comparisons with:
 
 ```bash
 cargo run --release --locked \
