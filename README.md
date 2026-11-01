@@ -1008,13 +1008,39 @@ prover-state drop/teardown. These are diagnostic measurements, not an accepted
 performance result; the N=25 case is far above the 200 ms target, which has not
 been achieved.
 
-Planned full-prove benchmark (source-only; the benchmark-only
-`hyperplonk/examples/full_prove_bench.rs` is under review and is not part of this
-validated milestone): its timed interval is the complete external prove path,
-including witness encoding and H2D, every commit, all three SumCheck instances,
-every open, host Fiat-Shamir and object assembly. SRS creation, context creation,
+Verified full-prove benchmark (`hyperplonk/examples/full_prove_bench`,
+benchmark-only; example source SHA-256 `f6ee5d97…`, Cargo manifest SHA-256
+`d92e5372…`): the example was built and smoke-tested for CPU and with
+`ascend910b3`. Its timed interval is the complete external prove path, including
+witness encoding and H2D, every commit, all three SumCheck instances, every open,
+host Fiat-Shamir and object assembly. SRS creation, context creation,
 preprocessing, fixture generation, the CPU oracle and verification are excluded
 from the interval and reported once outside it. Proof serialization is neither
-timed nor claimed, because no serialization API is exercised. The fixture must be
-non-identity and non-degenerate vanilla; the old identity `Mock` benchmark is not
-acceptance evidence.
+timed nor claimed, because no serialization API is exercised. The fixture is
+generic, non-identity and non-degenerate vanilla; the old identity `Mock`
+benchmark is not acceptance evidence.
+
+The N=8 smoke (one warm-up, three samples) completed real full prove on both
+backends: all four proofs on each backend were exact against the CPU oracle and
+accepted by the host verifier, and the tampered-public-input negative control was
+rejected. Observed prove medians were 37.580238 ms on CPU and 4046.187265 ms on
+NPU. N=8 is a smoke scale and the NPU case is overhead-dominated: these are smoke
+observations, not an accepted baseline or a performance gain. Evidence:
+`target/backend-sumcheck/full-proof-smoke/ledger.json`.
+
+```bash
+cargo run --release -p hyperplonk --example full_prove_bench -- \
+  --backend cpu --num-vars 8 --warmups 1 --samples 3 \
+  --srs-file target/full-prove-srs-n8.bin
+cargo run --release -p hyperplonk --example full_prove_bench \
+  --features ascend910b3 -- \
+  --backend npu --num-vars 8 --warmups 1 --samples 3 \
+  --srs-file target/full-prove-srs-n8.bin
+```
+
+`--num-vars` accepts 2..=25; N >= 22 needs an explicit memory feasibility check.
+`--srs-file` loads and dimension-validates a canonical SRS, or generates and
+writes it once with `create_new` if the path is absent; it never overwrites an
+existing file. `--samples` must be at least 1, `--seed` selects the deterministic
+fixture/SRS seed, and `--backend npu` requires the `ascend910b3` feature. The JSON
+report goes to stdout and progress to stderr.

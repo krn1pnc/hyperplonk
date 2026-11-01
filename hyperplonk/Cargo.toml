@@ -25,6 +25,14 @@ path = "benches/bench.rs"
 harness = false
 required-features = ["cpu"]
 
+# Full-prove benchmark driver. The CPU backend is the mandatory oracle and
+# verifier pairing; the NPU path is additionally compiled in with the
+# `ascend910b3` feature.
+[[example]]
+name = "full_prove_bench"
+path = "examples/full_prove_bench.rs"
+required-features = ["cpu"]
+
 [features]
 default = ["cpu"]
 cpu = ["backend/cpu", "subroutines/cpu"]
