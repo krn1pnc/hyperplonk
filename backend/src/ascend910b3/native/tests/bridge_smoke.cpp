@@ -173,6 +173,17 @@ struct RefFr {
 RefFr fr(uint64_t value) { return {fr_norm(Big(value))}; }
 RefFr fr_minus_one() { return {fr_norm(kFrModulus - 1)}; }
 
+// Deterministic full-width canonical Fr value. The high and middle terms stay
+// below the modulus, while the seed makes every generated value distinct and
+// its low words non-trivial, so a stale pointer or coefficient cannot alias a
+// correct one by accident.
+RefFr fr_spread(uint64_t seed) {
+    const Big high = Big(1) << 249;
+    const Big middle = Big(seed + 1) << 157;
+    const Big low = Big(seed + 1) * Big(0x9e3779b97f4a7c15ULL) + 0x243f6a8885a308d3ULL;
+    return {fr_norm(high + middle + low)};
+}
+
 RefFr decode_fr_bytes(const uint8_t* bytes, const std::string& what) {
     Big value = 0;
     for (size_t i = 0; i < 32; ++i) value = (value << 8) + Big(bytes[31 - i]);
@@ -893,6 +904,156 @@ void test_mle(Ascend910B3NativeContext* context, Ascend910B3NativeContext* other
 }
 
 // ---------------------------------------------------------------------------
+// Async metadata and input lifetime across a dependency DAG.
+//
+// Everything below is submitted without any intermediate observation: uploads,
+// linear combinations and retirements only enqueue work. Each intermediate
+// public handle is retired immediately after its last consumer was submitted,
+// so its device table, its control metadata and the pinned staging used by its
+// asynchronous copies become reuse candidates while later kernels are still
+// queued. A correct runtime freezes that reuse until the copy/kernel that last
+// referenced the storage really completed; a runtime that reclaims on a bare
+// stream-complete query lets the next enqueued operation overwrite the stale
+// metadata or reads a recycled table, and the final table below is wrong.
+//
+// The chain mixes arity 2 and arity 1 combinations over full-width canonical
+// coefficients. Table values and coefficients are all distinct, so swapping one
+// pointer or one coefficient cannot reproduce the expected values. The host
+// oracle is the documented elementwise CPU semantics over the same base tables,
+// evaluated independently with the reference field arithmetic.
+// ---------------------------------------------------------------------------
+
+void test_async_lifetime(Ascend910B3NativeContext* context) {
+    uint8_t sentinel = 0;
+    constexpr size_t kNumVars = 3;
+
+    const RefTable p0(kNumVars, {fr_spread(101), fr_spread(102), fr_spread(103),
+                                 fr_spread(104), fr_spread(105), fr_spread(106),
+                                 fr_spread(107), fr_spread(108)});
+    const RefTable p1(kNumVars, {fr_spread(201), fr_spread(202), fr_spread(203),
+                                 fr_spread(204), fr_spread(205), fr_spread(206),
+                                 fr_spread(207), fr_spread(208)});
+    const RefTable p2(kNumVars, {fr_spread(301), fr_spread(302), fr_spread(303),
+                                 fr_spread(304), fr_spread(305), fr_spread(306),
+                                 fr_spread(307), fr_spread(308)});
+
+    // Full-width, pairwise distinct canonical coefficients.
+    const RefFr k0 = fr_minus_one();
+    const RefFr k1 = fr_spread(0);
+    const RefFr k2{fr_norm(kFrModulus - 0x123456789ULL)};
+    const RefFr k3 = fr_spread(1);
+    const RefFr k4 = fr_spread(2);
+    const RefFr k5 = fr_spread(3);
+    const RefFr k6 = fr_spread(4);
+    const RefFr k7 = fr_spread(5);
+    const RefFr k8 = fr_spread(6);
+    const RefFr k9 = fr_spread(7);
+    const RefFr k10 = fr_spread(8);
+    const RefFr k11 = fr_spread(9);
+    const RefFr k12 = fr_spread(10);
+
+    auto combine = [](const RefTable& left, const RefTable& right,
+                      const RefFr& left_coefficient, const RefFr& right_coefficient) {
+        require(left.num_vars == right.num_vars &&
+                    left.values.size() == right.values.size(),
+                "async lifetime reference combine shape");
+        std::vector<RefFr> values;
+        values.reserve(left.values.size());
+        for (size_t i = 0; i < left.values.size(); ++i)
+            values.push_back(left_coefficient.mul(left.values[i])
+                                 .add(right_coefficient.mul(right.values[i])));
+        return RefTable(left.num_vars, std::move(values));
+    };
+    auto scale = [](const RefTable& input, const RefFr& coefficient) {
+        std::vector<RefFr> values;
+        values.reserve(input.values.size());
+        for (const RefFr& value : input.values)
+            values.push_back(coefficient.mul(value));
+        return RefTable(input.num_vars, std::move(values));
+    };
+
+    auto linear = [&](std::initializer_list<Ascend910B3DeviceAddress> inputs,
+                      std::initializer_list<RefFr> coefficients,
+                      const std::string& what) {
+        std::vector<Ascend910B3DeviceAddress> polynomials(inputs);
+        const std::vector<RefFr> coefficient_values(coefficients);
+        std::vector<uint8_t> coefficient_bytes = encode_values(coefficient_values);
+        Ascend910B3DeviceAddress output = &sentinel;
+        require_ok(abi::mle_linear_combination(context, kNumVars, polynomials.data(),
+                                               coefficient_bytes.data(),
+                                               coefficient_values.size(), &output),
+                   what);
+        require(output != nullptr, what + " returned a null handle");
+        // The bridge must have copied the borrowed bytes before returning.
+        std::fill(coefficient_bytes.begin(), coefficient_bytes.end(), uint8_t(0x5A));
+        return output;
+    };
+    auto retire = [&](Ascend910B3DeviceAddress address, const std::string& what) {
+        require_ok(abi::buffer_retire(context, address), what);
+    };
+
+    // Independent CPU reference DAG, fully evaluated before the first device
+    // upload. Host field arithmetic must not run inside the asynchronous submit
+    // sequence below, where it could delay enqueue timing and mask a reuse race.
+    const RefTable rA = combine(p0, p1, k0, k1);
+    const RefTable rB = scale(p2, k2);
+    const RefTable rC = combine(rA, rB, k3, k4);
+    const RefTable rD = scale(rA, k5);
+    const RefTable rE = combine(rC, rD, k6, k7);
+    const RefTable rF = scale(rE, k8);
+    const RefTable rG = combine(rF, p0, k9, k10);
+    const RefTable rFinal = combine(rG, p1, k11, k12);
+
+    const Ascend910B3DeviceAddress dp0 = upload_table(context, p0);
+    const Ascend910B3DeviceAddress dp1 = upload_table(context, p1);
+    const Ascend910B3DeviceAddress dp2 = upload_table(context, p2);
+
+    // hA <- p0,p1 (arity 2); hB <- p2 (arity 1). Only the coefficients differ
+    // from the later arity-2 metadata blocks, so a stale staging block is
+    // observable in the final table.
+    const Ascend910B3DeviceAddress hA = linear({dp0, dp1}, {k0, k1}, "async lifetime A");
+    const Ascend910B3DeviceAddress hB = linear({dp2}, {k2}, "async lifetime B");
+    // hB already consumed p2; no later consumer exists.
+    retire(dp2, "retire base p2 after B");
+
+    // hC consumes hA and hB. Retire hB only after this submission, then build
+    // hD from hA and retire hA after hD is queued.
+    const Ascend910B3DeviceAddress hC = linear({hA, hB}, {k3, k4}, "async lifetime C");
+    retire(hB, "retire B after C");
+
+    const Ascend910B3DeviceAddress hD = linear({hA}, {k5}, "async lifetime D");
+    retire(hA, "retire A after D");
+
+    // hE consumes the interleaved branches; both intermediates are retired
+    // after this call while hE's kernel still has to read them.
+    const Ascend910B3DeviceAddress hE = linear({hC, hD}, {k6, k7}, "async lifetime E");
+    retire(hC, "retire C after E");
+    retire(hD, "retire D after E");
+
+    const Ascend910B3DeviceAddress hF = linear({hE}, {k8}, "async lifetime F");
+    retire(hE, "retire E after F");
+
+    // p0 is still needed here; p1 only appears in the final consumer.
+    const Ascend910B3DeviceAddress hG = linear({hF, dp0}, {k9, k10}, "async lifetime G");
+    retire(hF, "retire F after G");
+
+    const Ascend910B3DeviceAddress hFinal = linear({hG, dp1}, {k11, k12}, "async lifetime final");
+    retire(hG, "retire G after final");
+
+    // First and only synchronization point: observe the actual final consumer.
+    check_table(context, hFinal, rFinal, "async lifetime final table");
+    const std::vector<RefFr> probe{fr_spread(900), fr_minus_one(), fr(123456789)};
+    require(evaluate_checked(context, hFinal, probe, "async lifetime nonzero probe")
+                .equals(reference_evaluate(rFinal, probe)),
+            "async lifetime nonzero probe mismatch");
+
+    retire(hFinal, "retire final after observation");
+    retire(dp0, "retire base p0 after final");
+    retire(dp1, "retire base p1 after final");
+    std::cout << "BRIDGE_ASYNC_LIFETIME_PASS\n";
+}
+
+// ---------------------------------------------------------------------------
 // KZG preparation, commit, multi-commit and open.
 // ---------------------------------------------------------------------------
 
@@ -1566,6 +1727,7 @@ int main(int argc, char** argv) {
         require(second != nullptr, "context_create second null");
 
         test_mle(first, second);
+        test_async_lifetime(first);
         test_kzg(first, second);
         test_sumcheck(first, second);
         // All ready-on-return and resident-transfer audits above completed.

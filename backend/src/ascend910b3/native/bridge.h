@@ -14,7 +14,8 @@
  * resources and clears output slots. Inputs are immutable. Contexts are single
  * host-thread/single-stream. State owns all data needed after create returns.
  * Retire transfers release responsibility to a native retired queue; buffers may
- * be physically freed only after aclrtStreamQuery succeeds and reports COMPLETE.
+ * be physically freed only after the block's own recorded stream event completes
+ * (or a real aclrtSynchronizeStream succeeds), never on a bare stream query.
  * Opaque resources must retain any data they still need after buffer retirement.
  * Host-result return synchronizes/reclaims; context_destroy finally drains work.
  * No Rust pending flag, manual collection or MemPoolAsync API is required.

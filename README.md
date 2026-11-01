@@ -102,8 +102,48 @@ transcript, passing a 32-byte challenge per round and receiving a
 `(degree + 1) * 32`-byte round message ready on return. Verification stays on the
 host: `verify` accepts no backend. The current SumCheck kernels are a generic
 Vector correctness baseline for all degrees, including the degree-34 product, not
-a Cube/Tensor path, and no NPU latency, speedup or end-to-end performance result
-is claimed here.
+a Cube/Tensor path, and no accepted NPU latency, speedup or end-to-end
+performance result is claimed here.
+
+Resource lifetime (integrated:
+`backend/src/ascend910b3/native/bridge_runtime.h` SHA-256 `66434aa0…` and
+`bridge_runtime.cpp` `c9103d5f…` are exactly the clean v4 source; `bridge.h` has
+only the `e044e652…` comment update, with its 20 declarations unchanged): owned
+pinned staging carries its own post-copy fence, and a device block's fence is
+recorded only after that block's last `BufferRef` owner has queued its final use,
+never at public retirement. A bare `aclrtStreamQuery` is not release proof, and a
+missing marker never authorizes release. The 4096-marker admission budget is
+process-wide; when admission is refused the resource stays markerless and is held
+until a real synchronize, and failed or ambiguous markers keep their slots
+accounted. If completion can never be proven, pinned host bytes are intentionally
+abandoned rather than freed under queued work; this is a terminal safety policy,
+not a completion proof. One host thread drives each Context.
+
+Validation for these artifacts is recorded in
+`target/backend-sumcheck/perf/clean-validation/clean-validation-ledger.json`
+(SHA-256 `693393d6…`) and
+`target/backend-sumcheck/perf/clean-validation/main-port.json`
+(`93af99dd…`). On physical device 6, the native suite passed 7 groups including
+`BRIDGE_ASYNC_LIFETIME_PASS`; Rust backend/subroutines/HyperPlonk suites passed
+57/35/9 including non-identity HyperPlonk prove/verify; 16 cold exact batch
+diagnostics and 32 multi-product cases matched CPU/NPU host verifiers; and 5000
+borrowed-host-byte-poisoned uploads each verified, with retire/destroy exit 0.
+The main native smoke source `2dc56706…` matches the validated copy.
+`main-port.json` records that these gates cover the identical clean-validation
+source artifacts and that the main tree was not rebuilt after the source port.
+The 4096-slot admission denial is inferred from the source budget and upload
+volume, not directly counter-measured, so it is not claimed as direct coverage.
+No NPU performance claim is attached to these correctness gates.
+
+Planned TensorZKP bulk SumCheck (source-only; not implemented, so no Tensor/Cube
+claim): the main-core port targets an actual `u8` Toeplitz fold, four-corner dot
+product and lazy reduction, adapted to 255-bit `Fr` and the INT8 path on A2
+hardware. It keeps the repository's host Fiat-Shamir, canonical Fr boundaries and
+round semantics, and does not adopt device-side Fiat-Shamir, mirrored point
+labels, high-bit shortcuts or the paper harness's 1024-way timing amortization.
+The current implementation remains the generic Vector baseline above until the
+port and its gates land. Complete backend/HyperPlonk wiring and a real end-to-end
+proof/verify gate any full-prove wall-time minimization.
 
 ### Ascend910B3 internal field, G1 and MSM math
 
@@ -140,7 +180,8 @@ multilinear-KZG commit/open and SumCheck prover state, with the v1 C ABI,
 canonical Fr LE32 encoding and 97-byte G1 packet unchanged. The native bridge
 smoke, CPU golden suites and Rust backend/PCS/SumCheck suites pass on Ascend910B3
 with a unified `Release` build, including a non-identity full HyperPlonk
-proof/verify, but no NPU performance has been measured; the figures in this
+proof/verify; NPU timing exists only as the fresh diagnostic baseline in
+Benchmarks, not as an accepted performance result, and the figures in this
 section remain standalone math results.
 
 ```bash
@@ -939,13 +980,41 @@ These are usage instructions, not measurements. `sumcheck_bench` is a standalone
 SumCheck benchmark, not a HyperPlonk PIOP driver, and this README describes no
 PIOP-level driver.
 
-The report embeds an external TensorZKP reference of 4.04 ms for a degree-2,
-N=25 SumCheck on an H100 80 GB in the BabyBear degree-8 extension. That number is
-context only: it is not a PIOP target, not directly comparable to BLS12-381 `Fr`
-on Ascend910B3, and must not be imposed as the project's goal. The TensorZKP
-paper's Table 1 reports, for that reference's H100/BabyBear degree-8 setting,
-PermCheck 134.00 ms, ZeroCheck 16.96 ms and a PIOP total of 150.96 ms (the sum of
-those two components). The project's separate target for a 2^25 complete
-HyperPlonk PIOP is at most 200 ms, with PCS and MSM accounted separately; no NPU
-performance has been measured at any input size, so that target has not been
-achieved.
+The primary goal remains the complete end-to-end prove/verify path, with
+full-prove wall time as its performance measure. The N=25 single SumCheck
+checkpoint is secondary: a complete 25-round proof at no more than 200 ms. The
+user-specified paper reference for that workload is 120 ms and is secondary to
+the engineering target; that value has not been verified in the current PDF.
+Neither figure is a full-PIOP target or a PIOP total with KZG removed. Published
+comparisons remain cross-field and cross-hardware: the known paper setting uses
+an H100 80 GB with a BabyBear degree-8 extension, not BLS12-381 `Fr` on
+Ascend910B3, and the reference's timing boundary is not verified in the current
+PDF.
+
+Fresh diagnostic baseline, not acceptance: one diagnostic build on physical
+device 0 with one warm-up and three timed samples produced four exact proofs
+(N=25 digest `fnv1a64:2521717a7b05d9f2`):
+
+| Workload | Backend | Wall time (ms) |
+|----------|---------|----------------|
+| N=20, degree 2 | Ascend910B3 | 51.914464 |
+| N=20, degree 2 | CPU (Rayon, 13 threads) | 116.972450 |
+| N=25, degree 2 | Ascend910B3 | 1468.975078 |
+
+The wall time includes host Fiat-Shamir rounds and prover-state creation/drop;
+initial uploads are separate. For N=25, initialization is 326.225563 ms and the
+rounds are 1142.425628 ms; the 1468.975078 ms total additionally covers
+prover-state drop/teardown. These are diagnostic measurements, not an accepted
+performance result; the N=25 case is far above the 200 ms target, which has not
+been achieved.
+
+Planned full-prove benchmark (source-only; the benchmark-only
+`hyperplonk/examples/full_prove_bench.rs` is under review and is not part of this
+validated milestone): its timed interval is the complete external prove path,
+including witness encoding and H2D, every commit, all three SumCheck instances,
+every open, host Fiat-Shamir and object assembly. SRS creation, context creation,
+preprocessing, fixture generation, the CPU oracle and verification are excluded
+from the interval and reported once outside it. Proof serialization is neither
+timed nor claimed, because no serialization API is exercised. The fixture must be
+non-identity and non-degenerate vanilla; the old identity `Mock` benchmark is not
+acceptance evidence.

@@ -8,6 +8,7 @@
 
 #include "field_params.h"
 
+#include <atomic>
 #include <cstring>
 #include <unordered_map>
 #include <utility>
@@ -62,6 +63,45 @@ bool& runtime_owned() noexcept {
     return owned;
 }
 
+// Process-wide conservative admission budget for outstanding stream-marker
+// events. RuntimeHandle is created once per Context, so the counter must NOT live
+// on it: this function-local static sits beside the runtime reference state and
+// is shared by every context (and therefore every device) in this process. The
+// CANN 9.1 contract allows 65536 events per device; 4096 keeps a wide margin and
+// prevents the marker path from self-starving while uploads are reclaimed only
+// by a later synchronize.
+constexpr int64_t kMarkerBudget = 4096;
+
+std::atomic<int64_t>& outstanding_markers() noexcept {
+    static std::atomic<int64_t> markers{0};
+    return markers;
+}
+
+bool try_acquire_marker_slot() noexcept {
+    std::atomic<int64_t>& markers = outstanding_markers();
+    int64_t current = markers.load(std::memory_order_relaxed);
+    while (current < kMarkerBudget) {
+        if (markers.compare_exchange_weak(current, current + 1,
+                                          std::memory_order_relaxed)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+void release_marker_slot() noexcept {
+    // Called only after a successful event destruction; floor at zero so a
+    // double release can never inflate later admission.
+    std::atomic<int64_t>& markers = outstanding_markers();
+    int64_t current = markers.load(std::memory_order_relaxed);
+    while (current > 0) {
+        if (markers.compare_exchange_weak(current, current - 1,
+                                          std::memory_order_relaxed)) {
+            return;
+        }
+    }
+}
+
 bool acquire_runtime(std::shared_ptr<RuntimeHandle>& out, aclError& error) noexcept {
     out.reset(); // never destroy a previous handle while holding the mutex
     std::lock_guard<std::mutex> lock(runtime_mutex());
@@ -103,23 +143,58 @@ void release_runtime() noexcept {
 // Completion-aware retirement.
 //
 // A retired allocation is pushed here by the last owner's destructor. Physical
-// freeing happens only after `aclrtStreamQuery` reports COMPLETE (or after a
-// stream synchronize). Pinned staging used by an asynchronous upload is retained
-// here until the same completion observation.
+// freeing is gated by a stream marker recorded only AFTER that last owner queued
+// the raw (lazily, by the next poll): a marker recorded earlier could complete
+// before a later same-stream use enqueued through a retained BufferRef. The
+// marker is ordered after every operation already enqueued on the context
+// stream, so its completion proves the storage can no longer be read. A bare
+// aclrtStreamQuery is deliberately NOT the release proof: this stack can report
+// ACL_STREAM_STATUS_COMPLETE before a just-enqueued task reaches the device
+// queue, which previously released metadata (device blocks and pinned upload
+// bytes) while a queued kernel could still read them. Pinned staging carries its
+// own marker recorded after the transfer that uses it, so staging is released
+// only when its own transfer completed and is covered even when no device block
+// has been retired yet.
 // ---------------------------------------------------------------------------
+
+struct PendingBlock {
+    void* raw = nullptr;
+    // Marker recorded only after the last owner queued this raw (see
+    // take_ready); null means "not marked yet or recording failed", so only a
+    // real stream synchronize may free.
+    aclrtEvent event = nullptr;
+    // One marker attempt per resource: a failed create/admission/record is never
+    // retried by later polls. The block then waits for an existing synchronize.
+    bool marker_attempted = false;
+};
+
+struct PendingStaging {
+    std::shared_ptr<PinnedStorage> pinned;
+    // Recorded after the transfer that reads these bytes.
+    aclrtEvent event = nullptr;
+    // The upload path made exactly one attempt; polls never retry it.
+    bool marker_attempted = false;
+};
 
 struct RetireQueue {
     std::mutex mutex;
-    std::vector<void*> pending;
-    std::vector<std::shared_ptr<PinnedStorage>> staging;
+    std::vector<PendingBlock> pending;
+    std::vector<PendingStaging> staging;
+    // Created but not provably recorded events. Recording failure is ambiguous
+    // (the record may have been enqueued), so these are never destroyed before a
+    // real stream synchronize.
+    std::vector<aclrtEvent> unproven;
     std::shared_ptr<RuntimeHandle> runtime;
     aclrtStream stream = nullptr;
     bool attached = true;
 
-    // Called from a destructor: never throws. A push failure or a detached queue
-    // may only free after completion is proven: a null stream means destroy
-    // already synchronized and disowned it, otherwise synchronize must succeed.
-    // Without proof the allocation is intentionally leaked, never freed live.
+    // Called from a destructor after the last owner is gone: never throws. A
+    // marker cannot be recorded safely from here, so the entry is queued and the
+    // next poll records its one-shot marker (which is then ordered after this
+    // enqueue and after every earlier same-stream use). A push failure or a
+    // detached queue may only free after completion is proven: a null stream
+    // means destroy already synchronized and disowned it, otherwise synchronize
+    // must succeed. Without proof the allocation is intentionally abandoned.
     void enqueue(void* raw) noexcept {
         aclrtStream active = nullptr;
         bool free_now = false;
@@ -130,21 +205,45 @@ struct RetireQueue {
                 free_now = true;
             } else {
                 try {
-                    pending.push_back(raw);
+                    pending.reserve(pending.size() + 1);
                 } catch (...) {
                     free_now = true;
                 }
+                if (!free_now) pending.push_back(PendingBlock{raw, nullptr, false});
             }
         }
         if (!free_now) return;
-        if (active == nullptr) {
+        if (active == nullptr || aclrtSynchronizeStream(active) == ACL_SUCCESS) {
             (void)aclrtFree(raw);
-            return;
         }
-        if (aclrtSynchronizeStream(active) == ACL_SUCCESS) (void)aclrtFree(raw);
+        // Without a proven synchronize the allocation is intentionally abandoned.
     }
 
-    void retain_staging(std::shared_ptr<PinnedStorage> pinned) noexcept {
+    // Records a one-shot marker on the queue stream. Requires the queue mutex NOT
+    // to be held.
+    aclrtEvent record_marker() noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        return record_marker_locked();
+    }
+
+    // Retains a created event whose recording is ambiguous (or that must not be
+    // destroyed yet) until a real stream synchronize.
+    void retain_unproven(aclrtEvent event) noexcept {
+        if (event == nullptr) return;
+        std::lock_guard<std::mutex> lock(mutex);
+        try {
+            unproven.reserve(unproven.size() + 1);
+            unproven.push_back(event);
+        } catch (...) {
+            // Intentional abandon: never destroy a possibly recorded event.
+        }
+    }
+
+    // Retains pinned bytes with the marker recorded after the transfer reading
+    // them. Capacity is obtained before the owning argument is moved, so a failed
+    // reservation cannot free bytes that a queued transfer may still read.
+    void retain_staging(std::shared_ptr<PinnedStorage> pinned,
+                        aclrtEvent marker) noexcept {
         aclrtStream active = nullptr;
         bool release_now = false;
         {
@@ -154,35 +253,170 @@ struct RetireQueue {
                 release_now = true;
             } else {
                 try {
-                    staging.push_back(std::move(pinned));
+                    staging.reserve(staging.size() + 1);
                 } catch (...) {
                     release_now = true;
+                }
+                if (!release_now) {
+                    staging.push_back(PendingStaging{});
+                    staging.back().pinned = std::move(pinned);
+                    staging.back().event = marker;
+                    // The upload path already made its single marker attempt.
+                    staging.back().marker_attempted = true;
                 }
             }
         }
         if (!release_now) return;
-        if (active != nullptr && aclrtSynchronizeStream(active) != ACL_SUCCESS) {
-            // No completion proof: keep the staging alive in a nothrow-allocated
-            // permanent slot instead of releasing memory the device may read.
-            void* slot = ::operator new(sizeof(std::shared_ptr<PinnedStorage>), std::nothrow);
-            if (slot != nullptr) {
-                new (slot) std::shared_ptr<PinnedStorage>(std::move(pinned));
-                return;
+        const bool proven =
+            active == nullptr || aclrtSynchronizeStream(active) == ACL_SUCCESS;
+        if (!proven && pinned) {
+            // No completion proof: intentionally abandon the host bytes instead of
+            // freeing memory a queued transfer may still read. Allocation-free.
+            pinned->abandon();
+        }
+        if (marker != nullptr) {
+            if (proven) {
+                destroy_marker(marker);
+            } else {
+                retain_unproven(marker);
             }
-            // Last resort (allocation failed): the local owner frees it.
         }
         pinned.reset();
     }
 
-    // Transfers all deferred work to the caller. The caller must have observed
-    // completion (synchronize or a COMPLETE query) unless it is detaching.
-    void take(std::vector<void*>& raw,
-              std::vector<std::shared_ptr<PinnedStorage>>& host) noexcept {
+    // Requires the queue mutex to be held.
+    aclrtEvent record_marker_locked() noexcept {
+        if (stream == nullptr) return nullptr;
+        // Admission is conservative and process-wide: when the shared budget is
+        // exhausted the caller leaves the resource markerless and it waits for an
+        // existing real synchronize. No marker is recorded while the process-wide
+        // self-owned count is at the budget, so this path cannot self-starve the
+        // device event pool.
+        if (!try_acquire_marker_slot()) return nullptr;
+        aclrtEvent event = nullptr;
+        if (aclrtCreateEvent(&event) != ACL_SUCCESS || event == nullptr) {
+            release_marker_slot();
+            return nullptr;
+        }
+        if (aclrtRecordEvent(event, stream) != ACL_SUCCESS) {
+            // Ambiguous: the record may already be enqueued. Retain it until a real
+            // synchronize instead of pretending the failure proved it unrecorded.
+            // Its admission slot stays accounted (conservative if abandoned).
+            try {
+                unproven.reserve(unproven.size() + 1);
+                unproven.push_back(event);
+            } catch (...) {
+                // Intentional abandon: never destroy a possibly recorded event.
+            }
+            return nullptr;
+        }
+        return event;
+    }
+
+    // Destroys a marker created by record_marker_locked. The admission slot is
+    // returned ONLY when aclrtDestroyEvent succeeds: a failed destruction may
+    // leave the event alive, so its slot stays accounted conservatively. This
+    // never reports fake success and never adds a synchronization.
+    void destroy_marker(aclrtEvent event) noexcept {
+        if (event == nullptr) return;
+        if (aclrtDestroyEvent(event) == ACL_SUCCESS) {
+            release_marker_slot();
+        }
+    }
+
+    // Moves every deferred resource out of the queue after a proven stream
+    // synchronize. All three moves are allocation-free. The caller frees blocks,
+    // destroys every marker (block, staging and unproven) and releases pinned
+    // bytes by destroying the staging entries.
+    void take(std::vector<PendingBlock>& blocks,
+              std::vector<PendingStaging>& staging_out,
+              std::vector<aclrtEvent>& unproven_out) noexcept {
         std::lock_guard<std::mutex> lock(mutex);
-        raw = std::move(pending);
+        blocks = std::move(pending);
         pending.clear();
-        host = std::move(staging);
+        staging_out = std::move(staging);
         staging.clear();
+        unproven_out = std::move(unproven);
+        unproven.clear();
+    }
+
+    // Moves every block and pinned buffer whose own marker completed (or all of
+    // them when `proven` comes from a real aclrtSynchronizeStream) into the
+    // caller's ready lists. Completed markers are identified first; only then are
+    // missing markers attempted, at most once per resource (marker_attempted). A
+    // marker recorded here is only possible after the last owner queued the raw,
+    // so it cannot pre-date a future same-stream use through a retained
+    // BufferRef. A newly recorded marker is never treated as complete in the same
+    // call, and a missing marker, admission refusal or failed/ambiguous query
+    // keeps the resource queued until an existing real synchronize: no retry and
+    // no query-authorized release.
+    void take_ready(bool proven,
+                    std::vector<PendingBlock>& ready_blocks,
+                    std::vector<std::shared_ptr<PinnedStorage>>& ready_staging,
+                    std::vector<aclrtEvent>& ready_events) noexcept {
+        std::lock_guard<std::mutex> lock(mutex);
+        std::vector<PendingBlock> keep_blocks;
+        std::vector<PendingStaging> keep_staging;
+        try {
+            ready_blocks.reserve(pending.size());
+            keep_blocks.reserve(pending.size());
+            ready_staging.reserve(staging.size());
+            keep_staging.reserve(staging.size());
+            ready_events.reserve(staging.size() + unproven.size());
+        } catch (...) {
+            return; // conservative: release nothing on allocation failure
+        }
+        if (proven) {
+            for (aclrtEvent event : unproven) ready_events.push_back(event);
+            unproven.clear();
+            for (PendingBlock& block : pending) ready_blocks.push_back(block);
+            pending.clear();
+            for (PendingStaging& entry : staging) {
+                ready_staging.push_back(std::move(entry.pinned));
+                if (entry.event != nullptr) ready_events.push_back(entry.event);
+            }
+            staging.clear();
+            return;
+        }
+        // Pass 1: reap already-completed markers before any new record attempt.
+        for (PendingBlock& block : pending) {
+            if (block.event != nullptr && marker_completed(false, block.event)) {
+                ready_blocks.push_back(block);
+            } else {
+                keep_blocks.push_back(block);
+            }
+        }
+        pending.swap(keep_blocks);
+        for (PendingStaging& entry : staging) {
+            if (entry.event != nullptr && marker_completed(false, entry.event)) {
+                ready_staging.push_back(std::move(entry.pinned));
+                ready_events.push_back(entry.event);
+            } else {
+                keep_staging.push_back(std::move(entry));
+            }
+        }
+        staging.swap(keep_staging);
+        // Pass 2: exactly one marker attempt per still-unmarked resource.
+        for (PendingBlock& block : pending) {
+            if (block.event == nullptr && !block.marker_attempted) {
+                block.marker_attempted = true;
+                block.event = record_marker_locked();
+            }
+        }
+        for (PendingStaging& entry : staging) {
+            if (entry.event == nullptr && !entry.marker_attempted) {
+                entry.marker_attempted = true;
+                entry.event = record_marker_locked();
+            }
+        }
+    }
+
+    static bool marker_completed(bool proven, aclrtEvent event) noexcept {
+        if (proven) return true;
+        if (event == nullptr) return false;
+        aclrtEventRecordedStatus status = ACL_EVENT_RECORDED_STATUS_NOT_READY;
+        return aclrtQueryEventStatus(event, &status) == ACL_SUCCESS &&
+               status == ACL_EVENT_RECORDED_STATUS_COMPLETE;
     }
 
     void detach() noexcept {
@@ -543,18 +777,51 @@ Ascend910B3Status Context::allocate_pinned(size_t bytes, size_t alignment,
     return status_success();
 }
 
+// Records a stream marker for a just-finished upload. The marker is ordered
+// after every operation already enqueued on this context stream, which includes
+// the transfer that reads the staged bytes. Null means the marker could not be
+// created/recorded; the resource must then be released only after a real stream
+// synchronize. A created-but-ambiguous event is retained by the queue until a
+// real synchronize, never destroyed on the assumption that recording failed.
+aclrtEvent Context::record_marker() noexcept {
+    if (impl_->stream == nullptr) return nullptr;
+    const Ascend910B3Status ensured = ensure_current();
+    if (!status_ok(ensured)) return nullptr;
+    return impl_->queue->record_marker();
+}
+
 Ascend910B3Status Context::retain_pinned(PinnedStorage&& storage) noexcept {
-    if (closed()) return status_invalid_state();
+    // Resource-lifetime contract: the caller enqueued the transfer that reads
+    // these bytes before this call. On any failure path this function must not
+    // return owning bytes that a caller could later free while that transfer may
+    // still be pending: when completion cannot be proven the bytes are
+    // intentionally abandoned (allocation-free) and the failure is still
+    // reported. A proven stream synchronize leaves ownership with the caller's
+    // object, whose destruction is then safe.
+    if (closed()) {
+        // No completion can be observed for a closing context; consume the owner
+        // so a caller fallback cannot free bytes a queued transfer may read.
+        if (storage.valid()) storage.abandon();
+        return status_invalid_state();
+    }
     if (!storage.valid()) return status_success();
     std::shared_ptr<PinnedStorage> pinned;
     try {
         pinned = std::make_shared<PinnedStorage>(std::move(storage));
     } catch (...) {
-        // Cannot track it: complete the stream before the local storage dies.
-        (void)aclrtSynchronizeStream(impl_->stream);
+        // make_shared allocates before it moves the owner, so on failure `storage`
+        // still owns the bytes. Prove the stream drained before letting them be
+        // freed; otherwise abandon them and preserve the error.
+        const bool proven =
+            impl_->stream == nullptr || aclrtSynchronizeStream(impl_->stream) == ACL_SUCCESS;
+        if (!proven) storage.abandon();
         return status_invalid_state(ACL_ERROR_BAD_ALLOC);
     }
-    impl_->queue->retain_staging(std::move(pinned));
+    // Every caller transfers into these bytes before retaining them, so a marker
+    // recorded now completes only after that transfer. The staging is released
+    // only when its own marker completed, independent of any device block.
+    aclrtEvent marker = record_marker();
+    impl_->queue->retain_staging(std::move(pinned), marker);
     return status_success();
 }
 
@@ -672,29 +939,23 @@ Ascend910B3Status Context::upload_mle(size_t num_vars, const uint8_t* evaluation
     aclError acl_status = aclrtMemcpyAsync(block->data(), block->bytes(), staging.data(), bytes,
                                            ACL_MEMCPY_HOST_TO_DEVICE, impl_->stream);
     if (acl_status != ACL_SUCCESS) {
-        // Keep the staging bytes alive until a completion observation: a failed
-        // enqueue may still leave previously submitted work outstanding.
-        std::shared_ptr<PinnedStorage> pinned;
-        try {
-            pinned = std::make_shared<PinnedStorage>(std::move(staging));
-            impl_->queue->retain_staging(std::move(pinned));
-        } catch (...) {
-            (void)aclrtSynchronizeStream(impl_->stream);
-        }
+        // A failed enqueue may still leave previously submitted work outstanding.
+        // The central retain_pinned owns the staging hand-off (marker, OOM and
+        // failed-sync policy) and consumes the owner; its status must not mask the
+        // original copy error.
+        (void)retain_pinned(std::move(staging));
         block.reset();
         poison(acl_status);
         return status_from_acl(acl_status);
     }
 
-    std::shared_ptr<PinnedStorage> pinned;
-    try {
-        pinned = std::make_shared<PinnedStorage>(std::move(staging));
-    } catch (...) {
-        (void)aclrtSynchronizeStream(impl_->stream);
+    const Ascend910B3Status retained = retain_pinned(std::move(staging));
+    if (!status_ok(retained)) {
+        // retain_pinned either queued the staging with its marker or intentionally
+        // abandoned it; the device block then waits for a real synchronize.
         block.reset();
-        return status_invalid_state(ACL_ERROR_BAD_ALLOC);
+        return retained;
     }
-    impl_->queue->retain_staging(std::move(pinned));
 
     bool was_closed = false;
     bool registered = false;
@@ -751,16 +1012,19 @@ Ascend910B3Status Context::copy_to_host_async(void* host_dst, const void* src,
     return copy_async(host_dst, src, bytes, ACL_MEMCPY_DEVICE_TO_HOST);
 }
 
-Ascend910B3Status Context::reclaim_retired() noexcept {
-    std::vector<void*> pending;
+Ascend910B3Status Context::reclaim_retired(bool proven) noexcept {
+    std::vector<PendingBlock> blocks;
     std::vector<std::shared_ptr<PinnedStorage>> staging;
-    impl_->queue->take(pending, staging);
-    // Completion has been observed, so the device can no longer read the host
-    // staging buffers; releasing them here is safe.
+    std::vector<aclrtEvent> events;
+    impl_->queue->take_ready(proven, blocks, staging, events);
+    // Pinned bytes and their markers are released only after their own transfer
+    // marker completed (or after a real synchronize).
     staging.clear();
+    for (aclrtEvent event : events) impl_->queue->destroy_marker(event);
     aclError first = ACL_SUCCESS;
-    for (void* raw : pending) {
-        const aclError status = aclrtFree(raw);
+    for (PendingBlock& block : blocks) {
+        impl_->queue->destroy_marker(block.event);
+        const aclError status = aclrtFree(block.raw);
         if (status != ACL_SUCCESS && first == ACL_SUCCESS) first = status;
     }
     if (first != ACL_SUCCESS) {
@@ -784,7 +1048,7 @@ Ascend910B3Status Context::synchronize() noexcept {
         poison(status);
         return status_from_acl(status);
     }
-    const Ascend910B3Status drained = reclaim_retired();
+    const Ascend910B3Status drained = reclaim_retired(true);
     if (!status_ok(drained)) return drained;
     if (poisoned()) return status_invalid_state(first_error());
     return status_success();
@@ -797,16 +1061,11 @@ Ascend910B3Status Context::poll_retired() noexcept {
         poison(ensured.native_code);
         return ensured;
     }
-    aclrtStreamStatus completion = ACL_STREAM_STATUS_NOT_READY;
-    const aclError status = aclrtStreamQuery(impl_->stream, &completion);
-    if (status != ACL_SUCCESS) {
-        poison(status);
-        return status_from_acl(status);
-    }
-    if (completion == ACL_STREAM_STATUS_COMPLETE) {
-        const Ascend910B3Status drained = reclaim_retired();
-        if (!status_ok(drained)) return drained;
-    }
+    // No aclrtStreamQuery here: this stack can report ACL_STREAM_STATUS_COMPLETE
+    // while a just-enqueued task is still missing from the device queue. Only the
+    // per-resource retirement markers authorize a release.
+    const Ascend910B3Status drained = reclaim_retired(false);
+    if (!status_ok(drained)) return drained;
     if (poisoned()) return status_invalid_state(first_error());
     return status_success();
 }
@@ -841,11 +1100,12 @@ Ascend910B3Status Context::retire(DeviceAddress address) noexcept {
         block = std::move(it->second);
         impl_->registry.erase(it);
     }
-    // Dropping the registry reference only retires; retained BufferRefs (for
-    // example a SumCheck state) keep the storage alive and usable.
+    // Dropping the registry reference only retires; retained BufferRefs keep the
+    // storage alive and usable, so no marker is recorded here: a marker recorded
+    // now could complete before a later use enqueued through a retained ref. The
+    // last owner's destruction queues the raw, and the next poll records its
+    // one-shot marker after that enqueue (see take_ready).
     block.reset();
-    // Observe real completion; a query failure is recorded on the context but the
-    // retirement responsibility has been transferred, so it is not a caller error.
     (void)poll_retired();
     return status_success();
 }
@@ -1019,12 +1279,22 @@ Ascend910B3Status destroy_context(Ascend910B3NativeContext* raw) noexcept {
             impl.registry.clear();
         }
 
-        std::vector<void*> pending;
-        std::vector<std::shared_ptr<PinnedStorage>> staging;
-        impl.queue->take(pending, staging);
+        std::vector<PendingBlock> blocks;
+        std::vector<PendingStaging> staging;
+        std::vector<aclrtEvent> unproven;
+        impl.queue->take(blocks, staging, unproven);
+        // The stream synchronize above succeeded, so every marker completed and
+        // every staged transfer is done: destroy the event handles, release the
+        // pinned bytes (staging destruction) and free the blocks.
+        for (PendingStaging& entry : staging) {
+            impl.queue->destroy_marker(entry.event);
+        }
         staging.clear();
-        for (void* allocation : pending) {
-            const aclError freed = aclrtFree(allocation);
+        for (aclrtEvent event : unproven) impl.queue->destroy_marker(event);
+        unproven.clear();
+        for (PendingBlock& block : blocks) {
+            impl.queue->destroy_marker(block.event);
+            const aclError freed = aclrtFree(block.raw);
             if (freed != ACL_SUCCESS && first == ACL_SUCCESS) first = freed;
         }
 

@@ -10,13 +10,33 @@
 //  * A context owns the ACL context, one stream and the allocation registry.
 //  * Immutable MLE handles are direct canonical-Fr device pointers; the public
 //    `Ascend910B3DeviceAddress` value is exactly `BufferRef::data()`.
-//  * `retire` removes registry ownership but physical free is deferred until
-//    `aclrtStreamQuery` reports `ACL_STREAM_STATUS_COMPLETE`. Internal users
-//    (sumcheck state, KZG params) hold `BufferRef` copies, so storage survives a
-//    retired public handle.
+//  * `retire` removes registry ownership but physical free is deferred until a
+//    per-block stream marker reports COMPLETE (or a real
+//    `aclrtSynchronizeStream` succeeds). A bare `aclrtStreamQuery` is never the
+//    release proof: it can report COMPLETE before a just-enqueued task reaches
+//    the device queue. Internal users (sumcheck state, KZG params) hold
+//    `BufferRef` copies, so storage survives a retired public handle and stays
+//    usable for later same-stream work; the marker for such a block is recorded
+//    only after its last owner queues it, never at public retire.
 //  * Async uploads copy the borrowed host bytes into owned pinned staging before
-//    returning; staging is reclaimed only after completion observation.
+//    returning; staging carries its own post-transfer marker and is released only
+//    after that marker completed, independent of any device block. If completion
+//    cannot be proven, the host bytes are intentionally abandoned (leaked) rather
+//    than freed under queued work.
 //  * Host-result entry points synchronize and reclaim; `destroy` finally drains.
+//  * Each Context is driven by one host thread (the Rust Rc contract keeps
+//    backends and handles !Send/!Sync). The marker admission counter is a true
+//    process-wide function-local static beside the runtime reference state, so
+//    every context and device in the process shares the same conservative
+//    budget; RuntimeHandle is created per Context and holds no budget state.
+//  * Outstanding stream markers are admitted by a conservative counter (4096,
+//    far below the 65536-per-device event limit). When admission is refused the
+//    resource stays markerless and is released only by an existing real
+//    synchronize; each resource gets at most one marker attempt and failed or
+//    ambiguous attempts are never retried.
+//  * A staged upload owns the marker recorded after its transfer; if completion
+//    can never be proven the host bytes are intentionally abandoned (terminal
+//    policy), never freed under queued work.
 //  * No exception crosses the C ABI and no device/hot-field arithmetic happens
 //    on the host. Only argument validation and control metadata are host-side.
 #include "bridge.h"
@@ -139,6 +159,15 @@ public:
     aclError release() noexcept;
     void swap(PinnedStorage& other) noexcept;
 
+    // Intentionally drops ownership of the host allocation without freeing it.
+    // Used only when stream completion cannot be proven and the device may still
+    // read these bytes: leaking is safer than a use-after-free. Allocation-free.
+    void abandon() noexcept {
+        raw_ = nullptr;
+        data_ = nullptr;
+        bytes_ = 0;
+    }
+
 private:
     friend class Context;
     void* raw_ = nullptr;
@@ -246,9 +275,11 @@ public:
     Ascend910B3Status allocate(size_t bytes, size_t alignment, DeviceStorage& out) noexcept;
     Ascend910B3Status allocate_pinned(size_t bytes, size_t alignment, PinnedStorage& out) noexcept;
 
-    // Hands pinned staging to the context. It stays alive until a real completion
-    // observation (query COMPLETE or synchronize), so an asynchronous copy that
-    // still reads it is never released early.
+    // Hands pinned staging to the context. The caller MUST have enqueued the
+    // transfer that reads these bytes BEFORE this call. The bytes are released
+    // only when the event recorded by this call completes or after a successful
+    // stream synchronize; a bare aclrtStreamQuery never authorizes release. If
+    // completion cannot be proven, the bytes are intentionally abandoned.
     Ascend910B3Status retain_pinned(PinnedStorage&& storage) noexcept;
 
     // Adopt an owned device allocation into the registry. The returned handle is
@@ -281,15 +312,20 @@ public:
     // staged pinned memory. On failure the context is poisoned and retirement is
     // kept queued for a later drain instead of being freed unsafely.
     Ascend910B3Status synchronize() noexcept;
-    // Query-only observation: frees retired allocations and staging only when the
-    // stream really reports complete. Safe to call from any entry point.
+    // Per-resource observation: frees a retired block only after its one-shot
+    // stream marker (recorded after the last owner queued it) reports COMPLETE,
+    // and releases pinned staging only after that staging's own marker reports
+    // COMPLETE. A bare stream-query status never authorizes release. Safe to call
+    // from any entry point.
     Ascend910B3Status poll_retired() noexcept;
     // Probe completion without releasing anything.
     Ascend910B3Status completion(bool& complete) noexcept;
 
-    // Removes the public handle; physical free is deferred until completion.
-    // Unknown or foreign addresses are InvalidParameters. A retained BufferRef
-    // keeps the storage usable after retirement (while the context lives).
+    // Removes the public handle. Physical free is deferred until the marker of
+    // the block's actual last enqueue completes (or a stream synchronize
+    // succeeds); a retained BufferRef keeps the storage usable after retirement
+    // (while the context lives), and the marker is recorded only once that last
+    // owner queues the block.
     Ascend910B3Status retire(DeviceAddress address) noexcept;
 
     // Contract for ContextRef/BufferRef owners: destroy is the last native use of
@@ -305,9 +341,15 @@ public:
     // later destroy may retry the completion proof.
 
 private:
-    // Requires stream completion already observed; frees deferred allocations
-    // and releases pinned staging, preserving the first ACL failure.
-    Ascend910B3Status reclaim_retired() noexcept;
+    // Records a stream marker ordered after every operation already enqueued on
+    // this context stream. Null means the marker could not be created/recorded,
+    // so the resource may then be released only after a real synchronize.
+    aclrtEvent record_marker() noexcept;
+    // Frees deferred blocks and releases pinned staging, preserving the first ACL
+    // failure. `proven` means a real aclrtSynchronizeStream succeeded; otherwise
+    // each resource is released only after its own recorded marker completed. A
+    // missing marker or a failed query never authorizes a release.
+    Ascend910B3Status reclaim_retired(bool proven) noexcept;
 
     struct Impl;
     explicit Context(std::unique_ptr<Impl> impl) noexcept;
