@@ -455,7 +455,8 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^20 | Symmetric square, device radix/CSR/schedule, prepared, automatic16-bit window (`R31`) | 1 | 3 | median | 1.340093202 |
 | 2^20 | Independent digit-band prefix (`R39`), prepared, automatic16-bit window | 1 | 3 | median | 1.307588938 |
 | 2^20 | Whole-wave affine reduction (`R42`, previous), prepared, automatic16-bit window, bundle16 of16 | 1 | 3 | median | 1.126259368 |
-| 2^20 | Mixed affine weighted add (`R43`), prepared, automatic16-bit window, bundle16 of16 | 1 | 3 | median | 1.108570778 |
+| 2^20 | Mixed affine weighted add (`R43`, previous), prepared, automatic16-bit window, bundle16 of16 | 1 | 3 | median | 1.108570778 |
+| 2^20 | In-loop 4096-word descriptor flush (`R49`), prepared, automatic16-bit window, bundle16 of16 | 1 | 3 | median | 1.113355917 |
 | 2^20 | CPU,16Rayon workers | 1 | 3 | median | 1.581598 |
 | 2^25 | Radix12 before resident-Montgomery IO | 1 | 1 | target | 75.465230 |
 | 2^25 | Cached G1 and redundant Montgomery, `a1ce28d` | 1 | 3 | median | 45.598630 |
@@ -466,7 +467,8 @@ Every warmup and target exactly matched the independent arkworks0.6 result.
 | 2^25 | Symmetric square, device radix/CSR/schedule, prepared, explicit20-bit window (`R31`) | 1 | 3 | median | 29.337902454 |
 | 2^25 | Independent digit-band prefix (`R39`), prepared, explicit20-bit window | 1 | 3 | median | 28.428664641 |
 | 2^25 | Whole-wave affine reduction (`R42`, previous), prepared, explicit20-bit window, bundle2+tail1 of13 | 1 | 3 | median | 24.525876869 |
-| 2^25 | Mixed affine weighted add (`R43`), prepared, explicit20-bit window, bundle2+tail1 of13 | 1 | 3 | median | 24.288640197 |
+| 2^25 | Mixed affine weighted add (`R43`, previous), prepared, explicit20-bit window, bundle2+tail1 of13 | 1 | 3 | median | 24.288640197 |
+| 2^25 | In-loop 4096-word descriptor flush (`R49`), prepared, explicit20-bit window, bundle2+tail1 of13 | 1 | 3 | median | 24.512709373 |
 | 2^25 | CPU,16Rayon workers | 1 | 3 | median | 43.114322 |
 
 The current native implementation supports2–20-bit windows. Removing the old
@@ -516,17 +518,54 @@ in124.766s and a seven-call prepared smoke in5.005s. The pure host field/math
 and capacity/rejection suite was not re-run because its executable is
 byte-identical to the accepted R42 build. The R39 rows had passed the same
 one-warmup/three-target/three-reuse schedule with metadata at11.137s and the
-native suite at72.491s.
+native suite at72.491s. With the R49 in-loop descriptor flush the same prepared
+scopes are1.113355917s and24.512709373s,0.4317% and0.9225% above the R43
+medians at unchanged inputs, windows and timing scope. That small regression is
+accepted because the change fixes a general correctness bug rather than speed:
+one bucket's descriptor run can exceed the4096-word (16 KiB) output chunk, and
+the previous code flushed between buckets only when the whole next bucket would
+not fit, so any bucket with more than4096 level ops wrote past the chunk. On a
+captured actual random `2^20` input, the14-bit last window reads scalar bits252..254
+and put144718 records and72359 level-0 ops in bucket1. The first failing run used
+the pre-fix R45 binary, whose descriptor writer was identical to main's, and failed in
+`hp_msm_wave_build_write_kernel` with runtime error507035 (vector-core
+exception, a scalar address out of bounds in an AICore internal buffer, blk37,
+task678, PID190086), and that raw failure log is kept. The fix now tests the
+4096-word boundary inside the per-descriptor loop, so every bucket streams full
+chunks and its tail carries through; no shape is
+special-cased, the output chunk stays4096 words instead of growing, and the
+kernel signature and its ABI, the HBM plan and the arithmetic are untouched.
+The same input then passed all seven CPU-exact calls; the three timed targets had
+a median of1.357122760s (15.242s total process wall time) at the non-default14-bit
+window, a correctness check rather than a tuning win. The permanent regression is
+one dense8195-record pattern-1 c8 case, needing4097 level-0 ops plus the odd-record
+carry, so the native suite now has83 cases; the same809 fixtures and the
+existing exception, replay and two-stream cases run unchanged and all83 cases
+plus the fixtures pass with strict resource audits. The R49 candidate's
+four-target build took311.838s, the
+complete83-case/809-fixture native suite126.754s and the103 metadata cases
+11.126s; these are wall times of that build, not kernel timings, and its
+benchmark binary was
+98ab3be96911d6e89f1392fd69f70819e134531a64b12a462e5af4d195873ab5.
+The original main-tree CMake rebuild took42.034s and produced all five artifacts
+(archive, host tests, metadata check, benchmark and native suite) byte-identical
+to that candidate. An actual seven-call production prepared smoke then passed
+in5.006s. The R49 runs kept the same
+one-warmup/three-target/three-reuse schedule, the same strict online audits
+(zero copies, zero allocations, zero synchronizations) and the full
+100663296-byte and3221225472-byte cache guards.
 An earlier48-lane private-arithmetic probe passed960 pairs/164160 exact checks
 covering REDC, aliases, live masks, `0/p`, inversion and canonical serialization.
 The packed64 integer-bridge probe separately covers all4096 digit values,
 permuted lane/row patterns, source/coordinate guards, I32 return-mask reuse and
 real HBM interleave-index restoration; all655360 output bytes match its CPU oracle.
 Only the old pre-cache NPU figures are1+1 diagnostic checkpoints.
-CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet: the current
-R43 prepared medians shave less than2% off the R42 rows, so the prepared`2^20`
-candidate is still slower than the user-reported 8-thread ~1.0s CPU
-approximation, which was not re-measured here.
+CPU10x, the`2^25<1s` goal and the later 200ms target remain unmet: the R43
+prepared medians shaved less than2% off the R42 rows and the R49 medians sit
+0.4317% and0.9225% above R43, so the prepared`2^20` candidate is still slower
+than the user-reported 8-thread ~1.0s CPU approximation, which was not
+re-measured here; neither the`2^25<1s` goal nor the 200ms target is reached, and
+this correctness fix does not change that.
 Tested exact-FP32-FMA and dual-base RNS/Cube candidates were slower and are not
 integrated. Cube MSM remains a private prototype: its primitive cells have been
 measured and are slower than the Vector path, and it is not integrated into the
@@ -537,8 +576,13 @@ remain under `target/msm-hotspot/`, including the R39 runs under
 `target/msm-hotspot/round42-wave-native/` and its raw run, build and identity
 records under `target/msm-hotspot/round42-wave-fused/`, the R43 candidate source
 under `target/msm-hotspot/round43-weighted-mixed-native/` and its raw run, build
-and identity records under `target/msm-hotspot/round43-weighted-mixed/`; those
-generated artifacts are local to this workspace, not shared, and not tracked.
+and identity records under `target/msm-hotspot/round43-weighted-mixed/`, the R49
+candidate source under `target/msm-hotspot/round49-wave-stream-native/` and its
+raw run, build, identity and preserved pre-fix failure records under
+`target/msm-hotspot/round49-wave-descriptor-stream/`, with the failing pre-fix
+`2^20`/14-bit run and its plog kept under
+`target/msm-hotspot/round48-window-selection/`; those generated artifacts are
+local to this workspace, not shared, and not tracked.
 Reproduce inputs and warmed CPU/NPU comparisons with:
 
 ```bash

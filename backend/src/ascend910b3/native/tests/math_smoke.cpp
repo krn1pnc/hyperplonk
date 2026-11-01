@@ -1851,6 +1851,13 @@ void test_msm_metadata(Runtime& runtime, aclrtStream stream)
     // Exact 8192-record chunk boundaries.
     for (size_t n : {8191,8192,8193})
         test_msm_wave_case(runtime,stream,n,3,16);
+    // One dense bucket first crossing the 4096-u32 (16 KiB) descriptor chunk:
+    // pattern 1 puts every record of the captured window in bucket buckets-1,
+    // so N=8195 gives level 0 floor(8195/2) = 4097 pair ops in a single bucket.
+    // The 4097th op no longer fits the chunk and the odd 8195th record still
+    // needs its level-0 carry; the finalized bucket tuple is the exact,
+    // consumer-visible witness for both descriptor passes.
+    test_msm_wave_case(runtime,stream,8195,1,8);
     // Route-1 fast path with bounded partitions, then both forced fallback digits.
     test_msm_wave_case(runtime,stream,4097,6,16);
     test_msm_wave_case(runtime,stream,8192,7,16); // exactly the 8192 partition limit stays fast
