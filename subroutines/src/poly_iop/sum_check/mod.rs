@@ -652,3 +652,263 @@ mod test {
         Ok(())
     }
 }
+
+/// Cross-backend protocol equality for the numerical sum-check prover.
+///
+/// These tests are compile-gated on the explicit Ascend910B3 feature. Enabling
+/// the feature means the native bridge must be present and the device usable:
+/// a missing or unimplemented backend fails the test instead of skipping it.
+/// The expected values are produced by the CPU prover over the same host
+/// tables; no device table is read back to build the expectation.
+#[cfg(all(test, feature = "cpu", feature = "ascend910b3"))]
+mod ascend910b3_test {
+    use super::*;
+    use ark_bls12_381::Fr;
+    use ark_ff::UniformRand;
+    use ark_serialize::CanonicalSerialize;
+    use ark_std::rand::{rngs::StdRng, SeedableRng};
+    use backend::{ascend910b3::Ascend910B3Backend, cpu::CpuBackend, BackendError, MleBackend};
+
+    const NUM_VARS: usize = 4;
+    const FACTORS: usize = 3;
+
+    /// Deterministic full-width Fr factor tables shared by both backends.
+    fn factor_tables(degree: usize) -> Vec<Vec<Fr>> {
+        let mut rng = StdRng::seed_from_u64(0x5eed_0000 + degree as u64);
+        (0..FACTORS)
+            .map(|_| {
+                (0..1usize << NUM_VARS)
+                    .map(|_| Fr::rand(&mut rng))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Products with mixed arity, a repeated multiplicand, several terms and a
+    /// leading term whose arity is exactly `degree`.
+    fn products(degree: usize) -> Vec<(Fr, Vec<usize>)> {
+        let mut products = vec![
+            (Fr::from(3u64), vec![0usize]),
+            (Fr::from(5u64), vec![0usize, 0usize]),
+        ];
+        if degree >= 3 {
+            products.push((Fr::from(7u64), vec![2usize, 0usize, 2usize]));
+        }
+        products.push((
+            Fr::from(11u64),
+            (0..degree).map(|index| index % FACTORS).collect(),
+        ));
+        products
+    }
+
+    fn build<B: MleBackend<Fr>>(
+        backend: &B,
+        tables: &[Vec<Fr>],
+        products: &[(Fr, Vec<usize>)],
+    ) -> Result<VirtualPolynomial<Fr, B::Mle>, PolyIOPErrors> {
+        let factors = tables
+            .iter()
+            .map(|table| backend.mle_from_evaluations(NUM_VARS, table.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut polynomial = VirtualPolynomial::new(NUM_VARS);
+        for (coefficient, indices) in products {
+            polynomial.add_mle_list(
+                indices.iter().map(|&index| factors[index].clone()),
+                *coefficient,
+            )?;
+        }
+        Ok(polynomial)
+    }
+
+    /// Sum of the virtual polynomial over the Boolean hypercube.
+    fn hypercube_sum(tables: &[Vec<Fr>], products: &[(Fr, Vec<usize>)]) -> Fr {
+        (0..1usize << NUM_VARS)
+            .map(|point| {
+                products
+                    .iter()
+                    .map(|(coefficient, indices)| {
+                        indices.iter().fold(*coefficient, |product, &index| {
+                            product * tables[index][point]
+                        })
+                    })
+                    .sum::<Fr>()
+            })
+            .sum()
+    }
+
+    fn field_bytes(values: &[Fr]) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        for value in values {
+            value
+                .serialize_compressed(&mut bytes)
+                .expect("field element serialization");
+        }
+        bytes
+    }
+
+    fn message_bytes(proof: &IOPProof<Fr>) -> Vec<Vec<u8>> {
+        proof
+            .proofs
+            .iter()
+            .map(|message| {
+                let mut bytes = Vec::new();
+                message
+                    .serialize_compressed(&mut bytes)
+                    .expect("prover message serialization");
+                bytes
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ascend_round_messages_match_cpu_for_generic_degrees() -> Result<(), PolyIOPErrors> {
+        let cpu = CpuBackend;
+        let ascend = Ascend910B3Backend::new(0)
+            .expect("Ascend910B3 backend must be available for NPU sum-check equality");
+        for degree in [2usize, 3, 7, 34] {
+            let tables = factor_tables(degree);
+            let terms = products(degree);
+            let cpu_poly = build(&cpu, &tables, &terms)?;
+            let npu_poly = build(&ascend, &tables, &terms)?;
+            assert_eq!(cpu_poly.aux_info, npu_poly.aux_info);
+            assert_eq!(cpu_poly.aux_info.max_degree, degree);
+            assert_eq!(cpu_poly.products, npu_poly.products);
+
+            let claimed_sum = hypercube_sum(&tables, &terms);
+
+            let mut cpu_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            let cpu_proof =
+                <PolyIOP<Fr> as SumCheck<Fr>>::prove(&cpu, &cpu_poly, &mut cpu_transcript)?;
+            let mut npu_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            let npu_proof =
+                <PolyIOP<Fr> as SumCheck<Fr>>::prove(&ascend, &npu_poly, &mut npu_transcript)?;
+
+            assert_eq!(npu_proof.proofs.len(), NUM_VARS);
+            assert_eq!(npu_proof.point.len(), NUM_VARS);
+            assert_eq!(npu_proof, cpu_proof);
+            assert_eq!(message_bytes(&npu_proof), message_bytes(&cpu_proof));
+            assert_eq!(field_bytes(&npu_proof.point), field_bytes(&cpu_proof.point));
+            assert_eq!(
+                <PolyIOP<Fr> as SumCheck<Fr>>::extract_sum(&npu_proof),
+                claimed_sum
+            );
+
+            let mut verify_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            let subclaim = <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+                claimed_sum,
+                &npu_proof,
+                &npu_poly.aux_info,
+                &mut verify_transcript,
+            )?;
+            assert_eq!(subclaim.point, npu_proof.point);
+            assert_eq!(subclaim.point, cpu_proof.point);
+            assert_eq!(
+                subclaim.expected_evaluation,
+                cpu.evaluate_vp(&cpu_poly, &subclaim.point)?
+            );
+
+            let mut cpu_verify_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+            let cpu_subclaim = <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+                claimed_sum,
+                &cpu_proof,
+                &cpu_poly.aux_info,
+                &mut cpu_verify_transcript,
+            )?;
+            assert_eq!(cpu_subclaim, subclaim);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn ascend_rejects_wrong_claim_and_mutated_transcript() -> Result<(), PolyIOPErrors> {
+        let ascend = Ascend910B3Backend::new(0)
+            .expect("Ascend910B3 backend must be available for NPU sum-check rejection tests");
+        let degree = 3usize;
+        let tables = factor_tables(degree);
+        let terms = products(degree);
+        let poly = build(&ascend, &tables, &terms)?;
+        let claimed_sum = hypercube_sum(&tables, &terms);
+
+        let mut transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        let proof = <PolyIOP<Fr> as SumCheck<Fr>>::prove(&ascend, &poly, &mut transcript)?;
+
+        // A wrong claimed sum must be rejected by the deferred round checks.
+        let mut wrong_claim_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        assert!(matches!(
+            <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+                claimed_sum + Fr::from(1u64),
+                &proof,
+                &poly.aux_info,
+                &mut wrong_claim_transcript,
+            ),
+            Err(PolyIOPErrors::InvalidProof(_))
+        ));
+
+        // A verifier transcript that diverges before the protocol rejects the
+        // proof, because the derived challenges differ.
+        let mut drifted_verify_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        drifted_verify_transcript.append_message(b"mutation", b"ascend910b3 transcript drift")?;
+        assert!(matches!(
+            <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+                claimed_sum,
+                &proof,
+                &poly.aux_info,
+                &mut drifted_verify_transcript,
+            ),
+            Err(PolyIOPErrors::InvalidProof(_))
+        ));
+
+        // A prover transcript that diverges first yields different challenges;
+        // the clean verifier rejects it while the matching verifier accepts it.
+        let mut drifted_prover_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        drifted_prover_transcript.append_message(b"mutation", b"ascend910b3 transcript drift")?;
+        let drifted_proof =
+            <PolyIOP<Fr> as SumCheck<Fr>>::prove(&ascend, &poly, &mut drifted_prover_transcript)?;
+        assert_ne!(field_bytes(&drifted_proof.point), field_bytes(&proof.point));
+        let mut clean_verify_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        assert!(matches!(
+            <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+                claimed_sum,
+                &drifted_proof,
+                &poly.aux_info,
+                &mut clean_verify_transcript,
+            ),
+            Err(PolyIOPErrors::InvalidProof(_))
+        ));
+        let mut matching_verify_transcript = <PolyIOP<Fr> as SumCheck<Fr>>::init_transcript();
+        matching_verify_transcript.append_message(b"mutation", b"ascend910b3 transcript drift")?;
+        let subclaim = <PolyIOP<Fr> as SumCheck<Fr>>::verify(
+            claimed_sum,
+            &drifted_proof,
+            &poly.aux_info,
+            &mut matching_verify_transcript,
+        )?;
+        assert_eq!(subclaim.point, drifted_proof.point);
+        Ok(())
+    }
+
+    #[test]
+    fn ascend_rejects_invalid_challenge_sequencing() -> Result<(), PolyIOPErrors> {
+        let ascend = Ascend910B3Backend::new(0)
+            .expect("Ascend910B3 backend must be available for sequencing tests");
+        let tables = factor_tables(3);
+        let terms = products(3);
+        let poly = build(&ascend, &tables, &terms)?;
+
+        let mut state = ascend.prover_init(&poly)?;
+        assert!(matches!(
+            ascend.prove_round_and_update_state(&mut state, &Some(Fr::from(1u64))),
+            Err(BackendError::InvalidState(_))
+        ));
+
+        let mut state = ascend.prover_init(&poly)?;
+        assert!(ascend
+            .prove_round_and_update_state(&mut state, &None)
+            .is_ok());
+        assert!(matches!(
+            ascend.prove_round_and_update_state(&mut state, &None),
+            Err(BackendError::InvalidState(_))
+        ));
+        Ok(())
+    }
+}

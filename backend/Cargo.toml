@@ -15,7 +15,9 @@ displaydoc = { version = "0.2.3", default-features = false }
 rayon = { version = "1.5.2", default-features = false }
 
 [features]
-default = ["cpu", "ascend910b3"]
+# CPU is the only default backend: compiling `ascend910b3` requires the real
+# native bridge and CANN at link time, so it must be requested explicitly.
+default = ["cpu"]
 cpu = []
 ascend910b3 = []
 print-trace = ["ark-std/print-trace"]

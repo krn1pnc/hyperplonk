@@ -32,9 +32,16 @@ path = "benches/pcs_bench.rs"
 harness = false
 required-features = ["cpu"]
 
+[[example]]
+name = "sumcheck_bench"
+path = "examples/sumcheck_bench.rs"
+harness = false
+required-features = ["cpu"]
+
 [features]
 default = ["cpu"]
 cpu = ["backend/cpu"]
+ascend910b3 = ["backend/ascend910b3"]
 print-trace = [ 
     "backend/print-trace",
     "ark-std/print-trace",

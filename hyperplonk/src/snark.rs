@@ -837,3 +837,262 @@ mod test {
         Ok(())
     }
 }
+
+/// End-to-end HyperPlonk preprocessing, proving and verification with the
+/// Ascend910B3 backend over a real circuit whose wiring has non-identity copy
+/// constraints.
+///
+/// Compile-gated on the explicit Ascend910B3 feature: enabling it requires a
+/// usable native bridge and device, so an unavailable backend fails the test
+/// instead of being skipped. The CPU backend produces the host oracle proof from
+/// the same index, SRS and witness assignment, and the host pairing verifier
+/// checks the device proof against verifier parameters trimmed from the same
+/// SRS. Every proof component that the protocol exposes across the crate
+/// boundary must match the CPU oracle exactly; the batch opening's inner
+/// sum-check and quotient proof are compared byte-for-byte in the PCS tests,
+/// which can reach them.
+#[cfg(all(test, feature = "cpu", feature = "ascend910b3"))]
+mod ascend910b3_test {
+    use super::*;
+    use crate::{structs::HyperPlonkParams, CustomizedGates, SelectorColumn};
+    use ark_bls12_381::Bls12_381;
+    use ark_serialize::CanonicalSerialize;
+    use ark_std::test_rng;
+    use backend::{
+        ascend910b3::Ascend910B3Backend, common::permutation::identity_permutation, cpu::CpuBackend,
+    };
+    use subroutines::{MultilinearKzgPCS, MultilinearUniversalParams};
+
+    type Fr = <Bls12_381 as Pairing>::ScalarField;
+    type Pcs = MultilinearKzgPCS<Bls12_381>;
+    type Proof = HyperPlonkProof<Bls12_381, PolyIOP<Fr>, Pcs>;
+    type AscendProvingKey = HyperPlonkProvingKey<Bls12_381, Pcs, Ascend910B3Backend>;
+    type CpuProvingKey = HyperPlonkProvingKey<Bls12_381, Pcs, CpuBackend>;
+    type VerifyingKey = HyperPlonkVerifyingKey<Bls12_381, Pcs>;
+
+    const NUM_CONSTRAINTS: usize = 4;
+    const NUM_VARIABLES: usize = 2;
+    const NUM_WITNESSES: usize = 2;
+
+    /// `q_L * w_1^5 - w_2 = 0` with a single selector column.
+    fn gate() -> CustomizedGates {
+        CustomizedGates {
+            gates: vec![(1, Some(0), vec![0, 0, 0, 0, 0]), (-1, None, vec![1])],
+        }
+    }
+
+    fn index_with(permutation: Vec<Fr>) -> HyperPlonkIndex<Fr> {
+        HyperPlonkIndex {
+            params: HyperPlonkParams {
+                num_constraints: NUM_CONSTRAINTS,
+                num_pub_input: NUM_CONSTRAINTS,
+                gate_func: gate(),
+            },
+            permutation,
+            selectors: vec![SelectorColumn(vec![Fr::one(); NUM_CONSTRAINTS])],
+        }
+    }
+
+    /// Non-identity wiring over real connections: rows 0 and 1 hold equal
+    /// values in both witness columns, so those wire positions are connected.
+    fn connected_wire_permutation() -> Vec<Fr> {
+        let mut permutation = identity_permutation::<Fr>(NUM_VARIABLES, NUM_WITNESSES);
+        permutation.swap(0, 4);
+        permutation.swap(1, 5);
+        permutation
+    }
+
+    fn assignments(
+        first: [u64; NUM_CONSTRAINTS],
+        second: [u64; NUM_CONSTRAINTS],
+    ) -> (Vec<Fr>, WitnessColumn<Fr>, WitnessColumn<Fr>) {
+        let first: Vec<Fr> = first.into_iter().map(Fr::from).collect();
+        let second: Vec<Fr> = second.into_iter().map(Fr::from).collect();
+        (
+            first.clone(),
+            WitnessColumn(first),
+            WitnessColumn(second),
+        )
+    }
+
+    fn serialized<T: CanonicalSerialize>(value: &T) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        value
+            .serialize_compressed(&mut bytes)
+            .expect("canonical serialization");
+        bytes
+    }
+
+    fn ascend_preprocess(
+        backend: &Ascend910B3Backend,
+        index: &HyperPlonkIndex<Fr>,
+        srs: &MultilinearUniversalParams<Bls12_381>,
+    ) -> Result<(AscendProvingKey, VerifyingKey), HyperPlonkErrors> {
+        <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, Pcs, Ascend910B3Backend>>::preprocess(
+            backend, index, srs,
+        )
+    }
+
+    fn ascend_prove(
+        backend: &Ascend910B3Backend,
+        proving_key: &AscendProvingKey,
+        public_input: &[Fr],
+        witnesses: &[WitnessColumn<Fr>],
+    ) -> Result<Proof, HyperPlonkErrors> {
+        <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, Pcs, Ascend910B3Backend>>::prove(
+            backend,
+            proving_key,
+            public_input,
+            witnesses,
+        )
+    }
+
+    fn cpu_preprocess(
+        backend: &CpuBackend,
+        index: &HyperPlonkIndex<Fr>,
+        srs: &MultilinearUniversalParams<Bls12_381>,
+    ) -> Result<(CpuProvingKey, VerifyingKey), HyperPlonkErrors> {
+        <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, Pcs, CpuBackend>>::preprocess(
+            backend, index, srs,
+        )
+    }
+
+    fn cpu_prove(
+        backend: &CpuBackend,
+        proving_key: &CpuProvingKey,
+        public_input: &[Fr],
+        witnesses: &[WitnessColumn<Fr>],
+    ) -> Result<Proof, HyperPlonkErrors> {
+        <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, Pcs, CpuBackend>>::prove(
+            backend,
+            proving_key,
+            public_input,
+            witnesses,
+        )
+    }
+
+    fn verify(
+        verifying_key: &VerifyingKey,
+        public_input: &[Fr],
+        proof: &Proof,
+    ) -> Result<bool, HyperPlonkErrors> {
+        <PolyIOP<Fr> as HyperPlonkSNARK<Bls12_381, Pcs, CpuBackend>>::verify(
+            verifying_key,
+            public_input,
+            proof,
+        )
+    }
+
+    fn assert_exposed_proof_parts_equal(left: &Proof, right: &Proof) {
+        assert_eq!(left.witness_commits, right.witness_commits);
+        assert_eq!(left.zero_check_proof, right.zero_check_proof);
+        assert_eq!(
+            left.perm_check_proof.zero_check_proof,
+            right.perm_check_proof.zero_check_proof
+        );
+        assert_eq!(
+            left.perm_check_proof.prod_x_comm,
+            right.perm_check_proof.prod_x_comm
+        );
+        assert_eq!(
+            left.perm_check_proof.frac_comm,
+            right.perm_check_proof.frac_comm
+        );
+        assert_eq!(
+            left.batch_openings.f_i_eval_at_point_i,
+            right.batch_openings.f_i_eval_at_point_i
+        );
+    }
+
+    #[test]
+    fn test_ascend_e2e_nonidentity_permutation_matches_cpu() -> Result<(), HyperPlonkErrors> {
+        let mut rng = test_rng();
+        let srs = Pcs::gen_srs_for_testing(&mut rng, 16)?;
+        let index = index_with(connected_wire_permutation());
+        let identity = identity_permutation::<Fr>(NUM_VARIABLES, NUM_WITNESSES);
+        assert_ne!(index.permutation, identity);
+        let mut sorted = index.permutation.clone();
+        sorted.sort();
+        let labels: Vec<Fr> = (0..(NUM_WITNESSES as u64) << NUM_VARIABLES)
+            .map(Fr::from)
+            .collect();
+        assert_eq!(sorted, labels);
+
+        let (public_input, first, second) = assignments([0, 1, 2, 3], [0, 1, 32, 243]);
+        assert_eq!(first.coeff_ref()[0], second.coeff_ref()[0]);
+        assert_eq!(first.coeff_ref()[1], second.coeff_ref()[1]);
+
+        let ascend = Ascend910B3Backend::new(0)
+            .expect("Ascend910B3 backend must be available for the HyperPlonk end-to-end test");
+        let cpu = CpuBackend;
+        let (ascend_pk, ascend_vk) = ascend_preprocess(&ascend, &index, &srs)?;
+        let (cpu_pk, cpu_vk) = cpu_preprocess(&cpu, &index, &srs)?;
+        assert_eq!(ascend_vk.params, cpu_vk.params);
+        assert_eq!(
+            ascend_vk.selector_commitments,
+            cpu_vk.selector_commitments
+        );
+        assert_eq!(ascend_vk.perm_commitments, cpu_vk.perm_commitments);
+        assert_eq!(
+            serialized(&ascend_vk.pcs_param),
+            serialized(&cpu_vk.pcs_param)
+        );
+
+        let ascend_proof =
+            ascend_prove(&ascend, &ascend_pk, &public_input, &[first.clone(), second.clone()])?;
+        let cpu_proof = cpu_prove(&cpu, &cpu_pk, &public_input, &[first, second])?;
+        assert_exposed_proof_parts_equal(&ascend_proof, &cpu_proof);
+
+        assert!(verify(&ascend_vk, &public_input, &ascend_proof)?);
+        assert!(verify(&cpu_vk, &public_input, &ascend_proof)?);
+        assert!(verify(&ascend_vk, &public_input, &cpu_proof)?);
+        Ok(())
+    }
+
+    #[test]
+    fn test_ascend_rejects_bad_copy_constraints_and_witnesses() -> Result<(), HyperPlonkErrors> {
+        let mut rng = test_rng();
+        let srs = Pcs::gen_srs_for_testing(&mut rng, 16)?;
+        let index = index_with(connected_wire_permutation());
+        let ascend = Ascend910B3Backend::new(0)
+            .expect("Ascend910B3 backend must be available for the HyperPlonk rejection test");
+        let (pk, vk) = ascend_preprocess(&ascend, &index, &srs)?;
+
+        // 1. A gate-consistent assignment that violates the copy constraint at
+        // the connected positions 1 and 5 must be rejected by verification.
+        let (public_input, first, second) = assignments([0, 5, 2, 3], [0, 3125, 32, 243]);
+        assert_eq!(first.coeff_ref()[1], Fr::from(5u64));
+        assert_ne!(first.coeff_ref()[1], second.coeff_ref()[1]);
+        let inconsistent = ascend_prove(&ascend, &pk, &public_input, &[first, second])?;
+        assert!(!matches!(
+            verify(&vk, &public_input, &inconsistent),
+            Ok(true)
+        ));
+
+        // 2. A gate-violating witness with a matching public input still
+        // produces a proof, which verification must reject.
+        let (public_input, first, mut second) = assignments([0, 1, 2, 3], [0, 1, 32, 243]);
+        second.0[2] += Fr::one();
+        let broken = ascend_prove(&ascend, &pk, &public_input, &[first, second])?;
+        assert!(!matches!(verify(&vk, &public_input, &broken), Ok(true)));
+
+        // 3. A verifying key from the identity wiring must reject a proof for
+        // the connected-wire index, while the matching key accepts it.
+        let identity_index = index_with(identity_permutation::<Fr>(NUM_VARIABLES, NUM_WITNESSES));
+        let (_, identity_vk) = ascend_preprocess(&ascend, &identity_index, &srs)?;
+        let (public_input, first, second) = assignments([0, 1, 2, 3], [0, 1, 32, 243]);
+        let honest = ascend_prove(&ascend, &pk, &public_input, &[first, second])?;
+        assert!(verify(&vk, &public_input, &honest)?);
+        assert!(!matches!(verify(&identity_vk, &public_input, &honest), Ok(true)));
+
+        // 4. A public input that disagrees with witness zero is rejected by the
+        // prover sanity check.
+        let (mut public_input, first, second) = assignments([0, 1, 2, 3], [0, 1, 32, 243]);
+        public_input[0] = Fr::from(7u64);
+        assert!(matches!(
+            ascend_prove(&ascend, &pk, &public_input, &[first, second]),
+            Err(HyperPlonkErrors::InvalidProver(_))
+        ));
+        Ok(())
+    }
+}

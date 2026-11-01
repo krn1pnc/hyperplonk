@@ -3,6 +3,15 @@ find_package(ASC REQUIRED)
 set(CMAKE_ASC_ARCHITECTURES dav-2201)
 project(hyperplonk_ascend910b3_math LANGUAGES ASC CXX)
 
+# CANN 9.1's ASC config clears CMAKE_CXX_FLAGS_{DEBUG,RELEASE} as normal
+# variables, shadowing the cache; restore only the empty cache values it hid.
+if("${CMAKE_CXX_FLAGS_DEBUG}" STREQUAL "")
+    set(CMAKE_CXX_FLAGS_DEBUG "$CACHE{CMAKE_CXX_FLAGS_DEBUG}")
+endif()
+if("${CMAKE_CXX_FLAGS_RELEASE}" STREQUAL "")
+    set(CMAKE_CXX_FLAGS_RELEASE "$CACHE{CMAKE_CXX_FLAGS_RELEASE}")
+endif()
+
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
@@ -39,6 +48,23 @@ target_link_libraries(hyperplonk_ascend910b3_math PUBLIC
     "${CANN_graph_base_LIBRARY}" "${CANN_c_sec_LIBRARY}" "${CANN_mmpa_LIBRARY}"
     "${CANN_profapi_LIBRARY}" "${CANN_runtime_LIBRARY}" dl m)
 
+# Host C ABI bridge: context/stream/retirement, immutable MLE, KZG and SumCheck
+# entry points. The shared bridge_runtime header carries the context. Every
+# definition source is required, so CMake fails configuration if one is absent
+# instead of producing a partial archive.
+add_library(hyperplonk_ascend910b3_bridge STATIC
+    bridge.asc
+    bridge_runtime.cpp
+    bridge_mle.cpp
+    bridge_kzg.cpp
+    bridge_sumcheck.cpp
+    mle_kernels.asc
+    sumcheck_kernels.asc)
+target_include_directories(hyperplonk_ascend910b3_bridge PUBLIC
+    "${CMAKE_CURRENT_SOURCE_DIR}" ${CANN_INCLUDE_DIRS})
+target_link_libraries(hyperplonk_ascend910b3_bridge PUBLIC
+    hyperplonk_ascend910b3_math)
+
 include(CTest)
 find_package(Threads REQUIRED)
 # This target deliberately has no ACL includes, initialization, or linkage.
@@ -61,7 +87,15 @@ add_executable(msm_metadata_check tests/msm_metadata_check.cpp tests/runtime_aud
 # Test-only square probe: candidate headers against the same archive and auditing.
 add_executable(square_probe tests/square_probe.cpp tests/square_probe.asc tests/runtime_audit.cpp)
 target_link_libraries(square_probe PRIVATE Threads::Threads)
-foreach(runner IN ITEMS native_math_smoke msm_benchmark msm_metadata_check square_probe)
+set(HYPERPLONK_ASCEND910B3_TEST_RUNNERS
+    native_math_smoke msm_benchmark msm_metadata_check square_probe)
+# Real host C ABI smoke: links the full bridge archive, its math dependency and
+# the existing ACL auditing shims, so runtime ownership is observed end to end.
+add_executable(bridge_smoke tests/bridge_smoke.cpp tests/runtime_audit.cpp)
+target_link_libraries(bridge_smoke PRIVATE
+    hyperplonk_ascend910b3_bridge Threads::Threads)
+list(APPEND HYPERPLONK_ASCEND910B3_TEST_RUNNERS bridge_smoke)
+foreach(runner IN LISTS HYPERPLONK_ASCEND910B3_TEST_RUNNERS)
     target_link_libraries(${runner} PRIVATE hyperplonk_ascend910b3_math)
     target_link_options(${runner} PRIVATE
         "-Wl,--wrap=aclrtMemcpy"

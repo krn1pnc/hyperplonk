@@ -28,6 +28,7 @@ required-features = ["cpu"]
 [features]
 default = ["cpu"]
 cpu = ["backend/cpu", "subroutines/cpu"]
+ascend910b3 = ["backend/ascend910b3", "subroutines/ascend910b3"]
 print-trace = [ 
     "ark-std/print-trace",
     "backend/print-trace",

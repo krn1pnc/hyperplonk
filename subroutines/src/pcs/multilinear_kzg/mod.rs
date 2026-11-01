@@ -433,3 +433,222 @@ mod test {
         assert!(MultilinearKzgPCS::<E>::gen_srs_for_testing(&mut rng, 0).is_err());
     }
 }
+
+/// Multilinear-KZG commit/open/batch equality between the Ascend910B3 backend
+/// and the host oracle.
+///
+/// Compile-gated on the explicit Ascend910B3 feature: enabling it requires a
+/// usable native bridge, so a missing backend fails instead of being skipped.
+/// Verification is always the host pairing check against verifier parameters
+/// trimmed from the same SRS. The prepared prover key is built after the host
+/// SRS is dropped, which exercises the backend-owned parameter lifetime.
+#[cfg(all(test, feature = "cpu", feature = "ascend910b3"))]
+mod ascend910b3_test {
+    use super::*;
+    use ark_bls12_381::Bls12_381;
+    use ark_ec::pairing::Pairing;
+    use ark_poly::{DenseMultilinearExtension, Polynomial};
+    use ark_serialize::CanonicalSerialize;
+    use ark_std::{
+        rand::{rngs::StdRng, SeedableRng},
+        UniformRand,
+    };
+    use backend::{ascend910b3::Ascend910B3Backend, cpu::CpuBackend, MleBackend};
+
+    type E = Bls12_381;
+    type Fr = <E as Pairing>::ScalarField;
+    type Pcs = MultilinearKzgPCS<E>;
+
+    fn table(num_vars: usize, seed: u64) -> Vec<Fr> {
+        let mut rng = StdRng::seed_from_u64(seed);
+        (0..1usize << num_vars).map(|_| Fr::rand(&mut rng)).collect()
+    }
+
+    fn serialized<T: CanonicalSerialize>(value: &T) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        value
+            .serialize_compressed(&mut bytes)
+            .expect("canonical serialization");
+        bytes
+    }
+
+    #[test]
+    fn test_ascend_commit_open_and_batch_match_cpu() -> Result<(), PCSError> {
+        let mut rng = StdRng::seed_from_u64(0xa5ce_0001);
+        let srs = Pcs::gen_srs_for_testing(&mut rng, 4)?;
+        let (host_prover_param, verifier_param) = Pcs::trim(&srs, 4)?;
+        // The backend-owned prepared key must outlive the host SRS.
+        drop(srs);
+        let ascend = Ascend910B3Backend::new(0)
+            .expect("Ascend910B3 backend must be available for the commit/open test");
+        let cpu = CpuBackend;
+        let ascend_param = host_prover_param.clone().prepare(&ascend)?;
+        let cpu_param = host_prover_param.prepare(&cpu)?;
+
+        // Mixed polynomial dimensions, including a constant and a duplicate.
+        let dimensions = vec![3usize, 0, 2, 3, 1, 3];
+        let mut tables = Vec::with_capacity(dimensions.len());
+        for (index, &num_vars) in dimensions.iter().enumerate() {
+            tables.push(table(num_vars, 0xb100 + index as u64));
+        }
+        // Entry 3 duplicates entry 0, so commitment order and duplicates are
+        // both checked.
+        let duplicate_table = tables[0].clone();
+        tables[3] = duplicate_table;
+
+        let ascend_polys = dimensions
+            .iter()
+            .zip(&tables)
+            .map(|(&num_vars, values)| ascend.mle_from_evaluations(num_vars, values.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+        let cpu_polys = dimensions
+            .iter()
+            .zip(&tables)
+            .map(|(&num_vars, values)| cpu.mle_from_evaluations(num_vars, values.clone()))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let ascend_commits = Pcs::multi_commit(&ascend, &ascend_param, &ascend_polys)?;
+        let cpu_commits = Pcs::multi_commit(&cpu, &cpu_param, &cpu_polys)?;
+        assert_eq!(ascend_commits.len(), dimensions.len());
+        assert_eq!(ascend_commits, cpu_commits);
+        assert_eq!(ascend_commits[0], ascend_commits[3]);
+
+        for (index, (&num_vars, values)) in dimensions.iter().zip(&tables).enumerate() {
+            let point: Vec<Fr> = (0..num_vars)
+                .map(|coordinate| Fr::from((index + coordinate) as u64 + 1))
+                .collect();
+            let (ascend_proof, ascend_value) =
+                Pcs::open(&ascend, &ascend_param, &ascend_polys[index], &point)?;
+            let (cpu_proof, cpu_value) = Pcs::open(&cpu, &cpu_param, &cpu_polys[index], &point)?;
+            let expected = DenseMultilinearExtension::from_evaluations_vec(
+                num_vars,
+                values.clone(),
+            )
+            .evaluate(&point);
+            assert_eq!(ascend_value, cpu_value);
+            assert_eq!(ascend_value, expected);
+            assert_eq!(serialized(&ascend_proof), serialized(&cpu_proof));
+            assert!(Pcs::verify(
+                &verifier_param,
+                &ascend_commits[index],
+                &point,
+                &ascend_value,
+                &ascend_proof
+            )?);
+        }
+
+        // The batch path uses the sum-check derived aggregation on the device.
+        let batch_indices = [0usize, 3, 5];
+        let batch_polys = batch_indices
+            .iter()
+            .map(|&index| ascend_polys[index].clone())
+            .collect::<Vec<_>>();
+        let batch_cpu_polys = batch_indices
+            .iter()
+            .map(|&index| cpu_polys[index].clone())
+            .collect::<Vec<_>>();
+        let batch_commits = batch_indices
+            .iter()
+            .map(|&index| ascend_commits[index].clone())
+            .collect::<Vec<_>>();
+        let points = (0..batch_indices.len())
+            .map(|index| {
+                (0..3)
+                    .map(|coordinate| Fr::from((10 * index + coordinate) as u64 + 2))
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<_>>();
+        let evals = batch_indices
+            .iter()
+            .zip(&points)
+            .map(|(&index, point)| cpu.evaluate_mle(&cpu_polys[index], point))
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let mut ascend_transcript = IOPTranscript::<Fr>::new(b"pcs batch opening");
+        let ascend_batch = Pcs::multi_open(
+            &ascend,
+            &ascend_param,
+            &batch_polys,
+            &points,
+            &evals,
+            &mut ascend_transcript,
+        )?;
+        let mut cpu_transcript = IOPTranscript::<Fr>::new(b"pcs batch opening");
+        let cpu_batch = Pcs::multi_open(
+            &cpu,
+            &cpu_param,
+            &batch_cpu_polys,
+            &points,
+            &evals,
+            &mut cpu_transcript,
+        )?;
+        assert_eq!(
+            ascend_batch.f_i_eval_at_point_i,
+            cpu_batch.f_i_eval_at_point_i
+        );
+        assert_eq!(ascend_batch.sum_check_proof, cpu_batch.sum_check_proof);
+        assert_eq!(
+            serialized(&ascend_batch.g_prime_proof),
+            serialized(&cpu_batch.g_prime_proof)
+        );
+
+        let mut verify_transcript = IOPTranscript::<Fr>::new(b"pcs batch opening");
+        assert!(Pcs::batch_verify(
+            &verifier_param,
+            &batch_commits,
+            &points,
+            &ascend_batch,
+            &mut verify_transcript,
+        )?);
+
+        // A single tampered claimed evaluation must break batch verification.
+        let mut tampered = ascend_batch;
+        tampered.f_i_eval_at_point_i[0] += Fr::from(1u64);
+        let mut tampered_transcript = IOPTranscript::<Fr>::new(b"pcs batch opening");
+        assert!(!matches!(
+            Pcs::batch_verify(
+                &verifier_param,
+                &batch_commits,
+                &points,
+                &tampered,
+                &mut tampered_transcript,
+            ),
+            Ok(true)
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_ascend_rejects_bad_opening_shapes() -> Result<(), PCSError> {
+        let mut rng = StdRng::seed_from_u64(0xa5ce_0002);
+        let srs = Pcs::gen_srs_for_testing(&mut rng, 3)?;
+        let (host_prover_param, _) = Pcs::trim(&srs, 3)?;
+        drop(srs);
+        let ascend = Ascend910B3Backend::new(0)
+            .expect("Ascend910B3 backend must be available for the shape-rejection test");
+        let ascend_param = host_prover_param.prepare(&ascend)?;
+
+        let polynomial = ascend.mle_from_evaluations(2, table(2, 0xb200))?;
+        assert!(matches!(
+            Pcs::open(&ascend, &ascend_param, &polynomial, &vec![Fr::from(1u64)]),
+            Err(PCSError::InvalidParameters(_))
+        ));
+        assert!(matches!(
+            Pcs::open(
+                &ascend,
+                &ascend_param,
+                &polynomial,
+                &vec![Fr::from(1u64), Fr::from(2u64), Fr::from(3u64)],
+            ),
+            Err(PCSError::InvalidParameters(_))
+        ));
+
+        // Dimensions above the trimmed parameter bound are rejected.
+        let unsupported = ascend.mle_from_evaluations(4, table(4, 0xb201))?;
+        assert!(matches!(
+            Pcs::multi_commit(&ascend, &ascend_param, &[unsupported]),
+            Err(PCSError::InvalidParameters(_))
+        ));
+        Ok(())
+    }
+}

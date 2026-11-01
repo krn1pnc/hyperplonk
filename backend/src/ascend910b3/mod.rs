@@ -1,17 +1,23 @@
 //! Ascend910B3 BLS12-381 backend using a statically linked host C ABI.
 //!
-//! The `ascend910b3` feature is enabled by default alongside `cpu`. Provide
-//! `libhyperplonk_ascend910b3_bridge.a` through `HYPERPLONK_ASCEND910B3_LIB_DIR`
-//! (or the system linker search path) for builds that link this backend. For a
-//! CPU-only backend build, use `--no-default-features --features cpu`.
-//! This feature gates the native backend, not the BLS12-381 dependency, which is
-//! also available in CPU-only builds and host tests.
-//! The crate root gates this entire module; child modules inherit that boundary.
-//! Cargo does not compile or automatically select `native/bridge.asc`.
-//! That host-linkable template returns NotImplemented for every entry point; it
-//! cannot construct a backend and contains no device/operator implementation.
-//! The crate-level `backend/build.rs` configures native library search and archive
-//! change tracking; Cargo discovers that script at its conventional location.
+//! The `ascend910b3` feature is never part of the default CPU build; request it
+//! explicitly (`--features ascend910b3`, or `hyperplonk/ascend910b3`). It links
+//! the real native bridge and has no CPU fallback. This feature gates the native
+//! backend, not the BLS12-381 dependency, which is also available in CPU-only
+//! builds and host tests. The crate root gates this entire module; child modules
+//! inherit that boundary.
+//!
+//! `backend/build.rs` owns all native linkage. It first honours the optional
+//! prebuilt `HYPERPLONK_ASCEND910B3_LIB_DIR`, requiring both
+//! `libhyperplonk_ascend910b3_bridge.a` and `libhyperplonk_ascend910b3_math.a`.
+//! Otherwise it configures the original `native/CMakeLists.txt` project in
+//! `OUT_DIR` against the installed CANN (`ASCEND_HOME_PATH`, optional `ASC_DIR`),
+//! builds the real bridge and math targets once per build directory, and links
+//! them with their transitive CANN libraries and runtime search path. Native
+//! sources and CANN environment variables are declared as rerun inputs. `ffi`
+//! keeps the authoritative `#[link(name = "hyperplonk_ascend910b3_bridge")]`
+//! attribute; the build script only contributes search paths and the math/CANN
+//! dependencies, so the bridge archive is never linked twice.
 //!
 //! Each backend uses one host thread and one native stream. Resources retain
 //! their context through `Rc`, so dropping the backend before its handles is
@@ -47,6 +53,8 @@ use std::{ptr::NonNull, rc::Rc};
 mod context;
 mod encoding;
 mod ffi;
+#[cfg(all(test, feature = "cpu"))]
+mod integration_tests;
 mod mem;
 mod multilinear_kzg;
 mod multilinear_polynomial;
@@ -56,10 +64,9 @@ mod utils;
 
 /// Single-threaded, single-stream Ascend910B3 execution entry point.
 ///
-/// Enable `ascend910b3` and statically link the native bridge. Every resource
-/// retains its context through `Rc`; dropping this entry point does not close a
-/// context still used by handles. Host numerical results are ready on return.
-/// The included unimplemented template cannot construct this type.
+/// Enable `ascend910b3` and link the native bridge. Every resource retains its
+/// context through `Rc`; dropping this entry point does not close a context still
+/// used by handles. Host numerical results are ready on return.
 pub struct Ascend910B3Backend {
     pub(crate) context: Rc<Ascend910B3Context>,
 }
@@ -67,10 +74,9 @@ pub struct Ascend910B3Backend {
 impl Ascend910B3Backend {
     /// Create a native context with one stream for a nonnegative device ID.
     ///
-    /// Requires the `ascend910b3` feature and a statically linked bridge. The
-    /// supplied template returns `BackendError::InvalidState` (NotImplemented),
-    /// without creating an owner. A real context remains alive until both this
-    /// entry point and all its handles are dropped; no manual close is needed.
+    /// Requires the `ascend910b3` feature and the linked native bridge. The
+    /// context remains alive until both this entry point and all its handles are
+    /// dropped; no manual close is needed.
     pub fn new(device_id: i32) -> Result<Self, BackendError> {
         if device_id < 0 {
             return Err(BackendError::InvalidParameters("negative device ID".into()));

@@ -21,6 +21,27 @@ use std::{
 pub struct Ascend910B3MultilinearKzgPreparedProverParam {
     pub(crate) raw: NonNull<ffi::Ascend910B3NativeMultilinearKzgPreparedProverParam>,
     pub(crate) context: Rc<Ascend910B3Context>,
+    /// Private host metadata: the largest polynomial dimension this SRS layer set
+    /// supports. It mirrors the CPU parameter domain and never leaves the backend.
+    pub(crate) num_vars: usize,
+}
+
+impl Ascend910B3MultilinearKzgPreparedProverParam {
+    /// Reject polynomials the prepared SRS cannot support before any native call.
+    ///
+    /// Parameters may commit or open polynomials of lower dimension; the layer
+    /// selected for a dimension is the retained `num_vars - polynomial.num_vars`
+    /// cache. A smaller parameter domain is an invalid request, never a clipped
+    /// or padded commitment.
+    fn check_dimension(&self, polynomial_num_vars: usize) -> Result<(), BackendError> {
+        if polynomial_num_vars > self.num_vars {
+            return Err(BackendError::InvalidParameters(format!(
+                "MLE num_vars ({polynomial_num_vars}) exceeds the prepared parameter limit ({})",
+                self.num_vars
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl MultilinearKzgBackend<Bls12_381> for Ascend910B3Backend {
@@ -54,6 +75,7 @@ impl MultilinearKzgBackend<Bls12_381> for Ascend910B3Backend {
         let params = Ascend910B3MultilinearKzgPreparedProverParam {
             raw,
             context: Rc::clone(&self.context),
+            num_vars,
         };
         // One scratch allocation is reused; each owned layer is dropped after
         // its synchronous host borrow ends, never collecting the entire SRS.
@@ -75,6 +97,16 @@ impl MultilinearKzgBackend<Bls12_381> for Ascend910B3Backend {
             scratch.clear();
             scratch.reserve(length);
             for point in &layer {
+                // Host G1 values may come from unchecked deserialization, so the
+                // 97-byte packet alone would not imply a valid group element.
+                // Validate each SRS point exactly once at this ingress; the native
+                // cold path additionally checks tag/Fq canonicity, not the subgroup.
+                // The identity is a valid subgroup member and is accepted.
+                if !point.is_on_curve() || !point.is_in_correct_subgroup_assuming_on_curve() {
+                    return Err(BackendError::InvalidParameters(format!(
+                        "SRS layer {layer_index} contains an invalid curve point"
+                    )));
+                }
                 scratch.extend_from_slice(&encode_g1(point));
             }
             // SAFETY: params is RAII-owned in this context, scratch contains
@@ -106,6 +138,7 @@ impl MultilinearKzgBackend<Bls12_381> for Ascend910B3Backend {
     ) -> Result<G1Affine, BackendError> {
         self.check_context(&prover_param.context)?;
         self.check_mle(polynomial)?;
+        prover_param.check_dimension(polynomial.num_vars)?;
         let bytes = collect_output("multilinear_kzg_commit", 97, |out| {
             // SAFETY: live prepared params and immutable MLE share this context;
             // success writes one complete host-ready G1 packet.
@@ -137,6 +170,7 @@ impl MultilinearKzgBackend<Bls12_381> for Ascend910B3Backend {
         let mut dimensions = Vec::with_capacity(polynomials.len());
         for polynomial in polynomials {
             self.check_mle(polynomial)?;
+            prover_param.check_dimension(polynomial.num_vars)?;
             addresses.push(polynomial.allocation.raw.as_ptr());
             dimensions.push(polynomial.num_vars);
         }
@@ -166,6 +200,7 @@ impl MultilinearKzgBackend<Bls12_381> for Ascend910B3Backend {
     ) -> Result<(Vec<G1Affine>, Fr), BackendError> {
         self.check_context(&prover_param.context)?;
         self.check_mle(polynomial)?;
+        prover_param.check_dimension(polynomial.num_vars)?;
         if point.len() != polynomial.num_vars {
             return Err(BackendError::InvalidParameters(
                 "opening requires a complete point".to_string(),

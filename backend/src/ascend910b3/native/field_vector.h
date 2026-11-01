@@ -20,6 +20,12 @@ template<class Field, uint32_t Lanes = 48, bool Compact = false> class FieldVect
     template<uint32_t, bool> friend class G1VectorEngine;
     template<uint32_t> friend class G1WaveAffine;
     friend struct SquareProbeAccess;
+    // MLE kernels reuse this arena's Montgomery primitives for table folds and
+    // element-wise protocol operations instead of duplicating field math.
+    friend class MleVectorEngine;
+    // Resident sumcheck state reuses the same primitives in its own packed
+    // Montgomery domain; it owns no second arena or field implementation.
+    template<uint32_t> friend class SumcheckVectorEngine;
     using Params = FieldVectorParams<typename Field::Parameters>;
     using I32 = AscendC::LocalTensor<int32_t>;
     using U32 = AscendC::LocalTensor<uint32_t>;

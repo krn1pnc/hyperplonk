@@ -39,6 +39,72 @@ Upon modification on `flake.nix`, run `direnv reload` to reflect new dependencie
 > cargo test --release --all
 ```
 
+The default CPU build does not compile the Ascend910B3 backend; its opt-in
+feature and real-device tests are described in the next section.
+
+### Ascend910B3 backend usage
+
+The CPU backend is the default. `ascend910b3` is an additive Cargo feature that
+must be requested explicitly; enabling it does not remove `cpu`, and it compiles
+and links the real host C ABI bridge, never a CPU fallback. `hyperplonk` re-exports
+neither `backend` nor `subroutines`, so a consumer that names
+`Ascend910B3Backend`, `MultilinearKzgPCS` or `PolyIOP` depends on all three:
+
+```toml
+hyperplonk  = { path = "…", default-features = false, features = ["ascend910b3"] }
+backend     = { path = "…", default-features = false, features = ["ascend910b3"] }
+subroutines = { path = "…", default-features = false, features = ["ascend910b3"] }
+```
+
+CANN is required: `ASCEND_HOME_PATH` must be set, and an optional `ASC_DIR`
+adds another CMake package prefix. `backend/build.rs` either links prebuilt
+archives from `HYPERPLONK_ASCEND910B3_LIB_DIR`, which must contain both
+`libhyperplonk_ascend910b3_bridge.a` and `libhyperplonk_ascend910b3_math.a`, or
+configures the native project in `OUT_DIR` with `Release` and builds the explicit
+`hyperplonk_ascend910b3_bridge` target. The native project restores the cache's
+`CMAKE_CXX_FLAGS_RELEASE` after CANN's ASC config shadows it, so the host Release
+optimization flags survive configuration. A missing CANN installation is a build
+error, not a fallback.
+
+```bash
+cargo build -p hyperplonk --features ascend910b3
+# NPU-only build: the CPU backend is not compiled.
+cargo build -p hyperplonk --no-default-features --features ascend910b3
+# Prebuilt mode still needs ASCEND_HOME_PATH; both archives are required.
+HYPERPLONK_ASCEND910B3_LIB_DIR=/path/to/prebuilt \
+  cargo build -p hyperplonk --features ascend910b3
+```
+
+`Ascend910B3Backend::new` takes a logical ACL device index. Logical indices
+address only the visible device set, so they have no fixed physical-card
+mapping. The real-device integration tests need both the CPU oracle and the NPU
+backend:
+
+```bash
+HYPERPLONK_ASCEND910B3_TEST_DEVICE=0 \
+  cargo test --release --workspace --features hyperplonk/ascend910b3
+```
+
+`HYPERPLONK_ASCEND910B3_TEST_DEVICE` selects a logical index and defaults to `0`;
+use `ASCEND_RT_VISIBLE_DEVICES` to choose which physical card is visible. These
+commands are usage instructions, not results or a record of the exact verified
+run: the default `cargo test` run is CPU-only and exercises no device test.
+
+On the proving path, preparing a multilinear-KZG parameter set consumes the host
+SRS layers into a native handle that keeps the SRS device-resident, and
+`commit`/`multi_commit`/`open` reuse that handle, running MSM against the resident
+prepared cache rather than re-uploading the SRS.
+Uploaded `Ascend910B3Mle` values are immutable tables, and derived MLEs stay on
+the device. The generic SumCheck prover accepts a `VirtualPolynomial` over
+BLS12-381 `Fr`, validates its product description on the host, and keeps its
+round state and factor tables resident; the host still runs the Fiat-Shamir
+transcript, passing a 32-byte challenge per round and receiving a
+`(degree + 1) * 32`-byte round message ready on return. Verification stays on the
+host: `verify` accepts no backend. The current SumCheck kernels are a generic
+Vector correctness baseline for all degrees, including the degree-34 product, not
+a Cube/Tensor path, and no NPU latency, speedup or end-to-end performance result
+is claimed here.
+
 ### Ascend910B3 internal field, G1 and MSM math
 
 `backend/src/ascend910b3/native/` contains independently built BLS12-381
@@ -47,7 +113,10 @@ compile-time `FieldElement<Params>` implements both the scalar field `Fr` and
 base field `Fq`, using canonical integers and exact Barrett reduction.
 The Fr Cube operations borrow TensorZKP's
 [limb/matrix approach](https://www.usenix.org/system/files/usenixsecurity26-lu-tao.pdf),
-not its BabyBear field or CUDA implementation.
+not its BabyBear field or CUDA implementation. The same native project also
+builds the host C ABI bridge, but the measurements and acceptance statements in
+this section describe the standalone math suite only, not the Rust backend, PCS
+commit or SumCheck.
 
 Internal C++ batch function templates provide Fr/Fq add, subtract, negate,
 multiply, square, inverse and complete wide reduction. One generic
@@ -65,20 +134,36 @@ Montgomery multiplication; all live G1 exception masks remain untouched.
 Fr inner product and shared-scalar vector multiplication retain signed INT8 Cube
 products, exact unsigned correction and Scalar packing/reduction.
 `g1.h` adds concrete host/device `G1Affine` and `G1Jacobian` value types over Fq.
-`msm.h` adds native cuZK-style optimized Pippenger MSM. The protocol bridge is
-still NotImplemented: Rust interfaces, C ABI and the 97-byte packet are unchanged.
+`msm.h` adds native cuZK-style optimized Pippenger MSM. The host C ABI bridge is
+implemented: its 20 v1 entry points cover context/buffer retirement, MLE,
+multilinear-KZG commit/open and SumCheck prover state, with the v1 C ABI,
+canonical Fr LE32 encoding and 97-byte G1 packet unchanged. The native bridge
+smoke, CPU golden suites and Rust backend/PCS/SumCheck suites pass on Ascend910B3
+with a unified `Release` build, including a non-identity full HyperPlonk
+proof/verify, but no NPU performance has been measured; the figures in this
+section remain standalone math results.
 
 ```bash
 source "$ASCEND_HOME_PATH/set_env.sh"
 cmake -S backend/src/ascend910b3/native -B target/ascend910b3-native-math \
   -DCMAKE_PREFIX_PATH="$ASCEND_HOME_PATH/aarch64-linux/lib64/cmake"
-cmake --build target/ascend910b3-native-math --parallel 2
+cmake --build target/ascend910b3-native-math --parallel 2 \
+  --target hyperplonk_ascend910b3_math field_math_tests native_math_smoke \
+  msm_benchmark msm_metadata_check square_probe
 python3 backend/src/ascend910b3/native/tests/generate_golden.py \
   --output target/ascend910b3-native-math/fixtures
 ctest --test-dir target/ascend910b3-native-math --output-on-failure
 target/ascend910b3-native-math/native_math_smoke \
   --device 0 --fixtures target/ascend910b3-native-math/fixtures
 ```
+
+This standalone build covers the native C++ math and smoke harness. The same
+project also defines the `hyperplonk_ascend910b3_bridge` target that Cargo builds
+in `OUT_DIR` and a separate `bridge_smoke` executable; this command names only
+the math/test targets, and CTest registers only `field_math_tests`. Add
+`hyperplonk_ascend910b3_bridge` to the target list to produce the archive used by
+`HYPERPLONK_ASCEND910B3_LIB_DIR`. Cargo's bridge build uses `Release`, while this
+manual invocation sets no `CMAKE_BUILD_TYPE`.
 
 The fixture command is self-contained Python (standard library only). It preserves
 all 806 original fixture files and also writes the three files under
@@ -159,7 +244,9 @@ scalar on device, perform ten state-update rounds, then download only the
 32-byte final result. Test-only forwarding wrappers assert no explicit H2D/D2H,
 synchronization, device or pinned-host allocation/free during compute. This audits calls
 from the test and static math library, not CANN shared-library internals, and
-does not establish residency of the still-unimplemented protocol bridge.
+does not establish residency of the Rust backend, PCS commit or SumCheck path;
+their functional correctness is covered by the separate backend/PCS/SumCheck
+suites described above.
 
 Field-only development avoids the unrelated G1/MSM suite:
 
@@ -834,3 +921,31 @@ To update only a single input specify it as an argument, for example
 
 To obtain benchmarks, run the script file `scripts/run_benchmarks.sh`. 
 We refer to Table 5 and Table 6 in https://eprint.iacr.org/2022/1355.pdf for an example benchmark.
+
+The standalone SumCheck benchmark `subroutines/examples/sumcheck_bench` compares
+the selected backend with a CPU oracle and writes a JSON report to stdout:
+
+```bash
+cargo run --release -p subroutines --example sumcheck_bench -- \
+  --backend cpu --num-vars 20 --degree 2 --warmups 1 --samples 3
+cargo run --release -p subroutines --example sumcheck_bench --features ascend910b3 -- \
+  --backend npu --num-vars 25 --degree 34 --warmups 1 --samples 3
+```
+
+The whole-proof window starts before `prover_init`, includes transcript setup,
+every host Fiat-Shamir round and the explicit prover-state drop, and excludes the
+CPU oracle and verification; cold init and cold upload are reported separately.
+These are usage instructions, not measurements. `sumcheck_bench` is a standalone
+SumCheck benchmark, not a HyperPlonk PIOP driver, and this README describes no
+PIOP-level driver.
+
+The report embeds an external TensorZKP reference of 4.04 ms for a degree-2,
+N=25 SumCheck on an H100 80 GB in the BabyBear degree-8 extension. That number is
+context only: it is not a PIOP target, not directly comparable to BLS12-381 `Fr`
+on Ascend910B3, and must not be imposed as the project's goal. The TensorZKP
+paper's Table 1 reports, for that reference's H100/BabyBear degree-8 setting,
+PermCheck 134.00 ms, ZeroCheck 16.96 ms and a PIOP total of 150.96 ms (the sum of
+those two components). The project's separate target for a 2^25 complete
+HyperPlonk PIOP is at most 200 ms, with PCS and MSM accounted separately; no NPU
+performance has been measured at any input size, so that target has not been
+achieved.
