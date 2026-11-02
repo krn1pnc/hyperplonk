@@ -93,9 +93,18 @@ run: the default `cargo test` run is CPU-only and exercises no device test.
 On the proving path, preparing a multilinear-KZG parameter set consumes the host
 SRS layers into a native handle that keeps the SRS device-resident, and
 `commit`/`multi_commit`/`open` reuse that handle, running MSM against the resident
-prepared cache rather than re-uploading the SRS.
+prepared cache rather than re-uploading the SRS. Preparation checks the
+`num_vars + 1` layer count, each layer's point count and the canonical 97-byte
+packet shape; it does not repeat per-point curve or subgroup validation. Callers
+must supply bases that are already valid subgroup elements: checked SRS
+deserialization validates them, and SRS generation produces them by construction.
 Uploaded `Ascend910B3Mle` values are immutable tables, and derived MLEs stay on
-the device. The generic SumCheck prover accepts a `VirtualPolynomial` over
+the device. The nums/denoms kernel rebuilds each row's public index from the
+canonical Fr table position inside every 48-lane tile
+(`beta * (column * total + row)`), and carries no per-block index between tiles,
+so a partial trailing tile cannot inherit a stale base. Canonical 32-byte Fr
+encoding, device-resident HBM tables and the 20-entry v1 bridge ABI are
+unchanged. The generic SumCheck prover accepts a `VirtualPolynomial` over
 BLS12-381 `Fr`, validates its product description on the host, and keeps its
 round state and factor tables resident; the host still runs the Fiat-Shamir
 transcript, passing a 32-byte challenge per round and receiving a
@@ -128,7 +137,15 @@ Validation for these artifacts is recorded in
 57/35/9 including non-identity HyperPlonk prove/verify; 16 cold exact batch
 diagnostics and 32 multi-product cases matched CPU/NPU host verifiers; and 5000
 borrowed-host-byte-poisoned uploads each verified, with retire/destroy exit 0.
-The main native smoke source `2dc56706…` matches the validated copy.
+The main native smoke source `2dc56706…` matches the validated copy; this tree
+adds a multi-tile public-index regression on top of that copy. That source was
+host-compiled without rebuilding any native kernel and run once on physical
+device 6 against the archived native libraries: the pre-fix bridge
+`02124ea6…` stops at the n=11 regression numerator assertion, while the fixed
+bridge `d849f75a…` passes the complete smoke (MLE, async lifetime, KZG,
+SumCheck, resource, context and smoke markers). The seven-group result above
+still refers to the earlier validated copy; this run reuses the archived
+artifacts and makes no fresh native-build claim.
 `main-port.json` records that these gates cover the identical clean-validation
 source artifacts and that the main tree was not rebuilt after the source port.
 The 4096-slot admission denial is inferred from the source budget and upload

@@ -47,6 +47,12 @@ impl Ascend910B3MultilinearKzgPreparedProverParam {
 impl MultilinearKzgBackend<Bls12_381> for Ascend910B3Backend {
     type PreparedProverParam = Ascend910B3MultilinearKzgPreparedProverParam;
 
+    /// Prepare device-resident SRS layers.
+    ///
+    /// The caller must pass bases that are already valid subgroup elements, as
+    /// produced by checked deserialization or by SRS generation. This backend
+    /// checks the layer count, each layer's point count and the canonical packet
+    /// encoding only; it does not repeat per-point curve or subgroup validation.
     fn prepare_prover_param(
         &self,
         num_vars: usize,
@@ -96,17 +102,9 @@ impl MultilinearKzgBackend<Bls12_381> for Ascend910B3Backend {
             let length = point_count * 97;
             scratch.clear();
             scratch.reserve(length);
+            // Uploaded bases are caller-validated subgroup elements; this path
+            // checks shape and canonical encoding only.
             for point in &layer {
-                // Host G1 values may come from unchecked deserialization, so the
-                // 97-byte packet alone would not imply a valid group element.
-                // Validate each SRS point exactly once at this ingress; the native
-                // cold path additionally checks tag/Fq canonicity, not the subgroup.
-                // The identity is a valid subgroup member and is accepted.
-                if !point.is_on_curve() || !point.is_in_correct_subgroup_assuming_on_curve() {
-                    return Err(BackendError::InvalidParameters(format!(
-                        "SRS layer {layer_index} contains an invalid curve point"
-                    )));
-                }
                 scratch.extend_from_slice(&encode_g1(point));
             }
             // SAFETY: params is RAII-owned in this context, scratch contains

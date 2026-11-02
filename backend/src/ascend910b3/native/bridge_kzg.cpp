@@ -13,8 +13,8 @@
 // round trip); fold quotients stay in HBM as the next MSM's scalars; only one
 // 96B point per quotient MSM and the final 32B evaluation reach the host.
 //
-// The Rust caller validates SRS curve membership and subgroup membership at
-// ingress exactly once (confirmed by the Rust wiring owner), so the cold upload
+// SRS curve and subgroup membership are caller preconditions, established by
+// checked deserialization or generation before preparation. The cold upload
 // here only enforces canonical 97-byte packet shape: tag 0/1, infinity with zero
 // coordinates, finite values < q, and no finite (0,0). Commit/open results are
 // re-validated on the host: canonical coordinates, infinity consistency and the

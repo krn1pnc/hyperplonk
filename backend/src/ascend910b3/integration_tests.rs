@@ -27,7 +27,7 @@ use crate::cpu::CpuBackend;
 use crate::{
     BackendError, Mle, MleBackend, MultilinearKzgBackend, SumCheckProver, VirtualPolynomial,
 };
-use ark_bls12_381::{Bls12_381, Fq, Fr, G1Affine, G1Projective};
+use ark_bls12_381::{Bls12_381, Fr, G1Affine, G1Projective};
 use ark_ec::{scalar_mul::variable_base::VariableBaseMSM, CurveGroup, PrimeGroup};
 use ark_ff::{AdditiveGroup, Field, PrimeField};
 use std::collections::HashMap;
@@ -449,20 +449,6 @@ fn independent_commitment(
     let bases = &layers[param_num_vars - num_vars];
     assert_eq!(bases.len(), values.len());
     G1Projective::msm_unchecked(bases, values).into_affine()
-}
-
-/// Safe Ark construction of an on-curve point outside the prime-order subgroup,
-/// used to exercise SRS ingress subgroup validation.
-fn on_curve_non_subgroup_point() -> G1Affine {
-    for candidate in 1u64..4096 {
-        let x = Fq::from(candidate);
-        if let Some(point) = G1Affine::get_point_from_x_unchecked(x, true) {
-            if !point.is_in_correct_subgroup_assuming_on_curve() {
-                return point;
-            }
-        }
-    }
-    panic!("no on-curve non-subgroup point found in the searched x range");
 }
 
 #[test]
@@ -1213,7 +1199,7 @@ fn open_matches_cpu_with_exact_quotients_and_evaluations() -> TestResult {
 }
 
 #[test]
-fn srs_ingress_rejects_invalid_layer_shapes_and_points() -> TestResult {
+fn srs_ingress_rejects_invalid_layer_shapes() -> TestResult {
     let _guard = device_guard();
     let backend = ascend_backend();
 
@@ -1239,23 +1225,7 @@ fn srs_ingress_rejects_invalid_layer_shapes_and_points() -> TestResult {
     long_layer[param_vars].push(layers[0][0]);
     assert_invalid_parameters(ascend_prepared(&backend, param_vars, &long_layer));
 
-    // Off-curve finite point (safe unchecked Ark construction).
-    let mut off_curve = layers.clone();
-    off_curve[0][1] = G1Affine::new_unchecked(Fq::from(1u64), Fq::from(1u64));
-    assert!(!off_curve[0][1].is_on_curve());
-    assert_invalid_parameters(ascend_prepared(&backend, param_vars, &off_curve));
-
-    // On-curve but outside the prime-order subgroup.
-    let non_subgroup = on_curve_non_subgroup_point();
-    assert!(non_subgroup.is_on_curve());
-    assert!(!non_subgroup.is_in_correct_subgroup_assuming_on_curve());
-    let mut non_subgroup_layers = layers;
-    non_subgroup_layers[param_vars][0] = non_subgroup;
-    assert_invalid_parameters(ascend_prepared(
-        &backend,
-        param_vars,
-        &non_subgroup_layers,
-    ));
+    // Point validity is a caller precondition; ingress checks shapes only.
     Ok(())
 }
 

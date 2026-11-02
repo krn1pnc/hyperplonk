@@ -5,7 +5,8 @@
 // do not call, include or mirror the production field/group/vector helpers.
 //
 // Covered here: the 20 bridge.h entry points, upload/evaluate/eq/frac/product/
-// nums+denoms/product-factors equality, KZG commit/multi-commit/open against a
+// nums+denoms equality (including an 11/12-variable multi-tile public-index
+// regression), product-factors equality, KZG commit/multi-commit/open against a
 // direct CPU group sum over fixed valid generator-point layers, complete generic
 // sumcheck rounds (degrees 1,2,3,7,34,65), state ordering/error-no-advance, empty
 // virtual polynomials, retirement deferral, two-context isolation and the small
@@ -407,6 +408,37 @@ RefTable reference_product_table(const RefTable& frac) {
     evaluations.push_back(RefFr::zero());
     require(evaluations.size() == size, "reference product recurrence length");
     return RefTable(frac.num_vars, std::move(evaluations));
+}
+
+// Full-range fixture for the per-tile public-index regression. With
+// beta = -1, gamma = -2, fx = gx = column*total + row + 10 and
+// perm = column*total + (row ^ 1):
+//   numerator(row)   = fx + gamma + beta*(column*total + row) = 8,
+//   denominator(row) = gx + gamma + beta*perm                = 7/9 by row parity.
+// The closed-form MLE at a non-Boolean first coordinate x is therefore 8 and
+// 7 + 2*x for every column and every choice of the higher coordinates, so a
+// stale base index in a later 48-lane tile cannot hide behind the other
+// coordinates. Values are built only from the independent host Fr helpers.
+void reference_index_fixture(uint32_t num_vars, uint32_t columns,
+                             std::vector<RefTable>& fx,
+                             std::vector<RefTable>& perm) {
+    require(num_vars < 63 && columns > 0, "invalid public-index fixture");
+    const uint64_t total = uint64_t(1) << num_vars;
+    fx.clear();
+    perm.clear();
+    for (uint32_t column = 0; column < columns; ++column) {
+        const uint64_t column_base = uint64_t(column) * total;
+        std::vector<RefFr> fx_values;
+        std::vector<RefFr> perm_values;
+        fx_values.reserve(total);
+        perm_values.reserve(total);
+        for (uint64_t row = 0; row < total; ++row) {
+            fx_values.push_back(fr(column_base + row + 10));
+            perm_values.push_back(fr(column_base + (row ^ 1)));
+        }
+        fx.emplace_back(num_vars, std::move(fx_values));
+        perm.emplace_back(num_vars, std::move(perm_values));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -864,6 +896,79 @@ void test_mle(Ascend910B3NativeContext* context, Ascend910B3NativeContext* other
         require_ok(abi::buffer_retire(context, numerator_out[1]), "retire numerator 1");
         require_ok(abi::buffer_retire(context, denominator_out[0]), "retire denominator 0");
         require_ok(abi::buffer_retire(context, denominator_out[1]), "retire denominator 1");
+    }
+
+    // Multi-tile public-index regression across whole 2048/4096-entry tables.
+    // On 40 AIV blocks each block covers 52/103 rows, so every block spans more
+    // than one 48-lane tile. The full-range fixture above makes only the exact
+    // per-tile CPU index beta*(column*total + row) produce NUM=8 and
+    // DEN=7+2*x at non-Boolean first coordinates; a carried or stale base
+    // index in any later tile changes those values. The oracle is the closed
+    // form evaluated with the independent host Fr helpers, never the device
+    // output. beta = -1 and gamma = -2 are canonical BLS12-381 Fr constants.
+    for (const uint32_t num_vars : {uint32_t(11), uint32_t(12)}) {
+        constexpr size_t kColumns = 2;
+        std::vector<RefTable> fx;
+        std::vector<RefTable> perm;
+        reference_index_fixture(num_vars, uint32_t(kColumns), fx, perm);
+
+        const RefFr beta = RefFr::zero().sub(RefFr::one());
+        const RefFr gamma = RefFr::zero().sub(fr(2));
+        const auto beta_encoded = beta.bytes();
+        const auto gamma_encoded = gamma.bytes();
+
+        std::array<Ascend910B3DeviceAddress, kColumns> fxs{};
+        std::array<Ascend910B3DeviceAddress, kColumns> gxs{};
+        std::array<Ascend910B3DeviceAddress, kColumns> perms{};
+        for (size_t column = 0; column < kColumns; ++column) {
+            fxs[column] = track(upload_table(context, fx[column]));
+            gxs[column] = fxs[column];
+            perms[column] = track(upload_table(context, perm[column]));
+        }
+
+        std::array<Ascend910B3DeviceAddress, kColumns> numerator_out{};
+        std::array<Ascend910B3DeviceAddress, kColumns> denominator_out{};
+        numerator_out.fill(&sentinel);
+        denominator_out.fill(&sentinel);
+        require_ok(abi::mle_compute_nums_and_denoms(
+                       context, num_vars, beta_encoded.data(), gamma_encoded.data(),
+                       fxs.data(), gxs.data(), perms.data(), kColumns,
+                       numerator_out.data(), denominator_out.data()),
+                   "mle_compute_nums_and_denoms multi-tile " +
+                       std::to_string(num_vars));
+        for (size_t column = 0; column < kColumns; ++column)
+            require(numerator_out[column] != nullptr &&
+                        denominator_out[column] != nullptr,
+                    "nums_and_denoms multi-tile returned null handles");
+
+        for (const uint64_t first : {uint64_t(2), uint64_t(3)}) {
+            std::vector<RefFr> point(num_vars);
+            point[0] = fr(first);
+            for (uint32_t coordinate = 1; coordinate < num_vars; ++coordinate)
+                point[coordinate] = fr(uint64_t(3) + coordinate);
+            const RefFr expected_numerator = fr(8);
+            const RefFr expected_denominator = fr(7).add(fr(2).mul(point[0]));
+            for (size_t column = 0; column < kColumns; ++column) {
+                const std::string label =
+                    "nums_and_denoms multi-tile " + std::to_string(num_vars) +
+                    " column " + std::to_string(column) + " x=" +
+                    std::to_string(first);
+                require(evaluate_checked(context, numerator_out[column], point,
+                                         label + " numerator")
+                            .equals(expected_numerator),
+                        label + " numerator");
+                require(evaluate_checked(context, denominator_out[column], point,
+                                         label + " denominator")
+                            .equals(expected_denominator),
+                        label + " denominator");
+            }
+        }
+        for (size_t column = 0; column < kColumns; ++column) {
+            require_ok(abi::buffer_retire(context, numerator_out[column]),
+                       "retire multi-tile numerator");
+            require_ok(abi::buffer_retire(context, denominator_out[column]),
+                       "retire multi-tile denominator");
+        }
     }
 
     // Retirement is asynchronous and queued: no synchronization, unknown and
