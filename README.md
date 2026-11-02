@@ -104,15 +104,26 @@ canonical Fr table position inside every 48-lane tile
 (`beta * (column * total + row)`), and carries no per-block index between tiles,
 so a partial trailing tile cannot inherit a stale base. Canonical 32-byte Fr
 encoding, device-resident HBM tables and the 20-entry v1 bridge ABI are
-unchanged. The generic SumCheck prover accepts a `VirtualPolynomial` over
-BLS12-381 `Fr`, validates its product description on the host, and keeps its
-round state and factor tables resident; the host still runs the Fiat-Shamir
-transcript, passing a 32-byte challenge per round and receiving a
-`(degree + 1) * 32`-byte round message ready on return. Verification stays on the
-host: `verify` accepts no backend. The current SumCheck kernels are a generic
-Vector correctness baseline for all degrees, including the degree-34 product, not
-a Cube/Tensor path, and no accepted NPU latency, speedup or end-to-end
-performance result is claimed here.
+unchanged. The SumCheck prover accepts a `VirtualPolynomial` over
+BLS12-381 `Fr`, validates its product description on the host, and retains the
+immutable canonical factor tables plus only shrinking fold slots on the device;
+the host still runs the Fiat-Shamir transcript, passing a 32-byte challenge per
+round and receiving a `(degree + 1) * 32`-byte round message ready on return.
+Verification stays on the host: `verify` accepts no backend.
+A degree-2 state whose whole sum is non-empty and whose products are all arity 2
+uses the Cube natural-message kernel (`sumcheck_tensor_kernels.asc`): four
+genuine 32x32 K512 INT8 products per pair tile, HBM raw-C staging for the
+arch22 Fixpipe route, and exact UB radix correction. Every other degree/arity
+uses the generic canonical natural Vector message, and the previous-challenge
+fold is always the canonical natural Vector fold, so no packed table exists.
+The degree-2 message input uses two 64 KiB per-group operand slots (slot 0 in
+the group record, slot 1 appended after it) with a strictly per-slot
+ready/free/result event, so publishing the next tile overlaps the Cube work on
+the current one without relying on a flag counter holding more than one event.
+The host allocates the workspace from the single layout in
+`sumcheck_tensor.h` (401472 bytes per group); the kernel and host share that
+definition. No accepted NPU latency, speedup or end-to-end performance result is
+claimed here.
 
 Resource lifetime (integrated:
 `backend/src/ascend910b3/native/bridge_runtime.h` SHA-256 `66434aa0…` and
@@ -152,15 +163,17 @@ The 4096-slot admission denial is inferred from the source budget and upload
 volume, not directly counter-measured, so it is not claimed as direct coverage.
 No NPU performance claim is attached to these correctness gates.
 
-Planned TensorZKP bulk SumCheck (source-only; not implemented, so no Tensor/Cube
-claim): the main-core port targets an actual `u8` Toeplitz fold, four-corner dot
-product and lazy reduction, adapted to 255-bit `Fr` and the INT8 path on A2
-hardware. It keeps the repository's host Fiat-Shamir, canonical Fr boundaries and
-round semantics, and does not adopt device-side Fiat-Shamir, mirrored point
-labels, high-bit shortcuts or the paper harness's 1024-way timing amortization.
-The current implementation remains the generic Vector baseline above until the
-port and its gates land. Complete backend/HyperPlonk wiring and a real end-to-end
-proof/verify gate any full-prove wall-time minimization.
+TensorZKP bulk SumCheck status: the degree-2 all-arity-2 route implements the
+TensorZKP-inspired four-corner `u8` dot product with lazy integer reduction,
+adapted to 255-bit `Fr` and the INT8 Cube path on A2 hardware. It keeps the
+repository's host Fiat-Shamir, canonical Fr boundaries and round semantics, and
+does not adopt device-side Fiat-Shamir, mirrored point labels, high-bit shortcuts
+or the paper harness's 1024-way timing amortization. It also does not implement
+the paper's Toeplitz/`u8` fold or any kernel-level fold/message fusion: the fold
+is the existing canonical Vector kernel. The generic canonical Vector message
+remains the fallback for every other degree/arity, including the degree-34
+product. Complete backend/HyperPlonk wiring and a real end-to-end proof/verify
+gate any full-prove wall-time claim.
 
 ### Ascend910B3 internal field, G1 and MSM math
 
@@ -217,10 +230,17 @@ target/ascend910b3-native-math/native_math_smoke \
 
 This standalone build covers the native C++ math and smoke harness. The same
 project also defines the `hyperplonk_ascend910b3_bridge` target that Cargo builds
-in `OUT_DIR` and a separate `bridge_smoke` executable; this command names only
-the math/test targets, and CTest registers only `field_math_tests`. Add
-`hyperplonk_ascend910b3_bridge` to the target list to produce the archive used by
-`HYPERPLONK_ASCEND910B3_LIB_DIR`. Cargo's bridge build uses `Release`, while this
+in `OUT_DIR` (its sources now include the Cube natural-message TU
+`sumcheck_tensor_kernels.asc`) and separate `bridge_smoke` and
+`sumcheck_tensor_edge` executables; this command names only the math/test
+targets, and CTest registers only `field_math_tests`. Add
+`hyperplonk_ascend910b3_bridge` and `sumcheck_tensor_edge` to the target list to
+produce the archive used by `HYPERPLONK_ASCEND910B3_LIB_DIR` and the
+consumer-boundary binary. Like the other device tests, run `sumcheck_tensor_edge`
+directly (it takes `--device N` and optional `--case NAME`); it drives the fixed
+n=1/2/3/9/12, duplicate-handle, mixed-arity, cubic and empty-sum cases through
+the public bridge ABI, checking byte-exact round messages against an independent
+`boost::multiprecision` oracle. Cargo's bridge build uses `Release`, while this
 manual invocation sets no `CMAKE_BUILD_TYPE`.
 
 The fixture command is self-contained Python (standard library only). It preserves

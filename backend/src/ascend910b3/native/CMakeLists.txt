@@ -59,7 +59,8 @@ add_library(hyperplonk_ascend910b3_bridge STATIC
     bridge_kzg.cpp
     bridge_sumcheck.cpp
     mle_kernels.asc
-    sumcheck_kernels.asc)
+    sumcheck_kernels.asc
+    sumcheck_tensor_kernels.asc)
 target_include_directories(hyperplonk_ascend910b3_bridge PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}" ${CANN_INCLUDE_DIRS})
 target_link_libraries(hyperplonk_ascend910b3_bridge PUBLIC
@@ -95,6 +96,13 @@ add_executable(bridge_smoke tests/bridge_smoke.cpp tests/runtime_audit.cpp)
 target_link_libraries(bridge_smoke PRIVATE
     hyperplonk_ascend910b3_bridge Threads::Threads)
 list(APPEND HYPERPLONK_ASCEND910B3_TEST_RUNNERS bridge_smoke)
+# Full-width Fr oracle through the unchanged public bridge ABI: the 9 fixed
+# consumer-boundary cases (n=1/2/3/9/12, duplicate handles, mixed arity,
+# cubic and the empty whole sum).
+add_executable(sumcheck_tensor_edge tests/sumcheck_tensor_edge.cpp tests/runtime_audit.cpp)
+target_link_libraries(sumcheck_tensor_edge PRIVATE
+    hyperplonk_ascend910b3_bridge Threads::Threads)
+list(APPEND HYPERPLONK_ASCEND910B3_TEST_RUNNERS sumcheck_tensor_edge)
 foreach(runner IN LISTS HYPERPLONK_ASCEND910B3_TEST_RUNNERS)
     target_link_libraries(${runner} PRIVATE hyperplonk_ascend910b3_math)
     target_link_options(${runner} PRIVATE

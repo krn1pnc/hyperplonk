@@ -16,16 +16,11 @@
 // low-bit-first (bit i is variable i), matching
 // ark_poly::DenseMultilinearExtension and the shared MLE fold convention.
 //
-// The prover keeps its working tables in the *private Montgomery domain*: a
-// table value is x*R mod p stored as canonical radix digits. The only interface
-// boundaries are canonical Fr, so the caller never supplies a Montgomery
-// coordinate:
-//   * `coordinate` is one canonical Fr; the fold kernel converts it with R^2
-//     (Mont(r) = r*R) before use and writes folded Montgomery values.
-//   * product coefficients and the 0..degree grid weights are converted
-//     once at create by `launch_sumcheck_convert` and stay Montgomery resident.
-//   * `launch_sumcheck_reduce` converts the final d+1 values back to canonical
-//     Fr before the host download, so host bytes are ordinary canonical Fr.
+// Working tables remain canonical numeric Fr. Grid weights are Montgomery;
+// each private coefficient is c*R^(arity+1), scaled once on device at create.
+// Generic message products have scale R^(1-arity); the unchanged reduce first
+// combines the scaled coefficient and then projects with literal canonical 1.
+// Coordinates are canonical; fold converts the scalar to rR once internally.
 //
 // Three lane variants are compiled. `lanes` selects the variant and `chunk`
 // (see sumcheck_chunk_*) is the number of 0..degree evaluations one pass can
@@ -76,29 +71,25 @@ constexpr SumcheckShape sumcheck_shape(size_t max_degree) noexcept {
     return shape;
 }
 
-// Factor-table arena geometry for one distinct factor (num_vars >= 1, which the
-// SumCheck contract requires). The state registers one
-// arena buffer holding `factor_count * sumcheck_table_stride(num_vars)` bytes;
-// factor f owns the byte range [f * stride, (f + 1) * stride). Within it:
-//   parity 0 table at +0           capacity 2^num_vars entries
-//   parity 1 table at +2^n*32      capacity 2^(num_vars-1) entries
-// Round r (0 <= r < num_vars) reads parity r % 2 and, for r >= 1, folds from
-// parity (r - 1) % 2 into parity r % 2 with 2^(num_vars - r + 1) inputs and
-// 2^(num_vars - r) outputs.
-constexpr uint64_t sumcheck_parity_bytes(size_t num_vars) noexcept {
-    return (uint64_t(1) << num_vars) * sumcheck_fr_bytes;
+// Retain the original canonical table for round zero. Each distinct factor
+// owns only shrinking A/B slots: n=1 has neither, n=2 has A only.
+constexpr uint64_t sumcheck_slot_a_bytes(size_t num_vars) noexcept {
+    return num_vars <= 1 ? 0 : (uint64_t(1) << (num_vars - 1)) * sumcheck_fr_bytes;
+}
+constexpr uint64_t sumcheck_slot_b_bytes(size_t num_vars) noexcept {
+    return num_vars <= 2 ? 0 : (uint64_t(1) << (num_vars - 2)) * sumcheck_fr_bytes;
+}
+constexpr uint64_t sumcheck_slot_b_offset(size_t num_vars) noexcept {
+    return sumcheck_slot_a_bytes(num_vars);
 }
 constexpr uint64_t sumcheck_table_stride(size_t num_vars) noexcept {
-    return (uint64_t(3) << (num_vars - 1)) * sumcheck_fr_bytes;
+    return sumcheck_slot_a_bytes(num_vars) + sumcheck_slot_b_bytes(num_vars);
 }
-constexpr uint64_t sumcheck_parity_offset(size_t num_vars, size_t round) noexcept {
-    return (round & 1) ? sumcheck_parity_bytes(num_vars) : 0;
+constexpr uint64_t sumcheck_round_slot_offset(size_t num_vars, size_t round) noexcept {
+    return (round & 1) ? 0 : sumcheck_slot_b_offset(num_vars);
 }
-constexpr uint64_t sumcheck_fold_src_offset(size_t num_vars, size_t round) noexcept {
-    return sumcheck_parity_offset(num_vars, round - 1);
-}
-constexpr uint64_t sumcheck_fold_dst_offset(size_t num_vars, size_t round) noexcept {
-    return sumcheck_parity_offset(num_vars, round);
+constexpr uint64_t sumcheck_previous_slot_offset(size_t num_vars, size_t round) noexcept {
+    return sumcheck_round_slot_offset(num_vars, round - 1);
 }
 // Low-bit-fold input exponent at round r >= 1: 2^(num_vars - r + 1) entries.
 constexpr uint32_t sumcheck_fold_exponent(size_t num_vars, size_t round) noexcept {
@@ -127,55 +118,33 @@ constexpr uint64_t sumcheck_partial_bytes(size_t product_count, size_t degree,
            sumcheck_fr_bytes;
 }
 
-// Canonical -> private Montgomery conversion of `count` contiguous entries
-// (natural low-bit-first order). `input` and `output` are disjoint; the output
-// holds canonical-length digits of x*R mod p. count 0 enqueues nothing.
-// Create-time uses: each factor table (count = 2^n) into arena parity 0, the
-// product coefficient array (count = product_count) and the grid weights
-// 0..degree (count = degree + 1).
+// Canonical -> Montgomery conversion, used only for the grid weights.
 bool launch_sumcheck_convert(aclrtStream stream, const Fr* input, Fr* output,
                              uint64_t count, uint32_t lanes);
 
-// One low-bit-first fold level in the private Montgomery domain:
-//   out[b] = in[2b] + Mont(r) * (in[2b+1] - in[2b])   (Montgomery homomorphic)
-// which is the canonical fold of the represented values (`coordinate` is one
-// device-resident canonical Fr). `input` has 2^exponent entries, `output`
-// 2^(exponent-1); exponent >= 1 and output must not alias input (the state
-// keeps disjoint parity regions).
+// Scale each c by R^(arity+1), using runtime arities, once at create.
+bool launch_sumcheck_scale_coefficients(aclrtStream stream, const Fr* canonical,
+                                        const uint32_t* arities, Fr* scaled,
+                                        uint32_t product_count, uint32_t lanes);
+
+// Canonical low-bit-first fold: even + mont(odd-even,rR).
+// Input contains 2^exponent records; output contains 2^(exponent-1).
 bool launch_sumcheck_fold(aclrtStream stream, const Fr* input, const Fr* coordinate,
                           Fr* output, uint32_t exponent, uint32_t lanes);
 
-// One product's round message over the current subject tables.
-// `arena` is the factor-table arena; the product's multiplicands are described
-// by `offsets`: `arity` records of one 64-bit arena offset each, stored 32 bytes
-// apart (records may repeat the same factor). Element b of a subject table is
-// addressed from that factor's parity base, which the kernel derives as
-//   arena + offset + parity_offset
-// where `parity_offset` is sumcheck_parity_offset(num_vars, round). For a rest
-// entry b and grid point t:
-//   partial[t][block] = sum over the block's rest entries of
-//       prod_j ( even_j(b) + t * (odd_j(b) - even_j(b)) )
-// evaluated in the Montgomery domain, where even/odd are table elements 2b and
-// 2b+1 of the round's subject table (low bit first). `rest_count` is the number
-// of rest entries and `t_count` the number of grid points in this pass.
-// `chunk_weight` is Mont(t_begin) (one Montgomery Fr, replicated inside); it is
-// unused and may be null when t_begin == 0.
-// Results are written as Montgomery Fr for t in [t_begin, t_begin + t_count):
-//   partial[((product_index * (degree + 1)) + t) * blocks + GetBlockIdx()]
-// `blocks` must equal the launch grid (sumcheck_message_blocks) and be >= 1.
-bool launch_sumcheck_message(aclrtStream stream, const void* arena,
-                             const uint64_t* offsets, uint32_t arity,
-                             uint64_t parity_offset, uint64_t rest_count,
+// Generic natural-layout message. Each immutable binding record is 32 bytes:
+// a little-endian absolute uint64 GM address followed by 24 zero bytes.
+// Repeated records preserve multiplicity. No common arena base is implied.
+// Partial layout: [product][grid point][block], with scale R^(1-arity).
+bool launch_sumcheck_message(aclrtStream stream, const uint64_t* absolute_offsets,
+                             uint32_t arity, uint64_t rest_count,
                              uint32_t t_begin, uint32_t t_count, Fr* partial,
                              uint32_t product_index, uint32_t degree,
                              const Fr* chunk_weight, uint32_t blocks,
                              uint32_t lanes);
 
-// Reduce one round's block partials to the d+1 canonical evaluations:
-//   out[t] = sum_p Mont(c_p) * sum_b partial[p][t][b]
-// `coefficients` holds product_count Montgomery coefficients (canonical digits
-// of c*R). The grid is parallel over t; every grid block writes its own t and
-// product_count == 0 writes canonical zeros without reading `partial`.
+// Reduce the shared partial layout using c*R^(arity+1); final literal-1
+// Montgomery projection is unchanged. Empty sums write canonical zeros.
 bool launch_sumcheck_reduce(aclrtStream stream, const Fr* partial,
                             const Fr* coefficients, Fr* output,
                             uint32_t product_count, uint32_t degree,

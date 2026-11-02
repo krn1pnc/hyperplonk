@@ -1,14 +1,14 @@
 // SumCheck prover bridge over the resident arbitrary-degree kernel family.
 //
-// Ownership: one opaque state owns the retained immutable canonical factor
-// handles, the registered Montgomery working arena (one 1.5*2^n slot per
-// distinct factor: parity 0 holds the converted subject table and round-0
-// messages, parity 1 is the first fold target), the pre-uploaded per-product
-// factor-offset binding table, the Mont product coefficients and the Mont
-// 0..degree grid weights, the block-partial scratch, the degree+1 canonical
-// output slot and the two tiny pinned staging slots. Everything is sized and
-// allocated once at create; a round neither allocates nor re-uploads metadata
-// and never reads a whole table back to the host.
+// Ownership: retain distinct immutable canonical originals, and allocate only
+// shrinking half/quarter A/B slots. Three immutable absolute-address binding
+// arrays select originals/A/B without per-round metadata transfers. Coefficients
+// are scaled once on device by R^(arity+1); grid weights stay Montgomery.
+// Degree-2, nonempty, all-arity-2 states use the Cube message kernel on the
+// canonical NATURAL table every round; the previous-challenge fold is always
+// the canonical natural Vector fold, so no packed table ever exists. Every
+// other state uses the generic canonical natural Vector message. All
+// workspaces and pinned staging are allocated once and retired with state.
 //
 // A round enqueues at most: one 32B challenge H2D, one fold per distinct factor,
 // product_count * ceil((degree+1)/chunk) message passes, one reduction, one
@@ -28,6 +28,7 @@
 #include "field.h"
 #include "mle_kernels.h"
 #include "sumcheck_kernels.h"
+#include "sumcheck_tensor.h"
 
 #include <cstdint>
 #include <cstring>
@@ -70,12 +71,16 @@ struct NativeSumcheck {
     size_t distinct_count = 0;
     size_t index_count = 0;
     size_t product_count = 0;
-    // Immutable canonical factor handles, retained after the Rust MLE handles
-    // are dropped. Rounds read the Montgomery arena, never these tables.
+    // Retain originals even after callers retire their public MLE handles.
     std::vector<rt::BufferRef> inputs;
-    rt::BufferRef arena;        // distinct_count * sumcheck_table_stride slots
-    rt::BufferRef bindings;     // index_count records of one uint64 arena offset
-    rt::BufferRef coefficients; // product_count Mont (one spare slot when empty)
+    rt::BufferRef arena;        // distinct_count * (half + quarter) slots
+    rt::BufferRef bindings_original;
+    rt::BufferRef bindings_slot_a;
+    rt::BufferRef bindings_slot_b;
+    rt::BufferRef coefficient_arity;
+    rt::BufferRef tensor_workspace;
+    bool tensor_d2 = false;
+    rt::BufferRef coefficients; // c*R^(arity+1), one valid slot when empty
     rt::BufferRef weights;      // degree+1 Mont grid weights 0..degree
     rt::BufferRef partial;      // product_count*(degree+1)*max_blocks records
     rt::BufferRef output;       // degree+1 canonical Fr
@@ -242,12 +247,16 @@ Ascend910B3Status create_state(Ascend910B3NativeContext* raw_context, size_t num
     // 1..max_degree, final offset equals the index count.
     if (product_offsets == nullptr) return invalid_parameters();
     if (product_offsets[0] != 0) return invalid_parameters();
+    bool tensor_d2 = max_degree == 2 && product_count > 0;
+    std::vector<uint32_t> arities(product_count);
     for (size_t p = 0; p < product_count; ++p) {
         const size_t begin = product_offsets[p];
         const size_t end = product_offsets[p + 1];
         if (end < begin) return invalid_parameters();
         const size_t arity = end - begin;
         if (arity == 0 || arity > max_degree) return invalid_parameters();
+        arities[p] = static_cast<uint32_t>(arity);
+        tensor_d2 = tensor_d2 && arity == 2;
     }
     if (product_offsets[product_count] != index_count) return invalid_parameters();
 
@@ -338,6 +347,7 @@ Ascend910B3Status create_state(Ascend910B3NativeContext* raw_context, size_t num
     state->distinct_count = distinct_count;
     state->index_count = index_count;
     state->product_count = product_count;
+    state->tensor_d2 = tensor_d2;
     state->inputs = std::move(distinct);
     state->product_offsets.assign(product_offsets, product_offsets + product_count + 1);
 
@@ -347,11 +357,10 @@ Ascend910B3Status create_state(Ascend910B3NativeContext* raw_context, size_t num
     rt::BufferRef weight_source;
     OwnedBuffers owned;
     owned.context = &*cref;
-    // Maximum tracked slots per create: six state allocations (arena, partial,
-    // coefficients, weights, output, coordinate) plus three create-time
-    // sources (coefficient source, weight source, bindings). Reserving the
-    // exact count keeps every later track() throw-free with no reallocation.
-    owned.buffers.reserve(9);
+    // Every state slot this create may track plus the two transient canonical
+    // sources. Reserve before enqueues so track() cannot allocate during
+    // failure cleanup.
+    owned.buffers.reserve(16);
 
     status = create_buffer_for(*cref, arena_bytes, state->arena);
     if (!rt::status_ok(status)) return status;
@@ -375,6 +384,19 @@ Ascend910B3Status create_state(Ascend910B3NativeContext* raw_context, size_t num
     status = create_buffer_for(*cref, rt::kFrBytes, state->coordinate);
     if (!rt::status_ok(status)) return status;
     owned.track(state->coordinate);
+    if (tensor_d2) {
+        const uint64_t message_groups =
+            (round_zero_rest + sc::sumcheck_tensor_tile - 1) / sc::sumcheck_tensor_tile;
+        const uint32_t groups = static_cast<uint32_t>(
+            message_groups < sc::sumcheck_tensor_max_groups
+                ? message_groups : sc::sumcheck_tensor_max_groups);
+        const uint64_t message_workspace_bytes = sc::sumcheck_tensor_workspace_bytes(groups);
+        if (message_workspace_bytes == 0) return invalid_state();
+        status = create_buffer_for(*cref, static_cast<size_t>(message_workspace_bytes),
+            state->tensor_workspace);
+        if (!rt::status_ok(status)) return status;
+        owned.track(state->tensor_workspace);
+    }
     status = cref->allocate_pinned(rt::kFrBytes, rt::kPinnedAlignment,
                                    state->coordinate_host);
     if (!rt::status_ok(status)) return status;
@@ -391,27 +413,23 @@ Ascend910B3Status create_state(Ascend910B3NativeContext* raw_context, size_t num
         return rt::status_invalid_state(static_cast<int32_t>(ACL_ERROR_BAD_ALLOC));
     }
 
-    // ---- Enqueue the one-time resident conversions and metadata uploads. ----
+    // ---- One-time coefficient scaling, grid conversion and metadata uploads. ----
     const aclrtStream stream = cref->stream();
-    const uint64_t table_entries = static_cast<uint64_t>(table_bytes / rt::kFrBytes);
-    uint8_t* const arena_base = static_cast<uint8_t*>(state->arena.data());
-    for (size_t j = 0; j < distinct_count; ++j) {
-        const hp::Fr* source = reinterpret_cast<const hp::Fr*>(state->inputs[j].data());
-        hp::Fr* target = reinterpret_cast<hp::Fr*>(arena_base + j * stride);
-        if (!sc::launch_sumcheck_convert(stream, source, target, table_entries,
-                                         shape.lanes))
-            return invalid_state();
-    }
 
     if (product_count > 0) {
         status = upload_bytes(*cref, coefficients, product_count * rt::kFrBytes,
                               coefficient_source);
         if (!rt::status_ok(status)) return status;
         owned.track(coefficient_source);
-        if (!sc::launch_sumcheck_convert(
+        status = upload_bytes(*cref, arities.data(), product_count * sizeof(uint32_t),
+                              state->coefficient_arity);
+        if (!rt::status_ok(status)) return status;
+        owned.track(state->coefficient_arity);
+        if (!sc::launch_sumcheck_scale_coefficients(
                 stream, reinterpret_cast<const hp::Fr*>(coefficient_source.data()),
-                reinterpret_cast<hp::Fr*>(state->coefficients.data()), product_count,
-                shape.lanes))
+                reinterpret_cast<const uint32_t*>(state->coefficient_arity.data()),
+                reinterpret_cast<hp::Fr*>(state->coefficients.data()),
+                static_cast<uint32_t>(product_count), shape.lanes))
             return invalid_state();
     } else {
         // Empty whole sum: the reduce kernel writes canonical zeros and does not
@@ -437,16 +455,35 @@ Ascend910B3Status create_state(Ascend910B3NativeContext* raw_context, size_t num
     }
 
     if (index_count > 0) {
-        std::vector<uint8_t> binding_host(bindings_bytes, 0);
-        for (size_t i = 0; i < index_count; ++i) {
-            const size_t slot = slot_of[factor_indices[i]];
-            const uint64_t offset = static_cast<uint64_t>(slot) * stride64;
-            std::memcpy(&binding_host[i * rt::kFrBytes], &offset, sizeof(offset));
-        }
-        status = upload_bytes(*cref, binding_host.data(), bindings_bytes,
-                              state->bindings);
+        const auto upload_bindings = [&](rt::BufferRef& bindings, size_t slot_kind)
+            -> Ascend910B3Status {
+            std::vector<uint8_t> host(bindings_bytes, 0);
+            for (size_t i = 0; i < index_count; ++i) {
+                const size_t slot = slot_of[factor_indices[i]];
+                const void* address = state->inputs[slot].data();
+                if (slot_kind != 0) {
+                    const size_t offset = slot * stride +
+                        (slot_kind == 2 ? static_cast<size_t>(sc::sumcheck_slot_b_offset(num_vars)) : 0);
+                    address = static_cast<uint8_t*>(state->arena.data()) + offset;
+                }
+                store_small_fr(&host[i * rt::kFrBytes],
+                               static_cast<uint64_t>(reinterpret_cast<uintptr_t>(address)));
+            }
+            const Ascend910B3Status uploaded =
+                upload_bytes(*cref, host.data(), bindings_bytes, bindings);
+            if (rt::status_ok(uploaded)) owned.track(bindings);
+            return uploaded;
+        };
+        status = upload_bindings(state->bindings_original, 0);
         if (!rt::status_ok(status)) return status;
-        owned.track(state->bindings);
+        if (sc::sumcheck_slot_a_bytes(num_vars) != 0) {
+            status = upload_bindings(state->bindings_slot_a, 1);
+            if (!rt::status_ok(status)) return status;
+        }
+        if (sc::sumcheck_slot_b_bytes(num_vars) != 0) {
+            status = upload_bindings(state->bindings_slot_b, 2);
+            if (!rt::status_ok(status)) return status;
+        }
     }
 
     // Setup completes the resident conversions before the state is published;
@@ -541,37 +578,58 @@ Ascend910B3Status round_state(Ascend910B3NativeContext* raw_context,
         const uint32_t exponent =
             sc::sumcheck_fold_exponent(num_vars, round_index);
         const uint64_t source_offset =
-            sc::sumcheck_fold_src_offset(num_vars, round_index);
+            sc::sumcheck_previous_slot_offset(num_vars, round_index);
         const uint64_t destination_offset =
-            sc::sumcheck_fold_dst_offset(num_vars, round_index);
+            sc::sumcheck_round_slot_offset(num_vars, round_index);
         for (size_t j = 0; j < state->distinct_count; ++j) {
             uint8_t* slot = arena_base + j * stride;
-            const hp::Fr* source =
-                reinterpret_cast<const hp::Fr*>(slot + static_cast<size_t>(source_offset));
+            const hp::Fr* source = round_index == 1
+                ? reinterpret_cast<const hp::Fr*>(state->inputs[j].data())
+                : reinterpret_cast<const hp::Fr*>(slot + static_cast<size_t>(source_offset));
             hp::Fr* destination =
                 reinterpret_cast<hp::Fr*>(slot + static_cast<size_t>(destination_offset));
-            if (!sc::launch_sumcheck_fold(
-                    stream, source,
-                    reinterpret_cast<const hp::Fr*>(state->coordinate.data()),
-                    destination, exponent, lanes))
+            const hp::Fr* coordinate =
+                reinterpret_cast<const hp::Fr*>(state->coordinate.data());
+            // Canonical natural Vector fold for every route: it converts only
+            // the challenge, keeps the table canonical and writes the natural
+            // pair order the Cube message kernel also reads.
+            if (!sc::launch_sumcheck_fold(stream, source, coordinate, destination,
+                                          exponent, lanes))
                 return fail(0);
         }
     }
 
     const uint64_t rest = sc::sumcheck_rest_count(num_vars, round_index);
-    const uint64_t parity_offset = sc::sumcheck_parity_offset(num_vars, round_index);
-    const uint32_t blocks =
-        sc::sumcheck_message_blocks(rest, lanes, state->aiv_cores);
-    if (blocks == 0) return fail(0);
+    const uint64_t tensor_tiles =
+        (rest + sc::sumcheck_tensor_tile - 1) / sc::sumcheck_tensor_tile;
+    const uint32_t blocks = state->tensor_d2
+        ? static_cast<uint32_t>(tensor_tiles < sc::sumcheck_tensor_max_groups
+                                   ? tensor_tiles : sc::sumcheck_tensor_max_groups)
+        : sc::sumcheck_message_blocks(rest, lanes, state->aiv_cores);
+    if (blocks == 0 || blocks > state->max_blocks) return fail(0);
 
     if (state->product_count > 0) {
-        const uint8_t* binding_base = static_cast<const uint8_t*>(state->bindings.data());
+        const rt::BufferRef& bindings = round_index == 0
+            ? state->bindings_original
+            : ((round_index & 1) ? state->bindings_slot_a : state->bindings_slot_b);
+        const uint8_t* binding_base = static_cast<const uint8_t*>(bindings.data());
         for (size_t product = 0; product < state->product_count; ++product) {
             const size_t begin = state->product_offsets[product];
             const size_t arity =
                 state->product_offsets[product + 1] - begin;
             const uint64_t* offsets = reinterpret_cast<const uint64_t*>(
                 binding_base + begin * rt::kFrBytes);
+            if (state->tensor_d2) {
+                // Natural layout in every round: the Vector fold output and
+                // the retained originals both hold sequential pair order.
+                if (!sc::launch_sumcheck_tensor_message_d2(
+                        stream, offsets, rest,
+                        reinterpret_cast<hp::Fr*>(state->partial.data()),
+                        static_cast<uint32_t>(product), blocks,
+                        state->tensor_workspace.data()))
+                    return fail(0);
+                continue;
+            }
             for (uint32_t pass = 0; pass < state->shape.chunks; ++pass) {
                 const uint64_t t_begin64 = static_cast<uint64_t>(pass) * state->shape.chunk;
                 const uint32_t t_begin = static_cast<uint32_t>(t_begin64);
@@ -584,8 +642,8 @@ Ascend910B3Status round_state(Ascend910B3NativeContext* raw_context,
                           static_cast<const uint8_t*>(state->weights.data()) +
                           t_begin * rt::kFrBytes);
                 if (!sc::launch_sumcheck_message(
-                        stream, arena_base, offsets, static_cast<uint32_t>(arity),
-                        parity_offset, rest, t_begin, t_count,
+                        stream, offsets, static_cast<uint32_t>(arity),
+                        rest, t_begin, t_count,
                         reinterpret_cast<hp::Fr*>(state->partial.data()),
                         static_cast<uint32_t>(product), degree, weight, blocks, lanes))
                     return fail(0);
@@ -624,7 +682,11 @@ void retire_state_buffers(rt::Context& context, NativeSumcheck& state) noexcept 
         if (ref.valid()) (void)context.retire(ref.data());
     };
     retire(state.arena);
-    retire(state.bindings);
+    retire(state.bindings_original);
+    retire(state.bindings_slot_a);
+    retire(state.bindings_slot_b);
+    retire(state.coefficient_arity);
+    retire(state.tensor_workspace);
     retire(state.coefficients);
     retire(state.weights);
     retire(state.partial);
